@@ -1,0 +1,34 @@
+# relay-pp's configuration: copy to relay-pp.toml beside the program, or
+# name the file on the command line (`relay-pp path/to/file.toml`).
+# Every section is optional; what is shown below is the default where a
+# value is commented out.
+
+[rtsp]
+# Where RTSP players connect: rtsp://<this machine>:8554/<path>
+# listen = "0.0.0.0:8554"
+# Whether players may ask for RTP over UDP as well as over their connection.
+# udp = true
+
+[webrtc]
+# The UDP address WebRTC media goes through.
+# listen = "0.0.0.0:8189"
+# The addresses players are told to send to, where `listen` is every
+# interface or the machine is behind a router: an IP alone keeps the port.
+candidates = ["192.168.0.10"]
+# How many threads sessions are spread over, each a UDP port of its own
+# from `listen`'s on.
+# threads = 2
+
+[http]
+# The status API (GET /api/v1/paths) and WHEP for browsers
+# (POST /<path>/whep).
+# listen = "0.0.0.0:8888"
+
+# One section for each camera; the name is the path players ask for.
+[paths.cam1]
+source = "rtsp://admin:password@192.168.0.21/stream1"
+
+[paths."floor2/cam3"]
+source = "rtsp://192.168.0.23/stream1"
+# How the camera is pulled: "tcp" (the default, which loses nothing) or "udp".
+transport = "udp"

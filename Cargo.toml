@@ -1,0 +1,24 @@
+[package]
+name = "relay-pp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A streaming server on media-pp: RTSP cameras pulled, played over RTSP and WebRTC, recorded."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hash1018/relay-pp"
+publish = false
+
+[dependencies]
+# The server parts relay-pp is built on are not in a media-pp release yet,
+# so it is taken from the repository at a revision. To build against a
+# checkout beside this one instead:
+#   cargo build --config 'patch."https://github.com/hash1018/media-pp".media-pp.path="../media-pp/lib"'
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "efcf10b62170ffb778e6e4ab1317978fa160cf91", features = ["rtsp-server", "webrtc"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "time"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

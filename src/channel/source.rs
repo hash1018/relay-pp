@@ -5,9 +5,14 @@
 //! once — a camera that drops is opened again as a new one, in a pipeline of
 //! its own — so this keeps how to open it, and the broadcast, which outlives
 //! every one of them.
+//!
+//! Its thread waits on nothing it has to look at again: between connections
+//! on a condition variable a stop rings, and while connected on the
+//! pipeline's bus, which a stop empties by stopping the pipeline.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -61,7 +66,7 @@ pub(super) struct SourceStatus {
 pub(super) struct Source {
     /// What the source's thread shares with it.
     inner: Arc<Inner>,
-    /// `None` before [`Source::run`] and after [`Source::stop`].
+    /// `None` before [`Source::run`] and after [`Source::wait`].
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -73,7 +78,10 @@ struct Inner {
     transport: RtspTransport,
     broadcast: Broadcast,
     state: Mutex<State>,
-    stop: AtomicBool,
+    control: Mutex<Control>,
+    /// Rung by [`Source::halt`], for a thread waiting before it connects
+    /// again.
+    halted: Condvar,
 }
 
 struct State {
@@ -81,6 +89,16 @@ struct State {
     since: SystemTime,
     error: Option<String>,
     connections: u64,
+}
+
+/// What a stop reaches the thread through: one lock, so a stop cannot fall
+/// between the thread starting a pipeline and putting it where the stop
+/// looks.
+#[derive(Default)]
+struct Control {
+    halted: bool,
+    /// The connection's pipeline, while one runs.
+    pipeline: Option<Arc<Pipeline>>,
 }
 
 impl Source {
@@ -102,7 +120,8 @@ impl Source {
                     error: None,
                     connections: 0,
                 }),
-                stop: AtomicBool::new(false),
+                control: Mutex::default(),
+                halted: Condvar::new(),
             }),
             thread: Mutex::new(None),
         }
@@ -134,10 +153,33 @@ impl Source {
         }
     }
 
-    /// Stops its thread — within the camera's timeout at most, the time an
-    /// open already under way may take — and closes its broadcast.
-    pub(super) fn stop(&self) {
-        self.inner.stop.store(true, Ordering::Release);
+    /// Tells its thread to stop, without waiting for it: what
+    /// [`Self::wait`] then waits for. Many sources are halted first and
+    /// waited for after, so they stop together rather than one after another.
+    pub(super) fn halt(&self) {
+        self.inner
+            .control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .halted = true;
+        self.inner.halted.notify_all();
+    }
+
+    /// Stops what [`Self::halt`] told to — the connection's pipeline, within
+    /// the camera's timeout at most, and an open already under way within
+    /// the same — waits for its thread, and closes its broadcast.
+    pub(super) fn wait(&self) {
+        self.halt();
+        let pipeline = self
+            .inner
+            .control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pipeline
+            .take();
+        if let Some(pipeline) = pipeline {
+            pipeline.stop();
+        }
         let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(thread) = thread {
             let _ = thread.join();
@@ -148,18 +190,18 @@ impl Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
-        self.stop();
+        self.wait();
     }
 }
 
 impl Inner {
     /// The source's thread: pulls the camera, and connects again after a
-    /// wait whenever it fails, until the source stops.
+    /// wait whenever it fails, until the source is halted.
     fn run(&self) {
         let mut wait = FIRST_WAIT;
         // Why it last failed, kept while it connects again.
         let mut last = None;
-        while !self.stopped() {
+        while !self.halted() {
             self.set(SourceState::Connecting, last.clone());
             let began = Instant::now();
             let reason = match self.pull() {
@@ -169,14 +211,17 @@ impl Inner {
             if began.elapsed() >= STAYED_UP {
                 wait = FIRST_WAIT;
             }
+            // Spread over ±20%, so cameras a network outage dropped together
+            // are not all opened again in the same instant.
+            let spread = wait.mul_f64(0.8 + 0.4 * unit_random());
             tracing::warn!(
                 channel = %self.name,
-                "{reason}; connecting again in {}s",
-                wait.as_secs()
+                "{reason}; connecting again in {:.1}s",
+                spread.as_secs_f64()
             );
             self.set(SourceState::Waiting, Some(reason.clone()));
             last = Some(reason);
-            if !self.sleep(wait) {
+            if !self.sleep(spread) {
                 break;
             }
             wait = (wait * 2).min(LONGEST_WAIT);
@@ -206,8 +251,8 @@ impl Inner {
         Ok((source, kept))
     }
 
-    /// Pulls the camera until it fails — the reason — or the source stops:
-    /// `Ok`.
+    /// Pulls the camera until it fails — the reason — or the source is
+    /// halted: `Ok`.
     ///
     /// Each connection is a pipeline of its own ending in the broadcast,
     /// published again: the broadcast is what outlives it, and publishing
@@ -228,38 +273,56 @@ impl Inner {
         pipeline
             .run()
             .map_err(|error| format!("cannot start the camera: {error}"))?;
-        self.went_live();
-
-        let ended = loop {
-            if self.stopped() {
+        {
+            let mut control = self.control.lock().unwrap_or_else(|p| p.into_inner());
+            if control.halted {
+                drop(control);
                 pipeline.stop();
                 return Ok(());
             }
-            match pipeline.bus().recv_timeout(Duration::from_millis(200)) {
-                Ok(BusEvent::Error { error, .. }) => break format!("the camera failed: {error}"),
-                Ok(BusEvent::Finished) => break "the camera ended its stream".to_owned(),
-                _ => {}
+            control.pipeline = Some(Arc::clone(&pipeline));
+        }
+        self.went_live();
+
+        // Blocks until the pipeline says why it ended, or until a halt stops
+        // it and its bus empties.
+        let ended = loop {
+            match pipeline.bus().recv() {
+                Some(BusEvent::Error { error, .. }) => {
+                    break Some(format!("the camera failed: {error}"));
+                }
+                Some(BusEvent::Finished) => break Some("the camera ended its stream".to_owned()),
+                Some(_) => {}
+                None => break None,
             }
         };
+        self.control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pipeline = None;
         pipeline.stop();
-        Err(ended)
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
-    }
-
-    /// Waits `wait`, or less where the source stops: whether it waited it
-    /// all.
-    fn sleep(&self, wait: Duration) -> bool {
-        let until = Instant::now() + wait;
-        while Instant::now() < until {
-            if self.stopped() {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        match ended {
+            Some(reason) if !self.halted() => Err(reason),
+            _ => Ok(()),
         }
-        !self.stopped()
+    }
+
+    fn halted(&self) -> bool {
+        self.control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .halted
+    }
+
+    /// Waits `wait`, or less where the source is halted: whether it waited
+    /// it all.
+    fn sleep(&self, wait: Duration) -> bool {
+        let control = self.control.lock().unwrap_or_else(|p| p.into_inner());
+        let (control, _) = self
+            .halted
+            .wait_timeout_while(control, wait, |control| !control.halted)
+            .unwrap_or_else(|p| p.into_inner());
+        !control.halted
     }
 
     fn set(&self, state: SourceState, error: Option<String>) {
@@ -278,5 +341,23 @@ impl Inner {
             .unwrap_or_else(|p| p.into_inner())
             .connections += 1;
         tracing::info!(channel = %self.name, "live");
+    }
+}
+
+/// A number in `[0, 1)`, different every call: `RandomState` is seeded
+/// afresh each time, which is all a spread of reconnections needs.
+fn unit_random() -> f64 {
+    (RandomState::new().hash_one(0u8) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spread_is_within_its_range_and_not_the_same_each_time() {
+        let draws: Vec<f64> = (0..32).map(|_| unit_random()).collect();
+        assert!(draws.iter().all(|r| (0.0..1.0).contains(r)), "{draws:?}");
+        assert!(draws.windows(2).any(|pair| pair[0] != pair[1]), "{draws:?}");
     }
 }

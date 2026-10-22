@@ -119,10 +119,10 @@ pub struct Channel {
     name: String,
     source: Source,
     sinks: Vec<Sink>,
-    /// Set by the first [`Channel::stop`]. The sinks are detached by name,
+    /// Set by the first [`Channel::halt`]. The sinks are detached by name,
     /// so a second detach would take a channel of the same name made since
     /// off its listeners.
-    stopped: AtomicBool,
+    halted: AtomicBool,
 }
 
 impl Channel {
@@ -148,7 +148,7 @@ impl Channel {
             name: name.clone(),
             source,
             sinks,
-            stopped: AtomicBool::new(false),
+            halted: AtomicBool::new(false),
         })
     }
 
@@ -172,17 +172,25 @@ impl Channel {
         }
     }
 
-    /// Detaches every sink, then stops the source — within the camera's
-    /// timeout at most. Once: a second call does nothing.
-    pub(crate) fn stop(&self) {
-        if self.stopped.swap(true, Ordering::AcqRel) {
+    /// Detaches every sink and tells the source to stop, without waiting for
+    /// it: once this returns, no player reaches the channel and its name can
+    /// be attached again. Once: a second call does nothing.
+    pub(crate) fn halt(&self) {
+        if self.halted.swap(true, Ordering::AcqRel) {
             return;
         }
         for sink in &self.sinks {
             sink.detach(&self.name);
         }
-        self.source.stop();
+        self.source.halt();
         tracing::info!(channel = %self.name, "removed");
+    }
+
+    /// Halts it, and waits for its source to stop — within the camera's
+    /// timeout at most.
+    pub(crate) fn stop(&self) {
+        self.halt();
+        self.source.wait();
     }
 }
 

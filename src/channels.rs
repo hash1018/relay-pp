@@ -12,10 +12,11 @@ pub(crate) struct Channels {
     /// removed: a reader takes the channel it needs out and lets go of the
     /// lock before doing anything that waits.
     map: RwLock<BTreeMap<String, Arc<Channel>>>,
-    /// Held across a whole add or remove. A channel's sinks are attached
-    /// and detached by name, so one being removed must be off every
-    /// listener before another of its name is attached — and the removal
-    /// waits on its source, which the map's lock must not.
+    /// Held across a whole add, and a removal up to its sinks being
+    /// detached. They are attached and detached by name, so one being
+    /// removed must be off every listener before another of its name is
+    /// attached; waiting for its source is left outside, so a camera that
+    /// takes its timeout to let go holds up no other add or remove.
     changing: Mutex<()>,
     listeners: Listeners,
 }
@@ -47,8 +48,7 @@ impl Channels {
             .collect()
     }
 
-    /// Makes a channel and starts it. May wait for a removal under way —
-    /// up to a camera's timeout.
+    /// Makes a channel and starts it.
     pub(crate) fn add(&self, config: &ChannelConfig) -> Result<Arc<Channel>, ChannelError> {
         let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
         if self.get(&config.name).is_some() {
@@ -66,12 +66,18 @@ impl Channels {
     /// listener and its source has stopped — up to a camera's timeout.
     /// Whether there was one.
     pub(crate) fn remove(&self, name: &str) -> bool {
-        let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
-        let removed = self
-            .map
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(name);
+        let removed = {
+            let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
+            let removed = self
+                .map
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(name);
+            if let Some(channel) = &removed {
+                channel.halt();
+            }
+            removed
+        };
         match removed {
             Some(channel) => {
                 channel.stop();
@@ -81,12 +87,22 @@ impl Channels {
         }
     }
 
-    /// Removes and stops every channel.
+    /// Removes and stops every channel, all at once: each is halted first,
+    /// and then each waited for on a thread of its own, so the whole takes
+    /// a camera's timeout at most rather than one for every camera.
     pub(crate) fn clear(&self) {
-        let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
-        let all = std::mem::take(&mut *self.map.write().unwrap_or_else(|p| p.into_inner()));
-        for channel in all.values() {
-            channel.stop();
-        }
+        let all = {
+            let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
+            let all = std::mem::take(&mut *self.map.write().unwrap_or_else(|p| p.into_inner()));
+            for channel in all.values() {
+                channel.halt();
+            }
+            all
+        };
+        std::thread::scope(|scope| {
+            for channel in all.values() {
+                scope.spawn(|| channel.stop());
+            }
+        });
     }
 }

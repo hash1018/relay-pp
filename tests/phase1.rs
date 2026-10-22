@@ -16,7 +16,7 @@ use media_pp::elements::{
 };
 use media_pp::ffmpeg;
 use media_pp::pipeline::Pipeline;
-use relay_pp::{Config, Server, SourceState};
+use relay_pp::{ChannelConfig, Config, Server, SourceState, Transport};
 
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -327,4 +327,72 @@ fn a_listener_that_cannot_bind_stops_the_start_saying_which() {
         .expect("the port is taken")
         .to_string();
     assert!(error.contains("http.listen"), "{error}");
+}
+
+/// A camera that takes a connection and never answers: opening it waits
+/// out the whole timeout.
+fn silent_camera() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+}
+
+fn pulling(name: &str, camera: SocketAddr) -> ChannelConfig {
+    ChannelConfig {
+        name: name.to_owned(),
+        source: format!("rtsp://{camera}/cam"),
+        transport: Transport::Tcp,
+    }
+}
+
+#[test]
+fn removing_a_channel_stuck_opening_holds_up_no_other_add() {
+    let silent = silent_camera();
+    let server = Arc::new(server());
+    server
+        .add_channel(&pulling("stuck", silent.local_addr().unwrap()))
+        .unwrap();
+    // Opening it now waits out the camera's timeout, and so does its
+    // removal.
+    let removing = std::thread::spawn({
+        let server = Arc::clone(&server);
+        move || server.remove_channel("stuck")
+    });
+    wait_for("the stuck channel gone from the list", || {
+        server.status().is_empty()
+    });
+    let began = Instant::now();
+    server
+        .add_channel(&pulling("other", silent.local_addr().unwrap()))
+        .unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "an add waited {:?} for a removal",
+        began.elapsed()
+    );
+    // And the name is free again at once.
+    server
+        .add_channel(&pulling("stuck", silent.local_addr().unwrap()))
+        .unwrap();
+    assert!(removing.join().unwrap());
+    Arc::into_inner(server).unwrap().stop();
+}
+
+#[test]
+fn stopping_waits_for_every_camera_together() {
+    let silent = silent_camera();
+    let server = server();
+    // Opens begun across a camera's timeout, none of which a stop can cut
+    // short: the stop waits for them together, one timeout at most.
+    for i in 0..10 {
+        server
+            .add_channel(&pulling(&format!("cam{i}"), silent.local_addr().unwrap()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let began = Instant::now();
+    server.stop();
+    assert!(
+        began.elapsed() < Duration::from_secs(7),
+        "stopping took {:?}: longer than one camera's timeout",
+        began.elapsed()
+    );
 }

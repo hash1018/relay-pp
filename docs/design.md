@@ -49,13 +49,13 @@ The server parts are not on crates.io yet (media-pp 0.4.1 predates them), so
 relay-pp depends on media-pp by git, pinned to a revision, with a local
 `[patch]` (a `--config` override, as obs-rs does) while both are worked on.
 
-relay-pp is mostly policy: configuration, the life of each path,
+relay-pp is mostly policy: configuration, the life of each channel,
 reconnecting, recording files and their retention, HTTP, and reporting.
 
 ## The model
 
 ```
-            ┌──────────────────────── path "cam1" ─────────────────────────┐
+            ┌────────────────────── channel "cam1" ────────────────────────┐
  source ──▶ │ ingest ──▶ Broadcast ──┬──▶ RtspServer   (players)           │
  (pull or   │ (reconnects)           ├──▶ WebRtcServer (players)           │
   publish)  │                        ├──▶ HLS (live, over HTTP)            │
@@ -64,36 +64,36 @@ reconnecting, recording files and their retention, HTTP, and reporting.
             └──────────────────────────────────────────────────────────────┘
 ```
 
-A **path** is a name, one source, one `Broadcast`, and what is done with it:
-the unit of configuration, authorization, statistics and recording.
+A **channel** is a name, one input, one `Broadcast`, and the outputs that read
+it: the unit of configuration, authorization, statistics and recording.
 
 **Sources**:
 
 - *Pulled* — relay-pp opens the URL itself: `rtsp://` (cameras), `rtmp://`,
   a WHEP URL, a file to loop. Always on, or **on demand**: opened when the
   first reader arrives, closed after the last has been gone for a while.
-- *Published* — the path waits for a publisher on any protocol the server
+- *Published* — the channel waits for a publisher on any protocol the server
   takes (RTSP RECORD, RTMP, WHIP). One at a time; a second is refused, or
   replaces the first (a setting).
 
 A pulled source reconnects by itself — back-off from one second to thirty,
-each failure's reason logged and kept in the path's status. The `Broadcast`
+each failure's reason logged and kept in the channel's status. The `Broadcast`
 outlives every reconnection, so players stay connected and go on at the next
 keyframe.
 
-**Outputs**: every player protocol the server runs, unless a path turns one
-off; HLS where enabled. **Recording** and **forwarding** are per path.
+**Outputs**: every player protocol the server runs, unless a channel turns one
+off; HLS where enabled. **Recording** and **forwarding** are per channel.
 
 ## Recording
 
 - Segments of a configured length (default 60 s), cut on keyframes, in
-  `<dir>/<path>/<YYYY-MM-DD>/<HH-MM-SS>.<ext>`.
+  `<dir>/<channel>/<YYYY-MM-DD>/<HH-MM-SS>.<ext>`.
 - Fragmented MP4 by default, readable even when the process dies mid-segment;
-  MPEG-TS for a path whose source may change its picture size partway (a
+  MPEG-TS for a channel whose source may change its picture size partway (a
   WebRTC publisher), which an MP4 refuses.
 - Retention: segments older than a period, or the oldest beyond a size, per
-  path or for all.
-- Playback: `/playback/{path}?from=&to=` answers an HLS VOD playlist over the
+  channel or for all.
+- Playback: `/playback/{channel}?from=&to=` answers an HLS VOD playlist over the
   segments, or one file of them.
 - Event recording (later): the last N seconds kept in a `ReplayBuffer` and
   written out with what follows when the API or a hook says so.
@@ -104,11 +104,11 @@ axum, one listener:
 
 | Route | What |
 |---|---|
-| `/api/v1/…` | paths and their status, sessions, recordings, reload, kick |
-| `/playback/{path}` | recordings by time |
-| `/{path}` | a page that plays the path in a browser |
-| `/{path}/index.m3u8` and segments | HLS live |
-| `/{path}/whep`, `/{path}/whip` | WebRTC play and publish |
+| `/api/v1/…` | channels and their status, sessions, recordings, reload, kick |
+| `/playback/{channel}` | recordings by time |
+| `/{channel}` | a page that plays the channel in a browser |
+| `/{channel}/index.m3u8` and segments | HLS live |
+| `/{channel}/whep`, `/{channel}/whip` | WebRTC play and publish |
 | `/metrics` | Prometheus text |
 
 WHIP and WHEP are axum routes over `WebRtcServerHandle::play`, `publish`
@@ -124,7 +124,7 @@ its camera, not to play.
 ## Configuration
 
 One TOML file, read at start and again on `POST /api/v1/reload`: a reload
-adds, changes and removes paths without touching the others.
+adds, changes and removes channels without touching the others.
 
 ```toml
 [rtsp]
@@ -153,16 +153,16 @@ name = "operator"
 password = "..."
 play = ["*"]
 
-[paths.cam1]
+[channels.cam1]
 source = "rtsp://10.0.0.21/stream1"
 record = true
 
-[paths.cam2]
+[channels.cam2]
 source = "rtsp://10.0.0.22/stream1"
 on_demand = true
 
-# One entry for many cameras: the path's name picks the address.
-[paths."~^cams/(\\d+)$"]
+# One entry for many cameras: the channel's name picks the address.
+[channels."~^cams/(\\d+)$"]
 source = "rtsp://10.0.1.$1/main"
 record = true
 ```
@@ -172,9 +172,9 @@ logged with them cut out.
 
 ## Reporting
 
-- Every path's status: its source (connecting, live, failed and why, waiting
+- Every channel's status: its source (connecting, live, failed and why, waiting
   for a publisher), since when, readers by protocol, bit rate, recording.
-- Events — a path goes live or drops, a publisher comes or goes, a segment is
+- Events — a channel goes live or drops, a publisher comes or goes, a segment is
   finished — over the API (a WebSocket or a long poll) and as **hooks**: a
   command or an HTTP call the configuration names (`on_ready`,
   `on_not_ready`, `on_record_segment`).
@@ -191,7 +191,7 @@ logged with them cut out.
 
 ## Phases
 
-1. **Core**: the configuration; paths with pulled RTSP sources, always on,
+1. **Core**: the configuration; channels with pulled RTSP sources, always on,
    reconnecting; RTSP players, and WebRTC players through WHEP on the axum port; the status API; logs. The
    CCTV case's live view.
 2. **Recording**: segments, retention, playback.
@@ -208,7 +208,7 @@ benchmarks have not measured.
 
 ## Borrowed and avoided
 
-From MediaMTX: path regexes, on-demand sources, hooks, a playback server, a
+From MediaMTX: names matched by a regex (its "channels"), on-demand sources, hooks, a playback server, a
 REST API and reload. From the CLAMOS server before media-pp: reconnecting
 sources with state events, event recording with a pre-buffer, restoring
 what was running at boot, systemd packaging — and not its polling loops,

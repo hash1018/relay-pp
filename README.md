@@ -17,10 +17,10 @@ cargo run --release
 ```
 
 It pulls every camera the file names and keeps connecting again to one
-that drops. Each is played at `rtsp://<host>:8554/<path>` and, by any
-WHEP client, at `http://<host>:8888/<path>/whep` (a page that plays it in
+that drops. Each is played at `rtsp://<host>:8554/<channel>` and, by any
+WHEP client, at `http://<host>:8888/<channel>/whep` (a page that plays it in
 a browser comes in phase 3);
-`http://<host>:8888/api/v1/paths` says what each path is doing. Ctrl+C
+`http://<host>:8888/api/v1/channels` says what each channel is doing. Ctrl+C
 stops it. relay-pp logs to the terminal and media-pp to `logs/`.
 
 Building needs FFmpeg's development libraries, as media-pp does — see its

@@ -1,4 +1,4 @@
-//! The configuration file: what relay-pp listens on and which paths it
+//! The configuration file: what relay-pp listens on and which channels it
 //! serves — see `docs/design.md`, "Configuration".
 
 use std::collections::BTreeMap;
@@ -21,11 +21,17 @@ pub enum ConfigError {
     /// The file is not TOML this understands.
     #[error("{0}")]
     Parse(#[from] toml::de::Error),
-    /// A path's source is not one relay-pp takes yet.
-    #[error("path {path}: source {url:?} is not an rtsp:// or rtsps:// URL")]
+    /// A channel's name is not one a URL carries as it is: it is what
+    /// players ask for, `rtsp://host/<name>` and `/<name>/whep`.
+    #[error(
+        "channel {0:?}: a name is letters, digits, `-`, `_`, `.` and `~`, in parts between `/`"
+    )]
+    Name(String),
+    /// A channel's source is not one relay-pp takes yet.
+    #[error("channel {channel}: source {url:?} is not an rtsp:// or rtsps:// URL")]
     Source {
-        /// The path.
-        path: String,
+        /// The channel.
+        channel: String,
         /// Its source, with any credentials cut out.
         url: String,
     },
@@ -47,9 +53,9 @@ pub struct Config {
     /// The API, and WHEP.
     #[serde(default)]
     pub http: HttpConfig,
-    /// Each path by its name.
+    /// Each channel by its name, which is what players ask for.
     #[serde(default)]
-    pub paths: BTreeMap<String, PathConfig>,
+    pub channels: BTreeMap<String, ChannelConfig>,
 }
 
 /// `[rtsp]`.
@@ -149,10 +155,10 @@ impl Default for HttpConfig {
     }
 }
 
-/// `[paths.<name>]`.
+/// `[channels.<name>]`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PathConfig {
+pub struct ChannelConfig {
     /// Where the stream comes from: an `rtsp://` or `rtsps://` URL, pulled
     /// for as long as relay-pp runs.
     pub source: String,
@@ -186,12 +192,15 @@ impl Config {
     /// The configuration `text` says, checked.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)?;
-        for (name, path) in &config.paths {
-            let scheme = path.source.split("://").next().unwrap_or_default();
-            if !path.source.contains("://") || !matches!(scheme, "rtsp" | "rtsps") {
+        for (name, channel) in &config.channels {
+            if !valid_name(name) {
+                return Err(ConfigError::Name(name.clone()));
+            }
+            let scheme = channel.source.split("://").next().unwrap_or_default();
+            if !channel.source.contains("://") || !matches!(scheme, "rtsp" | "rtsps") {
                 return Err(ConfigError::Source {
-                    path: name.clone(),
-                    url: redact(&path.source),
+                    channel: name.clone(),
+                    url: redact(&channel.source),
                 });
             }
         }
@@ -202,6 +211,18 @@ impl Config {
 
 fn yes() -> bool {
     true
+}
+
+/// Whether `name` goes into a URL as it is: parts of letters, digits, `-`,
+/// `_`, `.` and `~`, between single `/`.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+        })
 }
 
 /// `url` with any user name and password cut out, for a log line or an
@@ -231,10 +252,10 @@ mod tests {
             [webrtc]
             candidates = ["192.168.0.10", "203.0.113.7:8189"]
 
-            [paths.cam1]
+            [channels.cam1]
             source = "rtsp://user:secret@10.0.0.21/stream1"
 
-            [paths."floor2/cam3"]
+            [channels."floor2/cam3"]
             source = "rtsp://10.0.0.23/stream1"
             transport = "udp"
             "#,
@@ -250,13 +271,13 @@ mod tests {
                 "203.0.113.7:8189".parse().unwrap()
             ]
         );
-        assert_eq!(config.paths["cam1"].transport, Transport::Tcp);
-        assert_eq!(config.paths["floor2/cam3"].transport, Transport::Udp);
+        assert_eq!(config.channels["cam1"].transport, Transport::Tcp);
+        assert_eq!(config.channels["floor2/cam3"].transport, Transport::Udp);
     }
 
     #[test]
     fn what_cannot_be_used_is_refused_saying_what_and_no_secret() {
-        let error = Config::parse("[paths.cam1]\nsource = \"http://user:secret@10.0.0.21/\"")
+        let error = Config::parse("[channels.cam1]\nsource = \"http://user:secret@10.0.0.21/\"")
             .unwrap_err()
             .to_string();
         assert!(
@@ -265,6 +286,14 @@ mod tests {
         );
         assert!(Config::parse("[rtsp]\nport = 1").is_err(), "an unknown key");
         assert!(Config::parse("[webrtc]\ncandidates = [\"a host\"]").is_err());
+        for name in ["front door", "/cam", "cam//1", "cam?1", ""] {
+            let text = format!("[channels.\"{name}\"]\nsource = \"rtsp://10.0.0.1/\"");
+            assert!(
+                matches!(Config::parse(&text), Err(ConfigError::Name(_))),
+                "{name:?} goes into no URL as it is"
+            );
+        }
+        assert!(Config::parse("[channels.\"floor2/cam-3_a.b~c\"]\nsource = \"rtsp://h/\"").is_ok());
     }
 
     #[test]

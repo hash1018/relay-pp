@@ -1,25 +1,22 @@
 //! relay-pp: a streaming server on media-pp — see `docs/design.md`.
 //!
 //! [`Server::start`] binds every listener the configuration names and starts
-//! pulling every path's camera; [`Server::stop`] takes it all down again.
+//! every channel; [`Server::stop`] takes it all down again.
 
+mod channel;
 pub mod config;
 mod http;
-mod path;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use media_pp::driver::DriverRunner;
-use media_pp::elements::{
-    RtspPathMode, RtspServer, RtspServerHandle, RtspServerOptions, WebRtcPathMode, WebRtcServer,
-    WebRtcServerHandle, WebRtcServerOptions,
-};
+use media_pp::elements::{RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions};
 
+use channel::{Channel, Listeners};
+pub use channel::{ChannelStatus, InputState};
 pub use config::Config;
-use path::ServedPath;
-pub use path::{PathStatus, SourceState};
 
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
@@ -27,7 +24,10 @@ pub enum StartError {
     /// The configuration cannot be used.
     #[error(transparent)]
     Config(#[from] config::ConfigError),
-    /// A listener could not be opened, or a path not served.
+    /// A channel could not be registered.
+    #[error(transparent)]
+    Channel(#[from] channel::ChannelError),
+    /// A listener could not be opened.
     #[error("{what}: {error}")]
     Listen {
         /// Which.
@@ -39,18 +39,17 @@ pub enum StartError {
 
 /// A running server.
 pub struct Server {
-    paths: Arc<Mutex<BTreeMap<String, ServedPath>>>,
+    channels: http::Channels,
+    listeners: Listeners,
     rtsp: Arc<DriverRunner>,
-    rtsp_handle: RtspServerHandle,
     webrtc: Arc<DriverRunner>,
-    webrtc_handle: WebRtcServerHandle,
     http_addr: SocketAddr,
     runtime: Option<tokio::runtime::Runtime>,
     http_stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Server {
-    /// Binds every listener `config` names and starts every path. A
+    /// Binds every listener `config` names and starts every channel. A
     /// listener that cannot be bound stops the start, saying which.
     pub fn start(config: Config) -> Result<Self, StartError> {
         let listen = |what: &'static str| {
@@ -78,20 +77,17 @@ impl Server {
         let (webrtc, webrtc_handle) =
             WebRtcServer::bind("webrtc", config.webrtc.listen, webrtc_options)
                 .map_err(|error| listen("webrtc.listen")(error.into()))?;
+        let listeners = Listeners {
+            rtsp: rtsp_handle,
+            webrtc: webrtc_handle,
+        };
 
-        let mut paths = BTreeMap::new();
-        for (name, path_config) in &config.paths {
-            let path = ServedPath::start(name, path_config);
-            rtsp_handle
-                .add_path(name, path.broadcast(), RtspPathMode::Play)
-                .map_err(|error| listen("paths")(error.into()))?;
-            webrtc_handle
-                .add_path(name, path.broadcast(), WebRtcPathMode::Play)
-                .map_err(|error| listen("paths")(error.into()))?;
-            tracing::info!(path = %name, source = %config::redact(&path_config.source), "serving");
-            paths.insert(name.clone(), path);
+        let mut channels = BTreeMap::new();
+        for (name, channel_config) in &config.channels {
+            let channel = Channel::start(name, channel_config, &listeners)?;
+            channels.insert(name.clone(), Arc::new(channel));
         }
-        let paths = Arc::new(Mutex::new(paths));
+        let channels: http::Channels = Arc::new(RwLock::new(channels));
 
         let rtsp = DriverRunner::new(rtsp);
         rtsp.run().map_err(listen("rtsp"))?;
@@ -118,8 +114,8 @@ impl Server {
             error: error.to_string(),
         })?;
         let router = http::router(http::AppState {
-            paths: Arc::clone(&paths),
-            webrtc: webrtc_handle.clone(),
+            channels: Arc::clone(&channels),
+            webrtc: listeners.webrtc.clone(),
         });
         let (http_stop, stopped) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn(async move {
@@ -133,17 +129,16 @@ impl Server {
             }
         });
         tracing::info!(
-            rtsp = %rtsp_handle.local_addr(),
-            webrtc = %webrtc_handle.local_addr(),
+            rtsp = %listeners.rtsp.local_addr(),
+            webrtc = %listeners.webrtc.local_addr(),
             http = %http_addr,
             "listening"
         );
         Ok(Self {
-            paths,
+            channels,
+            listeners,
             rtsp,
-            rtsp_handle,
             webrtc,
-            webrtc_handle,
             http_addr,
             runtime: Some(runtime),
             http_stop: Some(http_stop),
@@ -152,12 +147,12 @@ impl Server {
 
     /// Where RTSP players connect.
     pub fn rtsp_addr(&self) -> SocketAddr {
-        self.rtsp_handle.local_addr()
+        self.listeners.rtsp.local_addr()
     }
 
     /// Where WebRTC media goes.
     pub fn webrtc_addr(&self) -> SocketAddr {
-        self.webrtc_handle.local_addr()
+        self.listeners.webrtc.local_addr()
     }
 
     /// Where the API and WHEP are.
@@ -165,13 +160,19 @@ impl Server {
         self.http_addr
     }
 
-    /// Every path's status, by name.
-    pub fn status(&self) -> Vec<PathStatus> {
-        let paths = self.paths.lock().unwrap_or_else(|p| p.into_inner());
-        paths.values().map(ServedPath::status).collect()
+    /// Every channel's status, by name.
+    pub fn status(&self) -> Vec<ChannelStatus> {
+        let channels: Vec<Arc<Channel>> = self
+            .channels
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        channels.iter().map(|channel| channel.status()).collect()
     }
 
-    /// Takes no more players, stops every path, then the listeners.
+    /// Takes no more players, stops every channel, then the listeners.
     pub fn stop(mut self) {
         self.shut_down();
     }
@@ -186,9 +187,10 @@ impl Server {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
         }
-        let paths = std::mem::take(&mut *self.paths.lock().unwrap_or_else(|p| p.into_inner()));
-        for (_, mut path) in paths {
-            path.stop();
+        let channels =
+            std::mem::take(&mut *self.channels.write().unwrap_or_else(|p| p.into_inner()));
+        for channel in channels.values() {
+            channel.stop();
         }
         self.webrtc.stop();
         self.rtsp.stop();

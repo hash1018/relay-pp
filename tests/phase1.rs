@@ -15,7 +15,7 @@ use media_pp::elements::{
 };
 use media_pp::ffmpeg;
 use media_pp::pipeline::Pipeline;
-use relay_pp::{Config, Server, SourceState};
+use relay_pp::{Config, InputState, Server};
 
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -147,7 +147,7 @@ fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     (status, body)
 }
 
-fn state_of(server: &Server) -> SourceState {
+fn state_of(server: &Server) -> InputState {
     server.status()[0].state
 }
 
@@ -163,15 +163,15 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
         listen = "127.0.0.1:0"
         [http]
         listen = "127.0.0.1:0"
-        [paths.cam1]
+        [channels.cam1]
         source = "rtsp://user:secret@{camera_addr}/cam"
         "#
     ))
     .unwrap();
     let server = Server::start(config).expect("start");
-    wait_for("the camera live", || state_of(&server) == SourceState::Live);
+    wait_for("the camera live", || state_of(&server) == InputState::Live);
 
-    let (status, body) = http_get(server.http_addr(), "/api/v1/paths");
+    let (status, body) = http_get(server.http_addr(), "/api/v1/channels");
     assert_eq!(status, 200, "{body}");
     assert!(
         body.contains(r#""name":"cam1""#) && body.contains(r#""state":"live""#),
@@ -181,7 +181,7 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
         !body.contains("secret"),
         "no credentials in an answer: {body}"
     );
-    let (status, _) = http_get(server.http_addr(), "/api/v1/paths/nowhere");
+    let (status, _) = http_get(server.http_addr(), "/api/v1/channels/nowhere");
     assert_eq!(status, 404);
 
     let (rtsp, over_rtsp) = rtsp_player(&format!("rtsp://{}/cam1", server.rtsp_addr()));
@@ -194,19 +194,17 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
         "both players read the broadcast"
     );
 
-    // The camera goes away: the path says why, and keeps its players.
+    // The camera goes away: the channel says why, and keeps its players.
     camera.stop();
-    wait_for("the drop noticed", || {
-        state_of(&server) != SourceState::Live
-    });
+    wait_for("the drop noticed", || state_of(&server) != InputState::Live);
     wait_for("the reason kept", || server.status()[0].error.is_some());
 
-    // It comes back where it was: the path connects again by itself, and
+    // It comes back where it was: the channel connects again by itself, and
     // the RTSP player, connected throughout, goes on.
     let camera = Camera::start(camera_addr);
     wait_for("the camera live again", || {
         let status = &server.status()[0];
-        status.state == SourceState::Live && status.connections == 2
+        status.state == InputState::Live && status.connections == 2
     });
     let before = over_rtsp.get();
     wait_for("RTSP packets after the camera came back", || {

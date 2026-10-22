@@ -6,7 +6,7 @@
 //! port to open and one place that decides who may play.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -16,20 +16,26 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use media_pp::elements::{SessionId, WebRtcServerError, WebRtcServerHandle};
 
-use crate::path::{PathStatus, ServedPath};
+use crate::channel::{Channel, ChannelStatus};
+
+/// Every channel by its name.
+pub(crate) type Channels = Arc<RwLock<BTreeMap<String, Arc<Channel>>>>;
 
 /// What the routes reach.
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) paths: Arc<Mutex<BTreeMap<String, ServedPath>>>,
+    /// Read on every request, written only as channels are added or
+    /// removed: a handler takes the channel it needs out and lets go of the
+    /// lock before doing anything that waits.
+    pub(crate) channels: Channels,
     pub(crate) webrtc: WebRtcServerHandle,
 }
 
 /// Every route.
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/v1/paths", get(list_paths))
-        .route("/api/v1/paths/{*name}", get(one_path))
+        .route("/api/v1/channels", get(list_channels))
+        .route("/api/v1/channels/{*name}", get(one_channel))
         .route(
             "/{*rest}",
             axum::routing::post(whep_offer)
@@ -39,34 +45,44 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn list_paths(State(state): State<AppState>) -> Response {
-    let paths: Vec<PathStatus> = {
-        let paths = state.paths.lock().unwrap_or_else(|p| p.into_inner());
-        paths.values().map(ServedPath::status).collect()
-    };
-    axum::Json(serde_json::json!({ "paths": paths })).into_response()
+/// The channel called `name`, the lock let go of.
+fn channel(state: &AppState, name: &str) -> Option<Arc<Channel>> {
+    state
+        .channels
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(name)
+        .cloned()
 }
 
-async fn one_path(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let status = {
-        let paths = state.paths.lock().unwrap_or_else(|p| p.into_inner());
-        paths.get(&name).map(ServedPath::status)
-    };
-    match status {
-        Some(status) => axum::Json(status).into_response(),
-        None => (StatusCode::NOT_FOUND, format!("no path {name}\n")).into_response(),
+async fn list_channels(State(state): State<AppState>) -> Response {
+    let channels: Vec<Arc<Channel>> = state
+        .channels
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let channels: Vec<ChannelStatus> = channels.iter().map(|channel| channel.status()).collect();
+    axum::Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
+async fn one_channel(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match channel(&state, &name) {
+        Some(channel) => axum::Json(channel.status()).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("no channel {name}\n")).into_response(),
     }
 }
 
-/// `POST /{path}/whep` with an SDP offer: a session playing the path, and
-/// its answer.
+/// `POST /{channel}/whep` with an SDP offer: a session playing the channel,
+/// and its answer.
 async fn whep_offer(
     State(state): State<AppState>,
     Path(rest): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(path) = rest.strip_suffix("/whep").map(str::to_owned) else {
+    let Some(name) = rest.strip_suffix("/whep").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let is_sdp = headers
@@ -85,19 +101,19 @@ async fn whep_offer(
     };
     let webrtc = state.webrtc.clone();
     let played = {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || webrtc.play(&path, &offer)).await
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || webrtc.play(&name, &offer)).await
     };
     match played {
         Ok(Ok((session, answer))) => {
-            tracing::info!(path = %path, "WebRTC player {session} joined");
+            tracing::info!(channel = %name, "WebRTC player {session} joined");
             let mut response = (StatusCode::CREATED, answer).into_response();
             let headers = response.headers_mut();
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/sdp"),
             );
-            if let Ok(location) = HeaderValue::from_str(&format!("/{path}/whep/{session}")) {
+            if let Ok(location) = HeaderValue::from_str(&format!("/{name}/whep/{session}")) {
                 headers.insert(header::LOCATION, location);
             }
             response
@@ -107,7 +123,7 @@ async fn whep_offer(
     }
 }
 
-/// `DELETE /{path}/whep/{session}`: the player leaves.
+/// `DELETE /{channel}/whep/{session}`: the player leaves.
 async fn whep_end(State(state): State<AppState>, Path(rest): Path<String>) -> Response {
     let session = rest
         .rsplit_once("/whep/")

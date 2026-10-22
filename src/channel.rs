@@ -113,13 +113,32 @@ pub struct ChannelError {
     error: String,
 }
 
-/// A channel being served.
+/// A channel being served: registered on every listener, its camera pulled
+/// on a thread of its own and connected again whenever it drops.
 pub struct Channel {
-    name: String,
-    source: String,
-    input: PullInput,
-    broadcast: Broadcast,
+    /// What the channel's thread shares with it.
+    inner: Arc<Inner>,
     outputs: Vec<Output>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// The half of a channel its thread works with.
+struct Inner {
+    name: String,
+    /// The camera's URL, credentials and all: what is opened.
+    url: String,
+    transport: RtspTransport,
+    broadcast: Broadcast,
+    input: Mutex<Input>,
+    stop: AtomicBool,
+}
+
+/// What the input is doing, as the status gives it.
+struct Input {
+    state: InputState,
+    since: SystemTime,
+    error: Option<String>,
+    connections: u64,
 }
 
 impl Channel {
@@ -131,10 +150,6 @@ impl Channel {
         listeners: &Listeners,
     ) -> Result<Self, ChannelError> {
         let broadcast = Broadcast::new(name, BroadcastOptions::default());
-        let fail = |error: String| ChannelError {
-            name: name.to_owned(),
-            error,
-        };
         let mut outputs = Vec::new();
         let registered = listeners
             .rtsp
@@ -152,26 +167,51 @@ impl Channel {
             for output in &outputs {
                 output.remove(name);
             }
-            return Err(fail(error));
+            return Err(ChannelError {
+                name: name.to_owned(),
+                error,
+            });
         }
-        let input = PullInput::start(name, config, &broadcast);
+
+        let inner = Arc::new(Inner {
+            name: name.to_owned(),
+            url: config.source.clone(),
+            transport: match config.transport {
+                Transport::Tcp => RtspTransport::Tcp,
+                Transport::Udp => RtspTransport::Udp,
+            },
+            broadcast,
+            input: Mutex::new(Input {
+                state: InputState::Connecting,
+                since: SystemTime::now(),
+                error: None,
+                connections: 0,
+            }),
+            stop: AtomicBool::new(false),
+        });
+        let thread = {
+            let inner = Arc::clone(&inner);
+            std::thread::Builder::new()
+                .name(format!("channel:{name}"))
+                .spawn(move || inner.run())
+                .expect("a thread can be started")
+        };
         tracing::info!(channel = %name, source = %redact(&config.source), "serving");
         Ok(Self {
-            name: name.to_owned(),
-            source: redact(&config.source),
-            input,
-            broadcast,
+            inner,
             outputs,
+            thread: Mutex::new(Some(thread)),
         })
     }
 
     /// What it is doing now.
     pub fn status(&self) -> ChannelStatus {
-        let input = self.input.shared.lock().unwrap_or_else(|p| p.into_inner());
-        let stats = self.broadcast.stats();
+        let inner = &self.inner;
+        let input = inner.input.lock().unwrap_or_else(|p| p.into_inner());
+        let stats = inner.broadcast.stats();
         ChannelStatus {
-            name: self.name.clone(),
-            source: self.source.clone(),
+            name: inner.name.clone(),
+            source: redact(&inner.url),
             state: input.state,
             since_ms: input
                 .since
@@ -185,15 +225,19 @@ impl Channel {
         }
     }
 
-    /// Takes it off every listener, stops its input — within the camera's
+    /// Takes it off every listener, stops its thread — within the camera's
     /// timeout at most, the time an open already under way may take — and
     /// closes its broadcast.
     pub(crate) fn stop(&self) {
         for output in &self.outputs {
-            output.remove(&self.name);
+            output.remove(&self.inner.name);
         }
-        self.input.stop();
-        self.broadcast.close();
+        self.inner.stop.store(true, Ordering::Release);
+        let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+        self.inner.broadcast.close();
     }
 }
 
@@ -203,72 +247,10 @@ impl Drop for Channel {
     }
 }
 
-struct InputShared {
-    state: InputState,
-    since: SystemTime,
-    error: Option<String>,
-    connections: u64,
-}
-
-/// A camera pulled on a thread of its own.
-struct PullInput {
-    shared: Arc<Mutex<InputShared>>,
-    stop: Arc<AtomicBool>,
-    thread: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl PullInput {
-    fn start(name: &str, config: &ChannelConfig, broadcast: &Broadcast) -> Self {
-        let shared = Arc::new(Mutex::new(InputShared {
-            state: InputState::Connecting,
-            since: SystemTime::now(),
-            error: None,
-            connections: 0,
-        }));
-        let stop = Arc::new(AtomicBool::new(false));
-        let puller = Puller {
-            name: name.to_owned(),
-            url: config.source.clone(),
-            transport: match config.transport {
-                Transport::Tcp => RtspTransport::Tcp,
-                Transport::Udp => RtspTransport::Udp,
-            },
-            broadcast: broadcast.clone(),
-            shared: Arc::clone(&shared),
-            stop: Arc::clone(&stop),
-        };
-        let thread = std::thread::Builder::new()
-            .name(format!("channel:{name}"))
-            .spawn(move || puller.run())
-            .expect("a thread can be started");
-        Self {
-            shared,
-            stop,
-            thread: Mutex::new(Some(thread)),
-        }
-    }
-
-    fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-        let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(thread) = thread {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// What the input's own thread does.
-struct Puller {
-    name: String,
-    url: String,
-    transport: RtspTransport,
-    broadcast: Broadcast,
-    shared: Arc<Mutex<InputShared>>,
-    stop: Arc<AtomicBool>,
-}
-
-impl Puller {
-    fn run(self) {
+impl Inner {
+    /// The channel's thread: pulls the camera, and connects again after a
+    /// wait whenever it fails, until the channel stops.
+    fn run(&self) {
         let mut wait = FIRST_WAIT;
         // Why it last failed, kept while it connects again.
         let mut last = None;
@@ -298,6 +280,10 @@ impl Puller {
 
     /// Pulls the camera until it fails — the reason — or the channel stops:
     /// `Ok`.
+    ///
+    /// Each connection is a pipeline of its own ending in the broadcast,
+    /// published again: the broadcast is what outlives it, and publishing
+    /// again is what tells its readers that one run ended and another began.
     fn pull(&self) -> Result<(), String> {
         let (source, streams) = RtspSource::open(
             format!("{}-camera", self.name),
@@ -310,17 +296,16 @@ impl Puller {
         .map_err(|error| format!("cannot open the camera: {error}"))?;
         // A camera's data or metadata stream goes nowhere: a broadcast
         // carries pictures and sound.
-        let kept: Vec<&StreamInfo> = streams
-            .iter()
+        let kept: Vec<StreamInfo> = streams
+            .into_iter()
             .filter(|stream| matches!(stream.kind(), media::Type::Video | media::Type::Audio))
             .collect();
         if kept.is_empty() {
             return Err("the camera sends neither pictures nor sound".into());
         }
-        let tracks: Vec<StreamInfo> = kept.iter().map(|stream| (*stream).clone()).collect();
         let sinks = self
             .broadcast
-            .publish(&tracks)
+            .publish(&kept)
             .map_err(|error| format!("cannot publish: {error}"))?;
         let (pipeline, ()) = Pipeline::new(format!("{}-pull", self.name), source, |source, ctx| {
             for (stream, sink) in kept.iter().zip(sinks) {
@@ -332,12 +317,8 @@ impl Puller {
         pipeline
             .run()
             .map_err(|error| format!("cannot start the camera: {error}"))?;
-        self.set(InputState::Live, None);
-        {
-            let mut shared = self.shared.lock().unwrap_or_else(|p| p.into_inner());
-            shared.connections += 1;
-        }
-        tracing::info!(channel = %self.name, "live");
+        self.went_live();
+
         let ended = loop {
             if self.stopped() {
                 pipeline.stop();
@@ -346,8 +327,7 @@ impl Puller {
             match pipeline.bus().recv_timeout(Duration::from_millis(200)) {
                 Ok(BusEvent::Error { error, .. }) => break format!("the camera failed: {error}"),
                 Ok(BusEvent::Finished) => break "the camera ended its stream".to_owned(),
-                Ok(_) => {}
-                Err(_) => {}
+                _ => {}
             }
         };
         pipeline.stop();
@@ -372,11 +352,20 @@ impl Puller {
     }
 
     fn set(&self, state: InputState, error: Option<String>) {
-        let mut shared = self.shared.lock().unwrap_or_else(|p| p.into_inner());
-        if shared.state != state {
-            shared.since = SystemTime::now();
+        let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+        if input.state != state {
+            input.since = SystemTime::now();
         }
-        shared.state = state;
-        shared.error = error;
+        input.state = state;
+        input.error = error;
+    }
+
+    fn went_live(&self) {
+        self.set(InputState::Live, None);
+        self.input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .connections += 1;
+        tracing::info!(channel = %self.name, "live");
     }
 }

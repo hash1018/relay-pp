@@ -5,9 +5,11 @@ takes streams in by whatever protocol they come — RTSP cameras, RTSP, RTMP
 and WHIP publishers — hands each out to RTSP, WebRTC and HLS players, and
 records what it is told to.
 
-Phase 1 is built — cameras pulled over RTSP, played over RTSP and WebRTC,
-their status over HTTP; [docs/design.md](docs/design.md) is the agreed scope
-and the order the rest is built in.
+Phase 1 is built — channels made over an HTTP API, each an RTSP camera
+pulled and played over RTSP and WebRTC (WHEP). [docs/status.md](docs/status.md)
+is what it does now, in full, and what it does not yet;
+[docs/design.md](docs/design.md) is the agreed scope and the order the rest
+is built in.
 
 ## Running
 

@@ -1,21 +1,24 @@
 //! relay-pp: a streaming server on media-pp — see `docs/design.md`.
 //!
-//! [`Server::start`] binds every listener the configuration names and starts
-//! every channel; [`Server::stop`] takes it all down again.
+//! [`Server::start`] binds every listener the configuration names, with no
+//! channel yet; channels are made and removed over the API, or
+//! [`Server::add_channel`] and [`Server::remove_channel`]. [`Server::stop`]
+//! takes it all down again.
 
 mod channel;
+mod channels;
 pub mod config;
 mod http;
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use media_pp::driver::DriverRunner;
 use media_pp::elements::{RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions};
 
-use channel::{Channel, Listeners};
-pub use channel::{ChannelStatus, SourceState};
+use channel::Listeners;
+pub use channel::{ChannelConfig, ChannelError, ChannelStatus, SourceState, Transport};
+use channels::Channels;
 pub use config::Config;
 
 /// Why the server could not start.
@@ -24,9 +27,6 @@ pub enum StartError {
     /// The configuration cannot be used.
     #[error(transparent)]
     Config(#[from] config::ConfigError),
-    /// A channel could not be registered.
-    #[error(transparent)]
-    Channel(#[from] channel::ChannelError),
     /// A listener could not be opened.
     #[error("{what}: {error}")]
     Listen {
@@ -39,7 +39,7 @@ pub enum StartError {
 
 /// A running server.
 pub struct Server {
-    channels: http::Channels,
+    channels: Arc<Channels>,
     listeners: Listeners,
     rtsp: Arc<DriverRunner>,
     webrtc: Arc<DriverRunner>,
@@ -49,8 +49,8 @@ pub struct Server {
 }
 
 impl Server {
-    /// Binds every listener `config` names and starts every channel. A
-    /// listener that cannot be bound stops the start, saying which.
+    /// Binds every listener `config` names. A listener that cannot be bound
+    /// stops the start, saying which.
     pub fn start(config: Config) -> Result<Self, StartError> {
         let listen = |what: &'static str| {
             move |error: media_pp::Error| StartError::Listen {
@@ -82,12 +82,7 @@ impl Server {
             webrtc: webrtc_handle,
         };
 
-        let mut channels = BTreeMap::new();
-        for (name, channel_config) in &config.channels {
-            let channel = Channel::start(name, channel_config, &listeners)?;
-            channels.insert(name.clone(), Arc::new(channel));
-        }
-        let channels: http::Channels = Arc::new(RwLock::new(channels));
+        let channels = Arc::new(Channels::new(listeners.clone()));
 
         let rtsp = DriverRunner::new(rtsp);
         rtsp.run().map_err(listen("rtsp"))?;
@@ -162,14 +157,24 @@ impl Server {
 
     /// Every channel's status, by name.
     pub fn status(&self) -> Vec<ChannelStatus> {
-        let channels: Vec<Arc<Channel>> = self
-            .channels
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        channels.iter().map(|channel| channel.status()).collect()
+        self.channels
+            .list()
+            .iter()
+            .map(|channel| channel.status())
+            .collect()
+    }
+
+    /// Makes a channel and starts pulling its source, as
+    /// `POST /api/v1/channels` does. May wait for a removal under way.
+    pub fn add_channel(&self, config: &ChannelConfig) -> Result<ChannelStatus, ChannelError> {
+        self.channels.add(config).map(|channel| channel.status())
+    }
+
+    /// Removes a channel, as `DELETE /api/v1/channels/{name}` does, once it
+    /// is off every listener and its source has stopped. Whether there was
+    /// one.
+    pub fn remove_channel(&self, name: &str) -> bool {
+        self.channels.remove(name)
     }
 
     /// Takes no more players, stops every channel, then the listeners.
@@ -187,11 +192,7 @@ impl Server {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
         }
-        let channels =
-            std::mem::take(&mut *self.channels.write().unwrap_or_else(|p| p.into_inner()));
-        for channel in channels.values() {
-            channel.stop();
-        }
+        self.channels.clear();
         self.webrtc.stop();
         self.rtsp.stop();
     }

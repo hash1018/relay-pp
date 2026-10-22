@@ -19,7 +19,7 @@ use media_pp::ffmpeg::media;
 use media_pp::pipeline::Pipeline;
 use serde::Serialize;
 
-use crate::config::{ChannelConfig, Transport, redact};
+use super::{ChannelConfig, Transport, redact};
 
 /// How long a camera has to answer, or to go on sending, before it is taken
 /// to be gone.

@@ -13,7 +13,7 @@ MediaMTX plays — built on [media-pp](https://github.com/hash1018/media-pp).
 | Repository | its own, beside media-pp |
 | First deployment | CCTV monitoring on a closed network |
 | HTTP and API | axum on tokio, one port — WHIP and WHEP included |
-| Configuration | TOML |
+| Configuration | TOML for the server; channels made over the API by whatever manages the inputs, none kept across a restart |
 | User interface | the API and a player page; no dashboard for now |
 
 ## What it is for
@@ -104,7 +104,7 @@ axum, one listener:
 
 | Route | What |
 |---|---|
-| `/api/v1/…` | channels and their status, sessions, recordings, reload, kick |
+| `/api/v1/…` | channels — made, removed, their status — sessions, recordings, kick |
 | `/playback/{channel}` | recordings by time |
 | `/{channel}` | a page that plays the channel in a browser |
 | `/{channel}/index.m3u8` and segments | HLS live |
@@ -123,8 +123,8 @@ its camera, not to play.
 
 ## Configuration
 
-One TOML file, read at start and again on `POST /api/v1/reload`: a reload
-adds, changes and removes channels without touching the others.
+One TOML file for the server — where it listens, where it records, who may
+play — read at start. Optional: every value has a default.
 
 ```toml
 [rtsp]
@@ -152,20 +152,26 @@ format = "fmp4"
 name = "operator"
 password = "..."
 play = ["*"]
-
-[channels.cam1]
-source = "rtsp://10.0.0.21/stream1"
-record = true
-
-[channels.cam2]
-source = "rtsp://10.0.0.22/stream1"
-on_demand = true
-
-# One entry for many cameras: the channel's name picks the address.
-[channels."~^cams/(\\d+)$"]
-source = "rtsp://10.0.1.$1/main"
-record = true
 ```
+
+**Channels are not in it.** Whatever manages the inputs — a VMS, a camera
+registry, a process of its own — makes and removes them over the API, and
+relay-pp keeps none across a restart: it starts empty, and the manager,
+seeing that in `GET /api/v1/channels`, makes them again.
+
+```
+POST   /api/v1/channels         {"name":"cam1","source":"rtsp://10.0.0.21/stream1",
+                                 "transport":"tcp","record":true}
+                                → 201 and the channel's status; 400 a name or source
+                                  that cannot be used; 409 a name taken
+DELETE /api/v1/channels/{name}  → 204 once it is off every listener and its
+                                  source has stopped; 404
+GET    /api/v1/channels[/{name}]
+```
+
+A source is changed by removing the channel and making it again. Fields
+beyond `name`, `source` and `transport` (`record`, `on_demand`) come with
+their phases.
 
 Secrets never reach a log line or an API answer; a URL with credentials is
 logged with them cut out.
@@ -183,7 +189,7 @@ logged with them cut out.
 ## Life of the process
 
 - Start: read the configuration, bind every listener (one that cannot stops
-  the start, saying why), open every always-on pulled source.
+  the start, saying why); no channel until the API makes one.
 - Stop: take no new sessions, finish every recording so its last segment is
   whole, close the listeners, then the sources — bounded, never a fixed
   sleep.
@@ -191,14 +197,15 @@ logged with them cut out.
 
 ## Phases
 
-1. **Core**: the configuration; channels with pulled RTSP sources, always on,
-   reconnecting; RTSP players, and WebRTC players through WHEP on the axum port; the status API; logs. The
-   CCTV case's live view.
+1. **Core**: the configuration; channels made and removed over the API, with
+   pulled RTSP sources, always on, reconnecting; RTSP players, and WebRTC
+   players through WHEP on the axum port; the status API; logs. The CCTV
+   case's live view.
 2. **Recording**: segments, retention, playback.
 3. **The player page and HLS live.**
 4. **Auth, hooks, metrics.**
 5. **Published sources** (RTSP, RTMP, WHIP), on-demand sources, forwarding,
-   event recording, reload.
+   event recording.
 6. **Packaging, and a soak**: a hundred pulled cameras for a day.
 
 Each phase ends with a run against real clients — VLC, ffplay, a browser, and
@@ -208,9 +215,9 @@ benchmarks have not measured.
 
 ## Borrowed and avoided
 
-From MediaMTX: names matched by a regex (its "channels"), on-demand sources, hooks, a playback server, a
-REST API and reload. From the CLAMOS server before media-pp: reconnecting
-sources with state events, event recording with a pre-buffer, restoring
-what was running at boot, systemd packaging — and not its polling loops,
+From MediaMTX: on-demand sources, hooks, a playback server, a REST API.
+From the CLAMOS server before media-pp: reconnecting sources with state
+events, event recording with a pre-buffer, systemd packaging — and not its
+polling loops,
 credentials in logs and committed configuration, an unauthenticated API, or
 a fixed sleep at shutdown.

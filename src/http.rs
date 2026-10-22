@@ -1,41 +1,39 @@
-//! The one HTTP port: the status API, and WHEP for WebRTC players — see
+//! The one HTTP port: the API, and WHEP for WebRTC players — see
 //! `docs/design.md`, "HTTP".
 //!
 //! WHEP is answered here over `WebRtcServerHandle::play` and `close` rather
 //! than by `WebRtcServer::serve_http`'s listener of its own, so there is one
 //! port to open and one place that decides who may play.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use media_pp::elements::{SessionId, WebRtcServerError, WebRtcServerHandle};
 
-use crate::channel::{Channel, ChannelStatus};
-
-/// Every channel by its name.
-pub(crate) type Channels = Arc<RwLock<BTreeMap<String, Arc<Channel>>>>;
+use crate::channel::{ChannelConfig, ChannelError, ChannelStatus};
+use crate::channels::Channels;
 
 /// What the routes reach.
 #[derive(Clone)]
 pub(crate) struct AppState {
-    /// Read on every request, written only as channels are added or
-    /// removed: a handler takes the channel it needs out and lets go of the
-    /// lock before doing anything that waits.
-    pub(crate) channels: Channels,
+    pub(crate) channels: Arc<Channels>,
     pub(crate) webrtc: WebRtcServerHandle,
 }
 
 /// Every route.
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/v1/channels", get(list_channels))
-        .route("/api/v1/channels/{*name}", get(one_channel))
+        .route("/api/v1/channels", get(list_channels).post(create_channel))
+        .route(
+            "/api/v1/channels/{*name}",
+            get(one_channel).delete(delete_channel),
+        )
         .route(
             "/{*rest}",
             axum::routing::post(whep_offer)
@@ -45,32 +43,73 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The channel called `name`, the lock let go of.
-fn channel(state: &AppState, name: &str) -> Option<Arc<Channel>> {
-    state
-        .channels
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(name)
-        .cloned()
-}
-
 async fn list_channels(State(state): State<AppState>) -> Response {
-    let channels: Vec<Arc<Channel>> = state
+    let channels: Vec<ChannelStatus> = state
         .channels
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .values()
-        .cloned()
+        .list()
+        .iter()
+        .map(|channel| channel.status())
         .collect();
-    let channels: Vec<ChannelStatus> = channels.iter().map(|channel| channel.status()).collect();
     axum::Json(serde_json::json!({ "channels": channels })).into_response()
 }
 
 async fn one_channel(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    match channel(&state, &name) {
+    match state.channels.get(&name) {
         Some(channel) => axum::Json(channel.status()).into_response(),
         None => (StatusCode::NOT_FOUND, format!("no channel {name}\n")).into_response(),
+    }
+}
+
+/// `POST /api/v1/channels` with a [`ChannelConfig`]: the channel made and
+/// started, and its status.
+async fn create_channel(
+    State(state): State<AppState>,
+    body: Result<axum::Json<ChannelConfig>, JsonRejection>,
+) -> Response {
+    let config = match body {
+        Ok(axum::Json(config)) => config,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("{}\n", rejection.body_text()),
+            )
+                .into_response();
+        }
+    };
+    let channels = Arc::clone(&state.channels);
+    let added =
+        tokio::task::spawn_blocking(move || channels.add(&config).map(|channel| channel.status()))
+            .await;
+    match added {
+        Ok(Ok(status)) => {
+            let mut response = (StatusCode::CREATED, axum::Json(&status)).into_response();
+            if let Ok(location) =
+                HeaderValue::from_str(&format!("/api/v1/channels/{}", status.name))
+            {
+                response.headers_mut().insert(header::LOCATION, location);
+            }
+            response
+        }
+        Ok(Err(error)) => {
+            let status = match error {
+                ChannelError::Name(_) | ChannelError::Source { .. } => StatusCode::BAD_REQUEST,
+                ChannelError::Exists(_) => StatusCode::CONFLICT,
+                ChannelError::Attach { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, format!("{error}\n")).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `DELETE /api/v1/channels/{name}`: answered once the channel is off every
+/// listener and its source has stopped.
+async fn delete_channel(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let channels = Arc::clone(&state.channels);
+    match tokio::task::spawn_blocking(move || channels.remove(&name)).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

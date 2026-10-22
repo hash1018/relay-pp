@@ -1,7 +1,8 @@
-//! relay-pp: `relay-pp [CONFIG]` serves what the configuration file says —
-//! `relay-pp.toml` where none is named — until Ctrl+C.
+//! relay-pp: `relay-pp [CONFIG]` listens where the configuration file says —
+//! `relay-pp.toml` where none is named, the defaults where there is none —
+//! until Ctrl+C. Channels are made over its API.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use relay_pp::{Config, Server};
@@ -25,20 +26,25 @@ fn main() -> ExitCode {
     };
 
     let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
-        .map_or_else(|| PathBuf::from("relay-pp.toml"), PathBuf::from);
+    let named = args.next().map(PathBuf::from);
     if args.next().is_some() {
         eprintln!("usage: relay-pp [CONFIG]");
         return ExitCode::from(2);
     }
-
-    let config = match Config::load(&path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
+    // A file named must be there; the default one need not be.
+    let path = named.or_else(|| {
+        let default = Path::new("relay-pp.toml");
+        default.exists().then(|| default.to_owned())
+    });
+    let config = match &path {
+        Some(path) => match Config::load(path) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("{}: {error}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => Config::default(),
     };
     let server = match Server::start(config) {
         Ok(server) => server,

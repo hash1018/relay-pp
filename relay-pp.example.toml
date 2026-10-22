@@ -1,7 +1,7 @@
 # relay-pp's configuration: copy to relay-pp.toml beside the program, or
 # name the file on the command line (`relay-pp path/to/file.toml`).
 # Every section is optional; what is shown below is the default where a
-# value is commented out.
+# value is commented out. Channels are not here: they are made over the API.
 
 [rtsp]
 # Where RTSP players connect: rtsp://<this machine>:8554/<channel>
@@ -20,15 +20,6 @@ candidates = ["192.168.0.10"]
 # threads = 2
 
 [http]
-# The status API (GET /api/v1/channels) and WHEP for browsers
-# (POST /<channel>/whep).
+# The API (channels are made with POST /api/v1/channels) and WHEP for
+# browsers (POST /<channel>/whep).
 # listen = "0.0.0.0:8888"
-
-# One section for each camera: a channel, its name what players ask for.
-[channels.cam1]
-source = "rtsp://admin:password@192.168.0.21/stream1"
-
-[channels."floor2/cam3"]
-source = "rtsp://192.168.0.23/stream1"
-# How the camera is pulled: "tcp" (the default, which loses nothing) or "udp".
-transport = "udp"

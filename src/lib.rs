@@ -82,22 +82,23 @@ impl Server {
             webrtc: webrtc_handle,
         };
 
-        let channels = Arc::new(Channels::new(listeners.clone()));
-
         let rtsp = DriverRunner::new(rtsp);
         rtsp.run().map_err(listen("rtsp"))?;
         let webrtc = DriverRunner::new(webrtc);
         webrtc.run().map_err(listen("webrtc"))?;
 
+        // The API, WHEP, and every channel's source task: what waits, not
+        // what carries media, which runs on threads of its own.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("http")
+            .thread_name("relay")
             .enable_all()
             .build()
             .map_err(|error| StartError::Listen {
-                what: "http",
+                what: "runtime",
                 error: error.to_string(),
             })?;
+        let channels = Arc::new(Channels::new(listeners.clone(), runtime.handle().clone()));
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind(config.http.listen))
             .map_err(|error| StartError::Listen {
@@ -165,14 +166,14 @@ impl Server {
     }
 
     /// Makes a channel and starts pulling its source, as
-    /// `POST /api/v1/channels` does. May wait for a removal under way.
+    /// `POST /api/v1/channels` does.
     pub fn add_channel(&self, config: &ChannelConfig) -> Result<ChannelStatus, ChannelError> {
         self.channels.add(config).map(|channel| channel.status())
     }
 
     /// Removes a channel, as `DELETE /api/v1/channels/{name}` does, once it
     /// is off every listener and its source has stopped. Whether there was
-    /// one.
+    /// one. Blocks the thread; not for an async caller.
     pub fn remove_channel(&self, name: &str) -> bool {
         self.channels.remove(name)
     }
@@ -189,10 +190,14 @@ impl Server {
         if let Some(stop) = self.http_stop.take() {
             let _ = stop.send(());
         }
+        // The channels before the runtime: their source tasks run on it, and
+        // stop their pipelines there as they end.
+        self.channels.clear();
         if let Some(runtime) = self.runtime.take() {
+            // What is left on it is a request under way and an open a halt
+            // let go of, which ends within a camera's timeout by itself.
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
         }
-        self.channels.clear();
         self.webrtc.stop();
         self.rtsp.stop();
     }

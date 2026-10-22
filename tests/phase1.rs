@@ -344,44 +344,42 @@ fn pulling(name: &str, camera: SocketAddr) -> ChannelConfig {
 }
 
 #[test]
-fn removing_a_channel_stuck_opening_holds_up_no_other_add() {
+fn removing_a_channel_stuck_opening_waits_for_no_open_and_holds_up_no_add() {
     let silent = silent_camera();
-    let server = Arc::new(server());
+    let server = server();
     server
         .add_channel(&pulling("stuck", silent.local_addr().unwrap()))
         .unwrap();
-    // Opening it now waits out the camera's timeout, and so does its
-    // removal.
-    let removing = std::thread::spawn({
-        let server = Arc::clone(&server);
-        move || server.remove_channel("stuck")
-    });
-    wait_for("the stuck channel gone from the list", || {
-        server.status().is_empty()
-    });
+    // Its open waits out the camera's timeout; the removal lets go of it.
+    std::thread::sleep(Duration::from_millis(200));
     let began = Instant::now();
-    server
-        .add_channel(&pulling("other", silent.local_addr().unwrap()))
-        .unwrap();
+    assert!(server.remove_channel("stuck"));
     assert!(
         began.elapsed() < Duration::from_secs(1),
-        "an add waited {:?} for a removal",
+        "a removal waited {:?} for an open",
         began.elapsed()
     );
-    // And the name is free again at once.
-    server
-        .add_channel(&pulling("stuck", silent.local_addr().unwrap()))
-        .unwrap();
-    assert!(removing.join().unwrap());
-    Arc::into_inner(server).unwrap().stop();
+    // And the name is free again at once, the other adds unheld.
+    let began = Instant::now();
+    for name in ["stuck", "other"] {
+        server
+            .add_channel(&pulling(name, silent.local_addr().unwrap()))
+            .unwrap();
+    }
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "adds waited {:?}",
+        began.elapsed()
+    );
+    server.stop();
 }
 
 #[test]
-fn stopping_waits_for_every_camera_together() {
+fn stopping_waits_for_no_camera_opening() {
     let silent = silent_camera();
     let server = server();
-    // Opens begun across a camera's timeout, none of which a stop can cut
-    // short: the stop waits for them together, one timeout at most.
+    // Opens begun across a camera's timeout, none of which a stop waits
+    // out: the runtime's own shutdown gives what is left of them 2 seconds.
     for i in 0..10 {
         server
             .add_channel(&pulling(&format!("cam{i}"), silent.local_addr().unwrap()))
@@ -391,8 +389,8 @@ fn stopping_waits_for_every_camera_together() {
     let began = Instant::now();
     server.stop();
     assert!(
-        began.elapsed() < Duration::from_secs(7),
-        "stopping took {:?}: longer than one camera's timeout",
+        began.elapsed() < Duration::from_secs(4),
+        "stopping took {:?}",
         began.elapsed()
     );
 }

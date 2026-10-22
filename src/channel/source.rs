@@ -6,14 +6,15 @@
 //! its own — so this keeps how to open it, and the broadcast, which outlives
 //! every one of them.
 //!
-//! Its thread waits on nothing it has to look at again: between connections
-//! on a condition variable a stop rings, and while connected on the
-//! pipeline's bus, which a stop empties by stopping the pipeline.
+//! Each connection's pipeline runs on its own thread, as media-pp runs
+//! every pipeline: that is the camera's data. What watches it — opens the
+//! camera, waits on the pipeline's bus, waits before connecting again, and
+//! hears a halt — is a task on the server's runtime, holding no thread while
+//! it waits; the open, which blocks, goes to the runtime's blocking pool.
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use media_pp::bus::BusEvent;
@@ -23,6 +24,8 @@ use media_pp::elements::{
 use media_pp::ffmpeg::media;
 use media_pp::pipeline::Pipeline;
 use serde::Serialize;
+use tokio::runtime::Handle;
+use tokio::sync::watch;
 
 use super::{ChannelConfig, Transport, redact};
 
@@ -62,15 +65,18 @@ pub(super) struct SourceStatus {
     pub(super) connections: u64,
 }
 
-/// A camera pulled on a thread of its own, into a broadcast.
+/// A camera pulled by a task, into a broadcast.
 pub(super) struct Source {
-    /// What the source's thread shares with it.
+    /// What the source's task shares with it.
     inner: Arc<Inner>,
-    /// `None` before [`Source::run`] and after [`Source::wait`].
-    thread: Mutex<Option<JoinHandle<()>>>,
+    /// Set once, by [`Source::halt`]; the task watches it.
+    halt: watch::Sender<bool>,
+    /// Whether the task has ended — set as it goes, however it goes, which
+    /// [`Source::wait`] waits for. True before [`Source::run`].
+    done: Arc<Done>,
 }
 
-/// The half of a source its thread works with.
+/// The half of a source its task works with.
 struct Inner {
     name: String,
     /// The camera's URL, credentials and all: what is opened.
@@ -78,10 +84,6 @@ struct Inner {
     transport: RtspTransport,
     broadcast: Broadcast,
     state: Mutex<State>,
-    control: Mutex<Control>,
-    /// Rung by [`Source::halt`], for a thread waiting before it connects
-    /// again.
-    halted: Condvar,
 }
 
 struct State {
@@ -91,14 +93,21 @@ struct State {
     connections: u64,
 }
 
-/// What a stop reaches the thread through: one lock, so a stop cannot fall
-/// between the thread starting a pipeline and putting it where the stop
-/// looks.
-#[derive(Default)]
-struct Control {
-    halted: bool,
-    /// The connection's pipeline, while one runs.
-    pipeline: Option<Arc<Pipeline>>,
+/// A task having ended, for a thread to wait on.
+struct Done {
+    done: Mutex<bool>,
+    ended: Condvar,
+}
+
+/// Owned by the task: says it is done as it drops — when the task returns,
+/// and when a runtime shutting down drops it unfinished.
+struct Finishing(Arc<Done>);
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        *self.0.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.0.ended.notify_all();
+    }
 }
 
 impl Source {
@@ -120,10 +129,12 @@ impl Source {
                     error: None,
                     connections: 0,
                 }),
-                control: Mutex::default(),
-                halted: Condvar::new(),
             }),
-            thread: Mutex::new(None),
+            halt: watch::Sender::new(false),
+            done: Arc::new(Done {
+                done: Mutex::new(true),
+                ended: Condvar::new(),
+            }),
         }
     }
 
@@ -132,14 +143,17 @@ impl Source {
         &self.inner.broadcast
     }
 
-    /// Starts pulling the camera, connecting again whenever it fails.
-    pub(super) fn run(&self) {
+    /// Starts pulling the camera on `runtime`, connecting again whenever it
+    /// fails.
+    pub(super) fn run(&self, runtime: &Handle) {
+        *self.done.done.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        let finishing = Finishing(Arc::clone(&self.done));
         let inner = Arc::clone(&self.inner);
-        let thread = std::thread::Builder::new()
-            .name(format!("source:{}", inner.name))
-            .spawn(move || inner.run())
-            .expect("a thread can be started");
-        *self.thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread);
+        let halt = self.halt.subscribe();
+        runtime.spawn(async move {
+            let _finishing = finishing;
+            inner.run(halt).await;
+        });
     }
 
     pub(super) fn status(&self) -> SourceStatus {
@@ -153,60 +167,59 @@ impl Source {
         }
     }
 
-    /// Tells its thread to stop, without waiting for it: what
-    /// [`Self::wait`] then waits for. Many sources are halted first and
-    /// waited for after, so they stop together rather than one after another.
+    /// Tells its task to stop, without waiting: the task lets go of an open
+    /// under way at once — it finishes on the blocking pool and is dropped
+    /// — and stops a connection's pipeline.
     pub(super) fn halt(&self) {
-        self.inner
-            .control
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .halted = true;
-        self.inner.halted.notify_all();
+        self.halt.send_replace(true);
     }
 
-    /// Stops what [`Self::halt`] told to — the connection's pipeline, within
-    /// the camera's timeout at most, and an open already under way within
-    /// the same — waits for its thread, and closes its broadcast.
+    /// Halts it and waits for its task to end — no longer than a
+    /// connection's pipeline takes to stop, which for a camera gone silent
+    /// is its timeout. Blocks the thread: never call it on the runtime's.
     pub(super) fn wait(&self) {
         self.halt();
-        let pipeline = self
-            .inner
-            .control
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pipeline
-            .take();
-        if let Some(pipeline) = pipeline {
-            pipeline.stop();
-        }
-        let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(thread) = thread {
-            let _ = thread.join();
-        }
-        self.inner.broadcast.close();
+        let done = self.done.done.lock().unwrap_or_else(|p| p.into_inner());
+        drop(
+            self.done
+                .ended
+                .wait_while(done, |done| !*done)
+                .unwrap_or_else(|p| p.into_inner()),
+        );
     }
 }
 
 impl Drop for Source {
+    /// Halts it only: a source is dropped wherever its channel's last
+    /// handle goes, a request on the runtime among them, which must not
+    /// wait. The task ends by itself, and its broadcast closes as the task
+    /// lets go of it.
     fn drop(&mut self) {
-        self.wait();
+        self.halt();
     }
 }
 
+/// How a connection ended, as far as the task's loop cares.
+enum Ended {
+    /// Halted: the task ends.
+    Halted,
+    /// Failed, and why: the camera is connected again after a wait.
+    Failed(String),
+}
+
 impl Inner {
-    /// The source's thread: pulls the camera, and connects again after a
-    /// wait whenever it fails, until the source is halted.
-    fn run(&self) {
+    /// The source's task: pulls the camera, and connects again after a wait
+    /// whenever it fails, until it is halted.
+    async fn run(self: Arc<Self>, mut halt: watch::Receiver<bool>) {
         let mut wait = FIRST_WAIT;
         // Why it last failed, kept while it connects again.
         let mut last = None;
-        while !self.halted() {
+        loop {
             self.set(SourceState::Connecting, last.clone());
             let began = Instant::now();
-            let reason = match self.pull() {
-                Ok(()) => break,
-                Err(reason) => reason,
+            let reason = match Arc::clone(&self).pull(&mut halt).await {
+                Ended::Halted => break,
+                Ended::Failed(reason) => reason,
             };
             if began.elapsed() >= STAYED_UP {
                 wait = FIRST_WAIT;
@@ -221,16 +234,18 @@ impl Inner {
             );
             self.set(SourceState::Waiting, Some(reason.clone()));
             last = Some(reason);
-            if !self.sleep(spread) {
-                break;
+            tokio::select! {
+                () = tokio::time::sleep(spread) => {}
+                _ = halt.wait_for(|halted| *halted) => break,
             }
             wait = (wait * 2).min(LONGEST_WAIT);
         }
+        self.broadcast.close();
     }
 
     /// Opens the camera: a media-pp source, and the streams of it a
     /// broadcast carries — pictures and sound, not a camera's data or
-    /// metadata streams.
+    /// metadata streams. Blocks, up to the camera's timeout.
     fn open(&self) -> Result<(RtspSource, Vec<StreamInfo>), String> {
         let (source, streams) = RtspSource::open(
             format!("{}-camera", self.name),
@@ -251,17 +266,49 @@ impl Inner {
         Ok((source, kept))
     }
 
-    /// Pulls the camera until it fails — the reason — or the source is
-    /// halted: `Ok`.
+    /// Pulls the camera until it fails or the source is halted.
     ///
     /// Each connection is a pipeline of its own ending in the broadcast,
     /// published again: the broadcast is what outlives it, and publishing
     /// again is what tells its readers that one run ended and another began.
-    fn pull(&self) -> Result<(), String> {
-        let (source, streams) = self.open()?;
+    async fn pull(self: Arc<Self>, halt: &mut watch::Receiver<bool>) -> Ended {
+        let opening = tokio::task::spawn_blocking({
+            let inner = Arc::clone(&self);
+            move || inner.open()
+        });
+        let opened = tokio::select! {
+            opened = opening => opened,
+            // The open goes on to its end on the blocking pool, and what it
+            // opens is dropped there.
+            _ = halt.wait_for(|halted| *halted) => return Ended::Halted,
+        };
+        let (source, streams) = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(reason)) => return Ended::Failed(reason),
+            Err(_) => return Ended::Failed("opening the camera panicked".into()),
+        };
+        let pipeline = match self.start(source, &streams) {
+            Ok(pipeline) => pipeline,
+            Err(reason) => return Ended::Failed(reason),
+        };
+        self.went_live();
+
+        let ended = tokio::select! {
+            reason = watch_bus(&pipeline) => Ended::Failed(reason),
+            _ = halt.wait_for(|halted| *halted) => Ended::Halted,
+        };
+        // Stopping joins the pipeline's thread, which a camera gone silent
+        // holds up to its timeout: not on the runtime's own threads.
+        let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
+        ended
+    }
+
+    /// Publishes `streams` again and starts a pipeline writing `source`
+    /// into them.
+    fn start(&self, source: RtspSource, streams: &[StreamInfo]) -> Result<Arc<Pipeline>, String> {
         let sinks = self
             .broadcast
-            .publish(&streams)
+            .publish(streams)
             .map_err(|error| format!("cannot publish: {error}"))?;
         let (pipeline, ()) = Pipeline::new(format!("{}-pull", self.name), source, |source, ctx| {
             for (stream, sink) in streams.iter().zip(sinks) {
@@ -273,56 +320,7 @@ impl Inner {
         pipeline
             .run()
             .map_err(|error| format!("cannot start the camera: {error}"))?;
-        {
-            let mut control = self.control.lock().unwrap_or_else(|p| p.into_inner());
-            if control.halted {
-                drop(control);
-                pipeline.stop();
-                return Ok(());
-            }
-            control.pipeline = Some(Arc::clone(&pipeline));
-        }
-        self.went_live();
-
-        // Blocks until the pipeline says why it ended, or until a halt stops
-        // it and its bus empties.
-        let ended = loop {
-            match pipeline.bus().recv() {
-                Some(BusEvent::Error { error, .. }) => {
-                    break Some(format!("the camera failed: {error}"));
-                }
-                Some(BusEvent::Finished) => break Some("the camera ended its stream".to_owned()),
-                Some(_) => {}
-                None => break None,
-            }
-        };
-        self.control
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pipeline = None;
-        pipeline.stop();
-        match ended {
-            Some(reason) if !self.halted() => Err(reason),
-            _ => Ok(()),
-        }
-    }
-
-    fn halted(&self) -> bool {
-        self.control
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .halted
-    }
-
-    /// Waits `wait`, or less where the source is halted: whether it waited
-    /// it all.
-    fn sleep(&self, wait: Duration) -> bool {
-        let control = self.control.lock().unwrap_or_else(|p| p.into_inner());
-        let (control, _) = self
-            .halted
-            .wait_timeout_while(control, wait, |control| !control.halted)
-            .unwrap_or_else(|p| p.into_inner());
-        !control.halted
+        Ok(pipeline)
     }
 
     fn set(&self, state: SourceState, error: Option<String>) {
@@ -341,6 +339,20 @@ impl Inner {
             .unwrap_or_else(|p| p.into_inner())
             .connections += 1;
         tracing::info!(channel = %self.name, "live");
+    }
+}
+
+/// Why a connection's pipeline ended, as its bus says — which it does only
+/// for a failure or the camera ending its stream, since nothing else stops
+/// it while this waits.
+async fn watch_bus(pipeline: &Pipeline) -> String {
+    loop {
+        match pipeline.bus().recv_async().await {
+            Some(BusEvent::Error { error, .. }) => return format!("the camera failed: {error}"),
+            Some(BusEvent::Finished) => return "the camera ended its stream".to_owned(),
+            Some(_) => {}
+            None => return "the camera's pipeline ended".to_owned(),
+        }
     }
 }
 

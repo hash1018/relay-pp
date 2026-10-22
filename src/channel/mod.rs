@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 
 pub(crate) use sink::Listeners;
 use sink::Sink;
@@ -126,12 +127,13 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Attaches a channel's sinks to every listener and starts its source.
-    /// Nothing is left attached, and nothing opened, where it cannot be
-    /// made.
+    /// Attaches a channel's sinks to every listener and starts its source's
+    /// task on `runtime`. Nothing is left attached, and nothing opened, where
+    /// it cannot be made.
     pub(crate) fn start(
         config: &ChannelConfig,
         listeners: &Listeners,
+        runtime: &Handle,
     ) -> Result<Self, ChannelError> {
         config.check()?;
         let name = &config.name;
@@ -142,7 +144,7 @@ impl Channel {
                 error,
             }
         })?;
-        source.run();
+        source.run(runtime);
         tracing::info!(channel = %name, source = %redact(&config.source), "serving");
         Ok(Self {
             name: name.clone(),
@@ -186,8 +188,9 @@ impl Channel {
         tracing::info!(channel = %self.name, "removed");
     }
 
-    /// Halts it, and waits for its source to stop — within the camera's
-    /// timeout at most.
+    /// Halts it, and waits for its source's task to end — no longer than a
+    /// connection's pipeline takes to stop. Blocks the thread: never call it
+    /// on the runtime's.
     pub(crate) fn stop(&self) {
         self.halt();
         self.source.wait();
@@ -195,8 +198,10 @@ impl Channel {
 }
 
 impl Drop for Channel {
+    /// Halts it only: the last handle to a channel may go in a request on
+    /// the runtime, which must not wait. Its source's task ends by itself.
     fn drop(&mut self) {
-        self.stop();
+        self.halt();
     }
 }
 

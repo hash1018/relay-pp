@@ -67,11 +67,12 @@ that goes.
 
 ### `DELETE /api/v1/channels/{name}` — remove one
 
-`204` once it is off every listener and its camera is let go of — up to
-5 seconds if an open is under way. `404` if there is none. The name is free
-again at once, while the old camera is still being let go of, and a removal
-waiting on its camera holds up no other request. A source is changed by
-removing the channel and making it again.
+`204` once it is off every listener and its camera is let go of: at once
+while the camera is being opened or waited for, and once its connection has
+stopped while it is live — up to 5 seconds for a camera gone silent. `404`
+if there is none. The name is free again at once, and a removal holds up no
+other request. A source is changed by removing the channel and making it
+again.
 
 ### `GET /api/v1/channels` and `GET /api/v1/channels/{name}`
 
@@ -119,16 +120,28 @@ Credentials never reach an answer or a log line.
 
 ## Stopping
 
-A stop takes no more requests, lets go of every camera together — 5 seconds
-at most, however many there are — then closes the listeners.
+A stop takes no more requests, lets go of every camera together — however
+many there are, no longer than the slowest live connection takes to stop,
+and what is left of opens under way is given 2 seconds — then closes the
+listeners.
+
+## Threads
+
+Each live camera's connection is a media-pp pipeline on a thread of its own,
+the camera's data. Everything that waits — the API, WHEP, and each channel's
+watcher, which opens its camera, waits on its pipeline and before connecting
+again — is a task on one tokio runtime of two threads; an open, which
+blocks, borrows a thread of the runtime's blocking pool while it runs. The
+RTSP and WebRTC listeners have threads of their own, shared by every
+channel.
 
 ## Verified
 
 `cargo test` runs on the loopback alone, with a camera of media-pp's own:
 pulled, played over RTSP and WHEP, followed across the camera going away and
 coming back; channels made, refused, removed and made again under the same
-name over the API; a removal not holding up an add; a stop bounded by one
-camera timeout with ten cameras opening. By hand: a file served by media-pp's
+name over the API; a removal of a camera being opened answering at once and
+holding up no add; a stop with ten cameras opening waiting for none of them. By hand: a file served by media-pp's
 `rtsp_server` example as the camera, FFmpeg playing over RTSP (TCP and
 UDP), two WHEP players through media-pp's `webrtc_load`, and reconnection
 after the camera was gone for a minute.

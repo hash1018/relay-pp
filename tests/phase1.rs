@@ -15,7 +15,7 @@ use media_pp::elements::{
 };
 use media_pp::ffmpeg;
 use media_pp::pipeline::Pipeline;
-use relay_pp::{Config, InputState, Server};
+use relay_pp::{Config, Server, SourceState};
 
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -147,7 +147,7 @@ fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     (status, body)
 }
 
-fn state_of(server: &Server) -> InputState {
+fn state_of(server: &Server) -> SourceState {
     server.status()[0].state
 }
 
@@ -169,7 +169,7 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
     ))
     .unwrap();
     let server = Server::start(config).expect("start");
-    wait_for("the camera live", || state_of(&server) == InputState::Live);
+    wait_for("the camera live", || state_of(&server) == SourceState::Live);
 
     let (status, body) = http_get(server.http_addr(), "/api/v1/channels");
     assert_eq!(status, 200, "{body}");
@@ -196,7 +196,9 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
 
     // The camera goes away: the channel says why, and keeps its players.
     camera.stop();
-    wait_for("the drop noticed", || state_of(&server) != InputState::Live);
+    wait_for("the drop noticed", || {
+        state_of(&server) != SourceState::Live
+    });
     wait_for("the reason kept", || server.status()[0].error.is_some());
 
     // It comes back where it was: the channel connects again by itself, and
@@ -204,7 +206,7 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
     let camera = Camera::start(camera_addr);
     wait_for("the camera live again", || {
         let status = &server.status()[0];
-        status.state == InputState::Live && status.connections == 2
+        status.state == SourceState::Live && status.connections == 2
     });
     let before = over_rtsp.get();
     wait_for("RTSP packets after the camera came back", || {

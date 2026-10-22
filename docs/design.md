@@ -56,7 +56,7 @@ reconnecting, recording files and their retention, HTTP, and reporting.
 
 ```
             ┌────────────────────── channel "cam1" ────────────────────────┐
- source ──▶ │ ingest ──▶ Broadcast ──┬──▶ RtspServer   (players)           │
+ source ──▶ │ Source ──▶ Broadcast ──┬──▶ RtspServer   (players)           │
  (pull or   │ (reconnects)           ├──▶ WebRtcServer (players)           │
   publish)  │                        ├──▶ HLS (live, over HTTP)            │
             │                        ├──▶ recorder (segments + retention)  │
@@ -64,7 +64,7 @@ reconnecting, recording files and their retention, HTTP, and reporting.
             └──────────────────────────────────────────────────────────────┘
 ```
 
-A **channel** is a name, one input, one `Broadcast`, and the outputs that read
+A **channel** is a name, one source, one `Broadcast`, and the sinks that read
 it: the unit of configuration, authorization, statistics and recording.
 
 **Sources**:
@@ -81,7 +81,7 @@ each failure's reason logged and kept in the channel's status. The `Broadcast`
 outlives every reconnection, so players stay connected and go on at the next
 keyframe.
 
-**Outputs**: every player protocol the server runs, unless a channel turns one
+**Sinks**: every player protocol the server runs, unless a channel turns one
 off; HLS where enabled. **Recording** and **forwarding** are per channel.
 
 ## Recording

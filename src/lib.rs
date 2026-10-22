@@ -15,7 +15,7 @@ use media_pp::driver::DriverRunner;
 use media_pp::elements::{RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions};
 
 use channel::{Channel, Listeners};
-pub use channel::{ChannelStatus, InputState};
+pub use channel::{ChannelStatus, SourceState};
 pub use config::Config;
 
 /// Why the server could not start.

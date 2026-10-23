@@ -1,6 +1,6 @@
 # relay-pp — design
 
-Status: agreed scope, 2026-10-23. Phase 1 is built — what it does is in
+Status: agreed scope, 2026-10-23. Phases 1 and 2 are built — what they do is in
 [status.md](status.md).
 
 relay-pp takes streams in by whatever protocol they come, hands each out by
@@ -66,7 +66,9 @@ reconnecting, recording files and their retention, HTTP, and reporting.
 ```
 
 A **channel** is a name, one source, one `Broadcast`, and the sinks that read
-it: the unit of configuration, authorization, statistics and recording.
+it: the unit of configuration, authorization, statistics and recording. It
+is made with its source alone; what reads it is asked for separately — a
+player by its protocol, a recording over the API — and attached as it is.
 
 **Sources**:
 
@@ -82,20 +84,31 @@ each failure's reason logged and kept in the channel's status. The `Broadcast`
 outlives every reconnection, so players stay connected and go on at the next
 keyframe.
 
-**Sinks**: every player protocol the server runs, unless a channel turns one
-off; HLS where enabled. **Recording** and **forwarding** are per channel.
+**Sinks**: a players' listener, registered when a player first asks for the
+channel by that protocol — an RTSP player through the API, which answers
+with the URL to open since an RTSP player never reaches the HTTP port, a
+WebRTC player by its WHEP offer — and kept until the channel goes;
+**recording**, attached and detached over the API; **forwarding** per
+channel.
 
 ## Recording
 
-- Segments of a configured length (default 60 s), cut on keyframes, in
-  `<dir>/<channel>/<YYYY-MM-DD>/<HH-MM-SS>.<ext>`.
-- Fragmented MP4 by default, readable even when the process dies mid-segment;
-  MPEG-TS for a channel whose source may change its picture size partway (a
-  WebRTC publisher), which an MP4 refuses.
-- Retention: segments older than a period, or the oldest beyond a size, per
-  channel or for all.
-- Playback: `/playback/{channel}?from=&to=` answers an HLS VOD playlist over the
-  segments, or one file of them.
+As HLS, so a recording is played as it is written and after, by any HLS
+player and over plain HTTP:
+
+- A chunk is a directory, `<dir>/<channel>/<YYYY-MM-DD>/<HH-MM-SS>/` in UTC,
+  of an event playlist and one fragmented MP4 file, every segment (default
+  4 s, cut at the next keyframe) a byte range of it — an hour one file, not
+  nine hundred. A chunk runs to the next whole multiple of its length in UTC
+  (default an hour), and ends as the camera drops, another beginning as it
+  comes back: no chunk runs from one connection into the next.
+- What is cut off keeps every segment its playlist lists.
+- A camera that changes its picture size within a connection is connected
+  again, so that a new chunk describes it: an MP4 refuses the change.
+- Retention: chunks last written longer ago than a period, then the oldest
+  beyond a size, for all.
+- Playback: `/playback/{channel}/index.m3u8?from=&to=` answers a VOD playlist
+  across the chunks, a discontinuity between each and the time each began.
 - Event recording (later): the last N seconds kept in a `ReplayBuffer` and
   written out with what follows when the API or a hook says so.
 
@@ -105,8 +118,9 @@ axum, one listener:
 
 | Route | What |
 |---|---|
-| `/api/v1/…` | channels — made, removed, their status — sessions, recordings, kick |
-| `/playback/{channel}` | recordings by time |
+| `/api/v1/…` | channels — made, removed, played, recorded, their status — sessions, recordings, kick |
+| `/playback/{channel}/index.m3u8` | recordings by time |
+| `/recordings/…` | the recordings' files, as written |
 | `/{channel}` | a page that plays the channel in a browser |
 | `/{channel}/index.m3u8` and segments | HLS live |
 | `/{channel}/whep`, `/{channel}/whip` | WebRTC play and publish |
@@ -145,9 +159,10 @@ listen = "0.0.0.0:8888"
 
 [record]
 dir = "/var/lib/relay-pp/record"
-segment = "60s"
+segment = "4s"
+chunk = "1h"
 keep = "30d"
-format = "fmp4"
+max_size = "2TB"
 
 [[auth.users]]
 name = "operator"
@@ -161,18 +176,21 @@ relay-pp keeps none across a restart: it starts empty, and the manager,
 seeing that in `GET /api/v1/channels`, makes them again.
 
 ```
-POST   /api/v1/channels         {"name":"cam1","source":"rtsp://10.0.0.21/stream1",
-                                 "transport":"tcp","record":true}
-                                → 201 and the channel's status; 400 a name or source
-                                  that cannot be used; 409 a name taken
-DELETE /api/v1/channels/{name}  → 204 once it is off every listener and its
-                                  source has stopped; 404
+POST   /api/v1/channels                {"name":"cam1","source":"rtsp://10.0.0.21/stream1",
+                                        "transport":"tcp"}   its source alone, pulled from now
+POST   /api/v1/channels/{name}/play    {"protocol":"rtsp"} → {"url":"rtsp://<host>:8554/cam1"}
+POST   /{name}/whep                    a WebRTC player's offer: no question first
+POST   /api/v1/channels/{name}/record  begin recording it
+DELETE /api/v1/channels/{name}/record  end it
+DELETE /api/v1/channels/{name}
 GET    /api/v1/channels[/{name}]
+GET    /api/v1/recordings/{name}
 ```
 
-A source is changed by removing the channel and making it again. Fields
-beyond `name`, `source` and `transport` (`record`, `on_demand`) come with
-their phases.
+A player's request waits up to ten seconds for the camera to be live. A
+source is changed by removing the channel and making it again; `on_demand`
+comes with its phase. [status.md](status.md) has every request and answer
+as built.
 
 Secrets never reach a log line or an API answer; a URL with credentials is
 logged with them cut out.
@@ -202,7 +220,7 @@ logged with them cut out.
    pulled RTSP sources, always on, reconnecting; RTSP players, and WebRTC
    players through WHEP on the axum port; the status API; logs. The CCTV
    case's live view.
-2. **Recording**: segments, retention, playback.
+2. **Recording**: as HLS, attached over the API; retention, playback.
 3. **The player page and HLS live.**
 4. **Auth, hooks, metrics.**
 5. **Published sources** (RTSP, RTMP, WHIP), on-demand sources, forwarding,

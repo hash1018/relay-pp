@@ -7,30 +7,34 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::runtime::Handle;
 
-use crate::channel::{Channel, ChannelConfig, ChannelError, Listeners};
+use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, Listeners, Protocol};
+use crate::config::RecordConfig;
 
 pub(crate) struct Channels {
     /// Read on every request, written only as a channel is added or
     /// removed: a reader takes the channel it needs out and lets go of the
     /// lock before doing anything that waits.
     map: RwLock<BTreeMap<String, Arc<Channel>>>,
-    /// Held across a whole add, and a removal up to its sinks being
-    /// detached. They are attached and detached by name, so one being
-    /// removed must be off every listener before another of its name is
-    /// attached; waiting for its source is left outside, so a camera slow
-    /// to let go holds up no other add or remove.
+    /// Held across a whole add, a registration on a listener, and a
+    /// removal up to its registrations being taken off. They are made and
+    /// taken off by name, so a channel removed must be off every listener
+    /// before another of its name is registered; waiting for what it ends
+    /// is left outside, so a camera slow to let go holds nothing up.
     changing: Mutex<()>,
     listeners: Listeners,
-    /// Where every channel's source runs its task.
+    /// How a recorded channel is recorded.
+    pub(crate) record: RecordConfig,
+    /// Where every channel's tasks run.
     runtime: Handle,
 }
 
 impl Channels {
-    pub(crate) fn new(listeners: Listeners, runtime: Handle) -> Self {
+    pub(crate) fn new(listeners: Listeners, record: RecordConfig, runtime: Handle) -> Self {
         Self {
             map: RwLock::default(),
             changing: Mutex::default(),
             listeners,
+            record,
             runtime,
         }
     }
@@ -53,13 +57,13 @@ impl Channels {
             .collect()
     }
 
-    /// Makes a channel and starts it.
+    /// Makes a channel of its source alone and starts pulling it.
     pub(crate) fn add(&self, config: &ChannelConfig) -> Result<Arc<Channel>, ChannelError> {
-        let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
+        let _changing = self.changing();
         if self.get(&config.name).is_some() {
             return Err(ChannelError::Exists(config.name.clone()));
         }
-        let channel = Arc::new(Channel::start(config, &self.listeners, &self.runtime)?);
+        let channel = Arc::new(Channel::start(config, &self.record, &self.runtime)?);
         self.map
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -67,12 +71,47 @@ impl Channels {
         Ok(channel)
     }
 
+    /// The channel called `name`, registered on `protocol`'s listener
+    /// where it was not yet.
+    pub(crate) fn stream(
+        &self,
+        name: &str,
+        protocol: Protocol,
+    ) -> Result<Arc<Channel>, AttachError> {
+        let _changing = self.changing();
+        let channel = self
+            .get(name)
+            .ok_or_else(|| AttachError::NoChannel(name.to_owned()))?;
+        channel.stream(protocol, &self.listeners)?;
+        Ok(channel)
+    }
+
+    /// Begins recording the channel called `name`.
+    pub(crate) fn record(&self, name: &str) -> Result<(), AttachError> {
+        self.get(name)
+            .ok_or_else(|| AttachError::NoChannel(name.to_owned()))?
+            .attach_record()
+    }
+
+    /// Ends the recording of the channel called `name`, returning once it
+    /// is finished, its playlist ended. Blocks the thread: never call it on
+    /// the runtime's.
+    pub(crate) fn unrecord(&self, name: &str) -> Result<(), AttachError> {
+        let recorder = self
+            .get(name)
+            .ok_or_else(|| AttachError::NoChannel(name.to_owned()))?
+            .detach_record()?;
+        recorder.wait();
+        Ok(())
+    }
+
     /// Removes a channel and stops it, returning once it is off every
-    /// listener and its source's task has ended. Whether there was one.
-    /// Blocks the thread: never call it on the runtime's.
+    /// listener, its recording finished and its source's task ended.
+    /// Whether there was one. Blocks the thread: never call it on the
+    /// runtime's.
     pub(crate) fn remove(&self, name: &str) -> bool {
         let removed = {
-            let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
+            let _changing = self.changing();
             let removed = self
                 .map
                 .write()
@@ -97,7 +136,7 @@ impl Channels {
     /// thread: never call it on the runtime's.
     pub(crate) fn clear(&self) {
         let all = {
-            let _changing = self.changing.lock().unwrap_or_else(|p| p.into_inner());
+            let _changing = self.changing();
             let all = std::mem::take(&mut *self.map.write().unwrap_or_else(|p| p.into_inner()));
             for channel in all.values() {
                 channel.halt();
@@ -107,5 +146,9 @@ impl Channels {
         for channel in all.values() {
             channel.stop();
         }
+    }
+
+    fn changing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.changing.lock().unwrap_or_else(|p| p.into_inner())
     }
 }

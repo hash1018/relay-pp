@@ -4,10 +4,15 @@
 # value is commented out. Channels are not here: they are made over the API.
 
 [rtsp]
-# Where RTSP players connect: rtsp://<this machine>:8554/<channel>
+# Where RTSP players connect.
 # listen = "0.0.0.0:8554"
 # Whether players may ask for RTP over UDP as well as over their connection.
 # udp = true
+# What the URL POST /api/v1/channels/<name>/play answers with begins with,
+# where players reach this machine by another address than the API's
+# callers — behind a router, say. Without it: the host the request came to,
+# and `listen`'s port.
+# public_url = "rtsp://cctv.example.com:8554"
 
 [webrtc]
 # The UDP address WebRTC media goes through.
@@ -20,6 +25,18 @@ candidates = ["192.168.0.10"]
 # threads = 2
 
 [http]
-# The API (channels are made with POST /api/v1/channels) and WHEP for
-# browsers (POST /<channel>/whep).
+# The API, WHEP for browsers (POST /<name>/whep) and recordings.
 # listen = "0.0.0.0:8888"
+
+[record]
+# Where recordings go: <dir>/<name>/<YYYY-MM-DD>/<HH-MM-SS>/, in UTC, each an
+# HLS playlist and one media file.
+# dir = "recordings"
+# How long a segment is — what a player seeks to — cut at the next keyframe.
+# segment = "4s"
+# How long one recording directory runs, at whole multiples of it in UTC.
+# chunk = "1h"
+# How long a recording is kept from its last write, and how much all of them
+# may take, the oldest removed first. Kept for ever where neither is set.
+# keep = "30d"
+# max_size = "500GB"

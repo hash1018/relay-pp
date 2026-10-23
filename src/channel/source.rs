@@ -14,7 +14,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use media_pp::bus::BusEvent;
@@ -25,8 +25,9 @@ use media_pp::ffmpeg::media;
 use media_pp::pipeline::Pipeline;
 use serde::Serialize;
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
+use super::task::Task;
 use super::{ChannelConfig, Transport, redact};
 
 /// How long a camera has to answer, or to go on sending, before it is taken
@@ -69,11 +70,7 @@ pub(super) struct SourceStatus {
 pub(super) struct Source {
     /// What the source's task shares with it.
     inner: Arc<Inner>,
-    /// Set once, by [`Source::halt`]; the task watches it.
-    halt: watch::Sender<bool>,
-    /// Whether the task has ended — set as it goes, however it goes, which
-    /// [`Source::wait`] waits for. True before [`Source::run`].
-    done: Arc<Done>,
+    task: Task,
 }
 
 /// The half of a source its task works with.
@@ -84,6 +81,12 @@ struct Inner {
     transport: RtspTransport,
     broadcast: Broadcast,
     state: Mutex<State>,
+    /// Which connection is live — its count — while one is: what a
+    /// recorder begins a recording on, and ends one at.
+    runs: watch::Sender<Option<u64>>,
+    /// Rung to end the live connection and open the camera again at once —
+    /// see [`Source::reconnect`].
+    reconnect: Arc<Notify>,
 }
 
 struct State {
@@ -91,23 +94,6 @@ struct State {
     since: SystemTime,
     error: Option<String>,
     connections: u64,
-}
-
-/// A task having ended, for a thread to wait on.
-struct Done {
-    done: Mutex<bool>,
-    ended: Condvar,
-}
-
-/// Owned by the task: says it is done as it drops — when the task returns,
-/// and when a runtime shutting down drops it unfinished.
-struct Finishing(Arc<Done>);
-
-impl Drop for Finishing {
-    fn drop(&mut self) {
-        *self.0.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        self.0.ended.notify_all();
-    }
 }
 
 impl Source {
@@ -129,13 +115,20 @@ impl Source {
                     error: None,
                     connections: 0,
                 }),
+                runs: watch::Sender::new(None),
+                reconnect: Arc::new(Notify::new()),
             }),
-            halt: watch::Sender::new(false),
-            done: Arc::new(Done {
-                done: Mutex::new(true),
-                ended: Condvar::new(),
-            }),
+            task: Task::new(),
         }
+    }
+
+    /// What ends the live connection and opens the camera again at once,
+    /// without a wait: for a reader that cannot go on with what the
+    /// connection began as — a recording of a camera that changed its
+    /// picture size, which a new connection describes anew. Nothing where
+    /// no connection is live.
+    pub(super) fn reconnect(&self) -> Arc<Notify> {
+        Arc::clone(&self.inner.reconnect)
     }
 
     /// What it writes into.
@@ -143,17 +136,16 @@ impl Source {
         &self.inner.broadcast
     }
 
+    /// Which connection is live, while one is, and each change of it.
+    pub(super) fn runs(&self) -> watch::Receiver<Option<u64>> {
+        self.inner.runs.subscribe()
+    }
+
     /// Starts pulling the camera on `runtime`, connecting again whenever it
     /// fails.
     pub(super) fn run(&self, runtime: &Handle) {
-        *self.done.done.lock().unwrap_or_else(|p| p.into_inner()) = false;
-        let finishing = Finishing(Arc::clone(&self.done));
         let inner = Arc::clone(&self.inner);
-        let halt = self.halt.subscribe();
-        runtime.spawn(async move {
-            let _finishing = finishing;
-            inner.run(halt).await;
-        });
+        self.task.spawn(runtime, |halt| inner.run(halt));
     }
 
     pub(super) fn status(&self) -> SourceStatus {
@@ -171,31 +163,14 @@ impl Source {
     /// under way at once — it finishes on the blocking pool and is dropped
     /// — and stops a connection's pipeline.
     pub(super) fn halt(&self) {
-        self.halt.send_replace(true);
+        self.task.halt();
     }
 
     /// Halts it and waits for its task to end — no longer than a
     /// connection's pipeline takes to stop, which for a camera gone silent
     /// is its timeout. Blocks the thread: never call it on the runtime's.
     pub(super) fn wait(&self) {
-        self.halt();
-        let done = self.done.done.lock().unwrap_or_else(|p| p.into_inner());
-        drop(
-            self.done
-                .ended
-                .wait_while(done, |done| !*done)
-                .unwrap_or_else(|p| p.into_inner()),
-        );
-    }
-}
-
-impl Drop for Source {
-    /// Halts it only: a source is dropped wherever its channel's last
-    /// handle goes, a request on the runtime among them, which must not
-    /// wait. The task ends by itself, and its broadcast closes as the task
-    /// lets go of it.
-    fn drop(&mut self) {
-        self.halt();
+        self.task.wait();
     }
 }
 
@@ -205,6 +180,8 @@ enum Ended {
     Halted,
     /// Failed, and why: the camera is connected again after a wait.
     Failed(String),
+    /// Ended to be connected again at once.
+    Reconnect,
 }
 
 impl Inner {
@@ -220,6 +197,10 @@ impl Inner {
             let reason = match Arc::clone(&self).pull(&mut halt).await {
                 Ended::Halted => break,
                 Ended::Failed(reason) => reason,
+                Ended::Reconnect => {
+                    tracing::info!(channel = %self.name, "connecting again, as asked");
+                    continue;
+                }
             };
             if began.elapsed() >= STAYED_UP {
                 wait = FIRST_WAIT;
@@ -296,10 +277,12 @@ impl Inner {
         let ended = tokio::select! {
             reason = watch_bus(&pipeline) => Ended::Failed(reason),
             _ = halt.wait_for(|halted| *halted) => Ended::Halted,
+            () = self.reconnect.notified() => Ended::Reconnect,
         };
         // Stopping joins the pipeline's thread, which a camera gone silent
         // holds up to its timeout: not on the runtime's own threads.
         let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
+        self.runs.send_replace(None);
         ended
     }
 
@@ -334,10 +317,12 @@ impl Inner {
 
     fn went_live(&self) {
         self.set(SourceState::Live, None);
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .connections += 1;
+        let connection = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.connections += 1;
+            state.connections
+        };
+        self.runs.send_replace(Some(connection));
         tracing::info!(channel = %self.name, "live");
     }
 }

@@ -1,8 +1,7 @@
-//! A channel's sinks: what hands its broadcast out.
-//!
-//! Each is the channel registered on one of the server's listeners, which
-//! every channel shares: one port each, the channel picked by the name in
-//! the URL.
+//! A channel's player sinks: the channel registered on one of the server's
+//! listeners, which every channel shares — one port each, the channel
+//! picked by the name in the URL. Registered when a player first asks for
+//! the channel by that protocol, and kept until the channel goes.
 
 use media_pp::elements::{
     Broadcast, RtspPathMode, RtspServerHandle, WebRtcPathMode, WebRtcServerHandle,
@@ -15,54 +14,60 @@ pub(crate) struct Listeners {
     pub(crate) webrtc: WebRtcServerHandle,
 }
 
-/// One of a channel's sinks.
+/// Which listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protocol {
+    Rtsp,
+    WebRtc,
+}
+
+impl Protocol {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Protocol::Rtsp => "rtsp",
+            Protocol::WebRtc => "webrtc",
+        }
+    }
+}
+
+/// A channel registered on one listener.
 pub(super) enum Sink {
-    /// The channel registered on the RTSP listener.
     Rtsp(RtspServerHandle),
-    /// The channel registered on the WebRTC listener.
     WebRtc(WebRtcServerHandle),
 }
 
 impl Sink {
-    /// Every sink a channel has on `listeners`, reading `broadcast`. Where
-    /// one cannot be attached, those already attached are detached again.
-    pub(super) fn attach_all(
+    /// Registers the channel called `name`, reading `broadcast`, on
+    /// `protocol`'s listener.
+    pub(super) fn attach(
+        protocol: Protocol,
         name: &str,
         broadcast: &Broadcast,
         listeners: &Listeners,
-    ) -> Result<Vec<Sink>, String> {
-        let mut sinks = Vec::new();
-        let attached = listeners
-            .rtsp
-            .add_path(name, broadcast, RtspPathMode::Play)
-            .map(|()| sinks.push(Sink::Rtsp(listeners.rtsp.clone())))
-            .map_err(|error| error.to_string())
-            .and_then(|()| {
-                listeners
-                    .webrtc
-                    .add_path(name, broadcast, WebRtcPathMode::Play)
-                    .map(|()| sinks.push(Sink::WebRtc(listeners.webrtc.clone())))
-                    .map_err(|error| error.to_string())
-            });
-        match attached {
-            Ok(()) => Ok(sinks),
-            Err(error) => {
-                for sink in &sinks {
-                    sink.detach(name);
-                }
-                Err(error)
-            }
+    ) -> Result<Sink, String> {
+        match protocol {
+            Protocol::Rtsp => listeners
+                .rtsp
+                .add_path(name, broadcast, RtspPathMode::Play)
+                .map(|()| Sink::Rtsp(listeners.rtsp.clone()))
+                .map_err(|error| error.to_string()),
+            Protocol::WebRtc => listeners
+                .webrtc
+                .add_path(name, broadcast, WebRtcPathMode::Play)
+                .map(|()| Sink::WebRtc(listeners.webrtc.clone()))
+                .map_err(|error| error.to_string()),
         }
     }
 
-    pub(super) fn kind(&self) -> &'static str {
+    pub(super) fn protocol(&self) -> Protocol {
         match self {
-            Sink::Rtsp(_) => "rtsp",
-            Sink::WebRtc(_) => "webrtc",
+            Sink::Rtsp(_) => Protocol::Rtsp,
+            Sink::WebRtc(_) => Protocol::WebRtc,
         }
     }
 
     /// Takes the channel off the listener: no player opens it from here.
+    /// Those playing it go on until its broadcast closes.
     pub(super) fn detach(&self, name: &str) {
         match self {
             Sink::Rtsp(listener) => {

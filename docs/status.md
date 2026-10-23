@@ -1,16 +1,19 @@
 # What relay-pp does now
 
-Phase 1 of [the design](design.md), as built. What is planned but not here
-is listed at the end.
+Phases 1 and 2 of [the design](design.md), as built. What is planned but
+not here is listed at the end.
 
 ## In one paragraph
 
 relay-pp starts with no channel. Whatever manages the cameras — a process of
-its own — makes each one over the HTTP API, naming an RTSP camera. relay-pp
-pulls that camera for as long as the channel is there, connecting again
-whenever it drops, and hands the stream out, as the camera sent it, to RTSP
-players and to WebRTC players through WHEP. Nothing is decoded or encoded.
-Nothing is kept across a restart: the manager makes the channels again.
+its own — makes each one over the HTTP API with its source alone, an RTSP
+camera, which relay-pp pulls from then on, connecting again whenever it
+drops. What reads a channel is asked for separately: an RTSP player asks
+the API where to play it and is told a URL; a WebRTC player offers to its
+WHEP URL; a recording is attached and detached over the API, and written
+as HLS a player can follow while it is written and play back afterwards.
+Nothing is decoded or encoded. Nothing is kept across a restart but the
+recordings: the manager makes the channels again.
 
 ## Running it
 
@@ -18,10 +21,11 @@ Nothing is kept across a restart: the manager makes the channels again.
 relay-pp [CONFIG]
 ```
 
-`CONFIG` is a TOML file of where to listen (below). With none named,
-`relay-pp.toml` is read if it is there, and the defaults are used if it is
-not. Ctrl+C stops it. relay-pp logs to the terminal (`RUST_LOG` filters it,
-`info` by default) and media-pp's own records go to `logs/`.
+`CONFIG` is a TOML file of where to listen and how to record (below). With
+none named, `relay-pp.toml` is read if it is there, and the defaults are
+used if it is not. Ctrl+C stops it. relay-pp logs to the terminal
+(`RUST_LOG` filters it, `info` by default) and media-pp's own records go to
+`logs/`.
 
 ## Configuration
 
@@ -32,17 +36,40 @@ has them all with comments.
 |---|---|---|
 | `rtsp.listen` | `0.0.0.0:8554` | where RTSP players connect |
 | `rtsp.udp` | `true` | whether players may ask for RTP over UDP as well as over their connection |
+| `rtsp.public_url` | none | what the URL the API gives an RTSP player begins with, `"rtsp://cctv.example.com:8554"`, where players reach this machine by another address than the API's callers; without it, the host the API request came to and `listen`'s port |
 | `webrtc.listen` | `0.0.0.0:8189` | the UDP address WebRTC media goes through |
 | `webrtc.candidates` | none | addresses players are told to send to — a router's public address, the machine's own where `listen` is every interface; an IP alone keeps `listen`'s port |
 | `webrtc.threads` | media-pp's default | how many threads WebRTC sessions are spread over, each a UDP port of its own from `listen`'s on |
-| `http.listen` | `0.0.0.0:8888` | the API and WHEP |
+| `http.listen` | `0.0.0.0:8888` | the API, WHEP and recordings |
+| `record.dir` | `recordings` | where recordings go |
+| `record.segment` | `"4s"` | how long a recorded segment is — what a player seeks to — cut at the next keyframe after it |
+| `record.chunk` | `"1h"` | how long one recording directory runs, at whole multiples of it in UTC |
+| `record.keep` | none | how long a recording is kept from its last write: `"30d"` |
+| `record.max_size` | none | how much all recordings together may take, the oldest removed first: `"500GB"`, `"2TiB"` |
 
-A key it does not know, or a candidate that is not an address, stops the
-start. So does a listener that cannot be bound, naming which.
+Durations are a number and `ms`, `s`, `m`, `h` or `d`; sizes a number of
+bytes, or one with `KB` … `TB` (1000-based) or `KiB` … `TiB` (1024-based).
+A key it does not know, a candidate that is not an address, or a chunk
+shorter than a segment stops the start. So does a listener that cannot be
+bound, naming which.
 
-## Channels: the API
+## The API
 
-On the HTTP port. JSON in and out.
+On the HTTP port. JSON in and out. A channel's name is letters, digits,
+`-`, `_`, `.` and `~` — not `/`, so that it is one part of a URL's path —
+and not `api`, `playback` or `recordings`.
+
+| | | |
+|---|---|---|
+| `POST /api/v1/channels` | make a channel: its source alone | `201`; `400`, `409` |
+| `GET /api/v1/channels` | every channel's status | `200` |
+| `GET /api/v1/channels/{name}` | one channel's status | `200`; `404` |
+| `DELETE /api/v1/channels/{name}` | remove it | `204`; `404` |
+| `POST /api/v1/channels/{name}/play` | where an RTSP player plays it | `200`; `400`, `404`, `503` |
+| `POST /api/v1/channels/{name}/record` | begin recording it | `201`; `404`, `409` |
+| `DELETE /api/v1/channels/{name}/record` | end recording it | `204`; `404` |
+| `GET /api/v1/recordings/{name}` | its recordings | `200` |
+| `GET /playback/{name}/index.m3u8` | a stretch of its recordings, as one playlist | `200`; `400`, `404` |
 
 ### `POST /api/v1/channels` — make one
 
@@ -52,27 +79,23 @@ On the HTTP port. JSON in and out.
 
 | Field | | |
 |---|---|---|
-| `name` | required | what players ask for: `rtsp://host:8554/<name>`, `/<name>/whep`. Letters, digits, `-`, `_`, `.`, `~`, in parts between single `/` (`floor2/cam3`) |
+| `name` | required | what it goes by: in the API, `rtsp://host:8554/<name>`, `/<name>/whep` |
 | `source` | required | an `rtsp://` or `rtsps://` URL |
 | `transport` | `"tcp"` | how the camera is pulled: `"tcp"`, RTP on the RTSP connection, which loses nothing; or `"udp"` |
 
-| Answer | When |
-|---|---|
-| `201` | made and started; the body is its status, `Location` its URL |
-| `400` | a name or source that cannot be used, a field missing or unknown, not JSON |
-| `409` | a channel of that name is there already |
-
-It answers at once. The camera is opened afterwards, and its status says how
-that goes.
+`201` with its status, `Location` its URL; `400` for a name or source that
+cannot be used, a field missing or unknown, or not JSON; `409` for a name
+taken. It answers at once; the camera is opened afterwards, and pulled from
+then on, played or not.
 
 ### `DELETE /api/v1/channels/{name}` — remove one
 
-`204` once it is off every listener and its camera is let go of: at once
-while the camera is being opened or waited for, and once its connection has
-stopped while it is live — up to 5 seconds for a camera gone silent. `404`
-if there is none. The name is free again at once, and a removal holds up no
-other request. A source is changed by removing the channel and making it
-again.
+`204` once it is off every listener, its recording finished and its camera
+let go of: at once while the camera is being opened or waited for, and once
+its connection has stopped while it is live — up to 5 seconds for a camera
+gone silent. `404` if there is none. The name is free again at once, and a
+removal holds up no other request. A source is changed by removing the
+channel and making it again.
 
 ### `GET /api/v1/channels` and `GET /api/v1/channels/{name}`
 
@@ -87,16 +110,18 @@ there. Each is:
 | `since_ms` | since when, in milliseconds since the Unix epoch |
 | `error` | why it last failed, while it is not live |
 | `connections` | how many times it has gone live |
-| `readers` | players reading it now |
+| `readers` | players and recordings reading it now |
 | `bytes` | what it has been sent, over every connection |
-| `sinks` | where it is played: `["rtsp", "webrtc"]` |
+| `sinks` | what reads it: `"rtsp"` and `"webrtc"` once a player has asked for it so, `"record"` while it is recorded |
+| `recording` | the playlist of the recording being written, while one is |
+| `record_error` | why its last recording failed, until one is written again |
 
 Credentials never reach an answer or a log line.
 
 ## A channel's camera
 
-- Opened with a 5-second timeout, which also bounds how long it may go
-  without sending before it is taken to be gone.
+- Opened when the channel is made, with a 5-second timeout, which also
+  bounds how long it may go without sending before it is taken to be gone.
 - Its pictures and sound are kept; a data or metadata stream is left out.
 - When it fails it is opened again after 1 second, then 2, 4 … up to 30,
   each spread ±20% so cameras one outage dropped are not all opened again
@@ -107,60 +132,144 @@ Credentials never reach an answer or a log line.
 
 ## Players
 
-- **RTSP** at `rtsp://<host>:8554/<channel>`, RTP over TCP or UDP. Any codec
-  the camera sends.
-- **WebRTC through WHEP** at `http://<host>:8888/<channel>/whep`, by any WHEP
+A channel is registered on a players' listener when a player first asks for
+it by that protocol, and stays registered until the channel goes. Being
+registered costs nothing while nobody plays; the camera is pulled either
+way.
+
+- **RTSP.** `POST /api/v1/channels/{name}/play` with `{"protocol":"rtsp"}`
+  answers `{"url": "rtsp://<host>:8554/<name>"}`, the host the request came
+  to unless `rtsp.public_url` says otherwise. An RTSP player connects to the
+  RTSP port and not to the API, so what is to play a channel over RTSP asks
+  first; before, the RTSP listener does not know the channel. RTP over TCP
+  or UDP; any codec the camera sends.
+- **WebRTC through WHEP** at `http://<host>:8888/<name>/whep`, by any WHEP
   client (a page in relay-pp comes in phase 3): `POST` an `application/sdp`
-  offer, `201` with the answer and `Location: /<channel>/whep/<session>`;
-  `DELETE` that to leave; `OPTIONS` says what it takes. `404` for no such
-  channel, `503` while it has nothing a WebRTC player can be sent — not live
-  yet, or no track in a codec WebRTC carries (H.264, H.265, VP8, VP9, AV1,
-  Opus, G.711). A camera's AAC sound is left out for WebRTC players; a
-  browser plays H.264 without B-frames.
+  offer, `201` with the answer and `Location: /<name>/whep/<session>`;
+  `DELETE` that to leave; `OPTIONS` says what it takes. The offer is the
+  asking: there is nothing to call first. A track in a codec WebRTC does not
+  carry is left out — a camera's AAC sound — and WebRTC carries H.264, H.265,
+  VP8, VP9, AV1, Opus and G.711; a browser plays H.264 without B-frames.
+
+Either waits up to 10 seconds for the camera to be live — a channel just
+made, or a camera connecting again — and answers `503` saying why where it
+is not; `404` for no such channel.
+
+## Recording
+
+`POST /api/v1/channels/{name}/record` begins recording a channel, from the
+newest keyframe it holds where it is live; `DELETE` ends it, answering once
+the recording under way is finished. A channel is recorded until told
+otherwise, across its camera dropping and coming back.
+
+What is written:
+
+```
+<record.dir>/<name>/<YYYY-MM-DD>/<HH-MM-SS>/    in UTC: when it began
+    index.m3u8      an HLS event playlist, ended (#EXT-X-ENDLIST) when the recording is
+    media.m4s       fragmented MP4: the initialization section, then every segment
+```
+
+- A recording directory — a chunk — runs until the next whole multiple of
+  `record.chunk` in UTC, and another begins. One also ends as the camera
+  drops, and another begins as it comes back, so no recording runs from one
+  connection into the next, whose picture may differ.
+- The playlist lists each segment by its byte range in the one media file:
+  an hour of four-second segments is one file, not nine hundred.
+- A player follows a recording being written by its own playlist, at
+  `/recordings/<name>/<YYYY-MM-DD>/<HH-MM-SS>/index.m3u8` — a few segments
+  behind live. Everything under `/recordings/` is served as it is, ranges
+  included.
+- What is cut off — the process dying, power lost — keeps every segment the
+  playlist lists; what is lost is the segment under way.
+- A recording that fails — a full disk — says why in `record_error` and is
+  begun again 5 seconds later.
+- Each recording is a media-pp pipeline on a thread of its own, so a disk
+  slow to take a write holds up that camera's recording and no other.
+
+### `GET /api/v1/recordings/{name}`
+
+`{"recordings": [ … ]}`, oldest first, whether or not the channel is there
+now: each `start` (RFC 3339), `duration_s`, `bytes`, whether it is
+`recording` still, and its `playlist`.
+
+### `GET /playback/{name}/index.m3u8?from=…&to=…`
+
+A finished (VOD) HLS playlist of every segment that overlaps `from`..`to`,
+RFC 3339 times in UTC (`2026-10-23T14:00:00Z`); from the first recording,
+and to now, where either is left out. Each recording follows the last with
+a discontinuity between and the time it began (`#EXT-X-PROGRAM-DATE-TIME`).
+`400` for a time it cannot read, `404` where nothing was recorded then.
+
+A recording's start is when its directory was made, and its first picture
+the keyframe it began at, which arrived up to a keyframe interval before:
+the times given are late by up to that.
+
+### Retention
+
+With `record.keep` or `record.max_size` set, recordings are swept at start
+and every minute after: those last written longer ago than `keep` go, then
+the oldest until all together fit in `max_size`, and the directories left
+empty. A recording being written is never taken, whatever it costs.
 
 ## Stopping
 
-A stop takes no more requests, lets go of every camera together — however
-many there are, no longer than the slowest live connection takes to stop,
-and what is left of opens under way is given 2 seconds — then closes the
-listeners.
+A stop takes no more requests, finishes every recording, lets go of every
+camera together — however many there are, no longer than the slowest live
+connection takes to stop, and what is left of opens under way is given 2
+seconds — then closes the listeners.
 
 ## Threads
 
-Each live camera's connection is a media-pp pipeline on a thread of its own,
-the camera's data. Everything that waits — the API, WHEP, and each channel's
-watcher, which opens its camera, waits on its pipeline and before connecting
-again — is a task on one tokio runtime of two threads; an open, which
-blocks, borrows a thread of the runtime's blocking pool while it runs. The
-RTSP and WebRTC listeners have threads of their own, shared by every
-channel.
+Each live camera's connection is a media-pp pipeline on a thread of its
+own, the camera's data, and so is each recording. Everything that waits —
+the API, WHEP, each channel's watcher, which opens its camera, waits on its
+pipeline and before connecting again, and each recorder's — is a task on one
+tokio runtime of two threads; an open, which blocks, borrows a thread of the
+runtime's blocking pool while it runs. The RTSP and WebRTC listeners have
+threads of their own, shared by every channel.
 
 ## Verified
 
 `cargo test` runs on the loopback alone, with a camera of media-pp's own:
-pulled, played over RTSP and WHEP, followed across the camera going away and
-coming back; channels made, refused, removed and made again under the same
-name over the API; a removal of a camera being opened answering at once and
-holding up no add; a stop with ten cameras opening waiting for none of them. By hand: a file served by media-pp's
-`rtsp_server` example as the camera, FFmpeg playing over RTSP (TCP and
-UDP), two WHEP players through media-pp's `webrtc_load`, and reconnection
-after the camera was gone for a minute.
+made with its source alone; asked for over RTSP and played at the URL the
+API gave, and played over WHEP; followed across the camera going away and
+coming back; a request to play waiting for a camera that never answers and
+saying so; channels made, refused, removed and made again under the same
+name; a removal of a camera being opened answering at once and holding up
+no add; a stop with ten cameras opening waiting for none of them. Recorded
+in four-second chunks of one-second segments, each one media file read by
+byte range; listed; a stretch across chunks played back as one playlist and
+read back by FFmpeg through the server; a recording ended and begun again as
+the camera dropped and came back, taken off and put back on, and ended by a
+stop. Retention, playlist reading and the playback playlist by unit tests.
 
-Not yet: Ctrl+C on the binary, a real IP camera, a browser through WHEP, and
-how many cameras one machine pulls.
+By hand, in phase 1: a file served by media-pp's `rtsp_server` example as
+the camera, FFmpeg playing over RTSP (TCP and UDP), two WHEP players through
+media-pp's `webrtc_load`, and reconnection after the camera was gone for a
+minute.
+
+Not yet: Ctrl+C on the binary, a real IP camera, a browser through WHEP or
+playing a recording, how many cameras one machine pulls and records, and a
+recording of hours.
 
 ## Not here yet
 
 | | Phase |
 |---|---|
-| Recording, retention, playback | 2 |
-| A player page, HLS | 3 |
-| Authentication — **until then anyone who reaches the HTTP port can make and remove channels** — hooks, metrics | 4 |
+| A player page, HLS live | 3 |
+| Authentication — **until then anyone who reaches the HTTP port can make and remove channels, and read every recording** — hooks, metrics | 4 |
 | Published sources (RTSP, RTMP, WHIP), on-demand sources, forwarding, event recording | 5 |
 | Packaging, a soak of a hundred cameras | 6 |
 
-Also not here: HTTPS, changing a channel in place, any source other than an
-RTSP camera. A camera that comes back with other tracks than it had — another
+Also not here: HTTPS, changing a channel in place, taking a channel off a
+players' listener without removing it, any source other than an RTSP
+camera. A camera that comes back with other tracks than it had — another
 codec, sound added or gone — ends its RTSP players' sessions, whose
-description no longer holds; one that changes its picture size partway
-through a connection is carried on.
+description no longer holds. One that changes its picture size partway
+through a connection is carried on to its players; its recording, which
+began as the connection did and is refused the new picture, is finished,
+and the camera connected again at once — a moment's break for players — so
+that a recording of the new picture begins with the new connection. That
+last is unit-tested only: no test here has a camera that changes its
+picture.

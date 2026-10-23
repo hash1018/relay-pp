@@ -7,8 +7,10 @@
 
 mod channel;
 mod channels;
+mod clock;
 pub mod config;
 mod http;
+mod recordings;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,7 +19,9 @@ use media_pp::driver::DriverRunner;
 use media_pp::elements::{RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions};
 
 use channel::Listeners;
-pub use channel::{ChannelConfig, ChannelError, ChannelStatus, SourceState, Transport};
+pub use channel::{
+    AttachError, ChannelConfig, ChannelError, ChannelStatus, SourceState, Transport,
+};
 use channels::Channels;
 pub use config::Config;
 
@@ -98,7 +102,12 @@ impl Server {
                 what: "runtime",
                 error: error.to_string(),
             })?;
-        let channels = Arc::new(Channels::new(listeners.clone(), runtime.handle().clone()));
+        let channels = Arc::new(Channels::new(
+            listeners.clone(),
+            config.record.clone(),
+            runtime.handle().clone(),
+        ));
+        runtime.spawn(recordings::keep(config.record.clone()));
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind(config.http.listen))
             .map_err(|error| StartError::Listen {
@@ -112,6 +121,8 @@ impl Server {
         let router = http::router(http::AppState {
             channels: Arc::clone(&channels),
             webrtc: listeners.webrtc.clone(),
+            rtsp_port: listeners.rtsp.local_addr().port(),
+            rtsp_public_url: config.rtsp.public_url.clone(),
         });
         let (http_stop, stopped) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn(async move {

@@ -2,28 +2,24 @@
 //! channel's hub, through its [`Publisher`] — a camera pulled
 //! ([`PullSource`]), or a publisher taken ([`publish`]).
 //!
-//! A camera is pulled over RTSP, connected again whenever it drops. Each connection is made by one of two clients: `retina`'s, a
-//! task on the runtime ([`retina`]), where it takes the camera — most do —
-//! and FFmpeg's, media-pp's `RtspSource` in a pipeline of its own
-//! ([`ffmpeg`]), where it does not. Both publish each connection's tracks
-//! to the hub and write them into what it gives back, which outlives every
-//! connection; what reads the hub never knows which.
+//! A camera is pulled over RTSP, connected again whenever it drops: each
+//! connection media-pp's `RtspSource` in a pipeline of its own ([`rtsp`]),
+//! its tracks published to the hub and written into what it gives back,
+//! which outlives every connection.
 //!
 //! What watches a connection — waits on it, waits before connecting again,
 //! hears a halt — is the source's task, holding no thread while it waits.
 
-mod ffmpeg;
 mod publish;
-mod retina;
+mod rtsp;
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use media_pp::elements::RtspTransport;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
@@ -61,37 +57,6 @@ pub enum SourceState {
     AwaitingPublisher,
 }
 
-/// Which RTSP client a channel's camera is pulled with — the body of
-/// `POST /api/v1/channels`' `client`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Client {
-    /// `retina`'s where it takes the camera, FFmpeg's where it does not:
-    /// `rtsps://`, RTP over UDP, a codec other than H.264, H.265, AAC and
-    /// G.711, a camera that gives no `rtptime` to line its tracks up by, or
-    /// pictures with B-frames.
-    #[default]
-    Auto,
-    /// FFmpeg's, always — for a camera `retina` takes but takes wrongly.
-    Ffmpeg,
-}
-
-/// Which client made a connection, as the status names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Puller {
-    Retina,
-    Ffmpeg,
-}
-
-impl Puller {
-    fn name(self) -> &'static str {
-        match self {
-            Puller::Retina => "retina",
-            Puller::Ffmpeg => "ffmpeg",
-        }
-    }
-}
-
 /// What a source is doing, at one moment.
 pub(in crate::channel) struct SourceStatus {
     /// Its URL, with any credentials cut out.
@@ -102,7 +67,8 @@ pub(in crate::channel) struct SourceStatus {
     pub(in crate::channel) error: Option<String>,
     /// How many times it has gone live.
     pub(in crate::channel) connections: u64,
-    /// The client of the connection live, or the last.
+    /// How its stream comes in: `"rtsp"` for a camera pulled, a
+    /// publisher's protocol for one pushed — once it has.
     pub(in crate::channel) client: Option<&'static str>,
 }
 
@@ -173,11 +139,6 @@ struct Inner {
     /// The camera's URL, credentials and all: what is opened.
     url: String,
     transport: RtspTransport,
-    /// The client asked for.
-    client: Client,
-    /// Set once `retina` has said it cannot take this camera: FFmpeg's
-    /// client pulls it from then on, without asking again.
-    ffmpeg_only: AtomicBool,
     /// What each connection's tracks are published through: a run each, and
     /// another where a camera changes its pictures partway.
     publisher: Publisher,
@@ -189,7 +150,6 @@ struct State {
     since: SystemTime,
     error: Option<String>,
     connections: u64,
-    client: Option<Puller>,
 }
 
 impl PullSource {
@@ -204,15 +164,12 @@ impl PullSource {
                     Transport::Tcp => RtspTransport::Tcp,
                     Transport::Udp => RtspTransport::Udp,
                 },
-                client: config.client,
-                ffmpeg_only: AtomicBool::new(false),
                 publisher,
                 state: Mutex::new(State {
                     state: SourceState::Connecting,
                     since: SystemTime::now(),
                     error: None,
                     connections: 0,
-                    client: None,
                 }),
             }),
             task: Task::new(),
@@ -234,20 +191,20 @@ impl PullSource {
             since: state.since,
             error: state.error.clone(),
             connections: state.connections,
-            client: state.client.map(Puller::name),
+            client: (state.connections > 0).then_some("rtsp"),
         }
     }
 
     /// Tells its task to stop, without waiting: the task lets go of an open
-    /// under way at once — FFmpeg's finishes on the blocking pool and is
-    /// dropped — and stops the connection.
+    /// under way at once — it finishes on the blocking pool and is dropped
+    /// — and stops the connection.
     pub(in crate::channel) fn halt(&self) {
         self.task.halt();
     }
 
     /// Halts it and waits for its task to end — no longer than a
-    /// connection takes to stop, which for FFmpeg's of a camera gone silent
-    /// is its timeout.
+    /// connection takes to stop: its threads joined, and a `TEARDOWN`
+    /// written.
     pub(in crate::channel) async fn wait(&self) {
         self.task.wait().await;
     }
@@ -304,29 +261,9 @@ impl Inner {
         }
     }
 
-    /// One connection, by `retina`'s client where it may take the camera,
-    /// and by FFmpeg's where it may not or says it cannot.
+    /// One connection.
     async fn pull(self: &Arc<Self>, halt: &mut watch::Receiver<bool>) -> Ended {
-        let retina_may = self.client == Client::Auto
-            && self.transport == RtspTransport::Tcp
-            && !self.ffmpeg_only.load(Ordering::Acquire);
-        if retina_may {
-            match retina::pull(self, halt).await {
-                retina::Pulled::Ended(ended) => return ended,
-                retina::Pulled::Unsupported(why) => {
-                    tracing::info!(
-                        channel = %self.name,
-                        "retina does not take this camera ({why}); FFmpeg's client pulls it"
-                    );
-                    self.ffmpeg_only.store(true, Ordering::Release);
-                    // What retina may have had live has ended: nothing waits
-                    // on it while FFmpeg's client opens the camera.
-                    self.publisher.ended();
-                    self.set(SourceState::Connecting, None);
-                }
-            }
-        }
-        ffmpeg::pull(self, halt).await
+        rtsp::pull(self, halt).await
     }
 
     fn set(&self, state: SourceState, error: Option<String>) {
@@ -338,15 +275,14 @@ impl Inner {
         current.error = error;
     }
 
-    /// A connection by `client` is live, its first run published.
-    fn went_live(&self, client: Puller) {
+    /// A connection is live, its first run published.
+    fn went_live(&self) {
         self.set(SourceState::Live, None);
-        {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state.connections += 1;
-            state.client = Some(client);
-        }
-        tracing::info!(channel = %self.name, client = client.name(), "live");
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .connections += 1;
+        tracing::info!(channel = %self.name, "live");
     }
 }
 

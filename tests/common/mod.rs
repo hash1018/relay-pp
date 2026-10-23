@@ -17,7 +17,7 @@ use media_pp::elements::{
 };
 use media_pp::ffmpeg;
 use media_pp::pipeline::{Pipeline, PipelineBuilder};
-use relay_pp::{ChannelConfig, Client, Config, ConvertChoice, Server, SourceState, Transport};
+use relay_pp::{ChannelConfig, Config, ConvertChoice, Server, SourceState, Transport};
 
 pub const WITHIN: Duration = Duration::from_secs(20);
 
@@ -335,7 +335,6 @@ pub fn pulling(name: &str, camera: SocketAddr) -> ChannelConfig {
         source: Some(format!("rtsp://{camera}/cam")),
         publish: None,
         transport: Transport::Tcp,
-        client: Client::Auto,
         convert: ConvertChoice::default(),
     }
 }

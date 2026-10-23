@@ -121,7 +121,6 @@ and not `api`, `playback` or `recordings`.
 | `source` | this or `publish` | a camera to pull: an `rtsp://` or `rtsps://` URL |
 | `publish` | this or `source` | the protocol a publisher pushes the stream over: `"rtmp"`, `"rtsp"` or `"whip"` — see "A channel's publisher" |
 | `transport` | `"tcp"` | how the camera is pulled: `"tcp"`, RTP on the RTSP connection, which loses nothing; or `"udp"` |
-| `client` | `"auto"` | which RTSP client pulls it: `"auto"`, `retina`'s where it takes the camera and FFmpeg's where it does not (below); or `"ffmpeg"`, FFmpeg's always — for a camera `retina` takes but takes wrongly |
 | `convert` | the server's `[convert]` | its own say over it: `{"sound": "off", "video": "any"}`, each left out the server's |
 
 `201` with its status, `Location` its URL; `400` for a name or source that
@@ -152,7 +151,7 @@ there. Each is:
 | `since_ms` | since when, in milliseconds since the Unix epoch |
 | `error` | why it last failed, while it is not live |
 | `connections` | how many times it has gone live |
-| `client` | which client pulled it, live or last: `"retina"` or `"ffmpeg"`; none before it first goes live |
+| `client` | how its stream comes in: `"rtsp"` for a camera pulled, the publisher's protocol for one pushed; none before it first goes live |
 | `readers` | players and recordings reading its stream as it came now; what reads a conversion of it counts as one, the conversion |
 | `bytes` | what it has been sent, over every connection |
 | `sinks` | what reads it: `"rtsp"` and `"webrtc"` once a player has asked for it so, `"record"` while it is recorded |
@@ -193,16 +192,12 @@ from when it is made until it is removed:
 - Opened when the channel is made, with a 5-second timeout, which also
   bounds how long it may go without sending before it is taken to be gone.
 - Its pictures and sound are kept; a data or metadata stream is left out.
-- Pulled by one of two RTSP clients. `retina`'s, in Rust, takes most
-  cameras at a fifth of the processor time or less ([benchmarks.md](benchmarks.md));
-  FFmpeg's, media-pp's `RtspSource`, takes the rest. With `client` `"auto"`
-  `retina`'s is tried first over TCP, and FFmpeg's pulls the camera instead —
-  from then on, until the channel is made again — where `retina`'s cannot:
-  `rtsps://`, RTP over UDP, a codec other than H.264, H.265, AAC and G.711,
-  a camera of several tracks that gives no `rtptime` to line them up by, or
-  pictures sent out of the order they are shown in (B-frames), which RTP
-  gives `retina` no way to stamp.
-  What reads the channel never knows which.
+- Pulled by media-pp's RTSP client, `RtspSource`, over TCP or UDP: H.264
+  and H.265 — B-frames given the decoding times RTP does not carry —
+  VP8, VP9, AAC, Opus and G.711, with the credentials the URL carries
+  answering a Digest or Basic challenge. A track in another codec is
+  left out; a camera with none it takes fails as one that cannot be
+  opened. `rtsps://` is not taken.
 - When it fails it is opened again after 1 second, then 2, 4 … up to 30,
   each spread ±20% so cameras one outage dropped are not all opened again
   in the same instant. A camera that stayed live for 10 seconds starts again
@@ -368,11 +363,11 @@ seconds — then closes the listeners.
 
 ## Threads
 
-A camera pulled by `retina`'s client is a task on one tokio runtime of two
-threads, reading its connection and writing what it reads into the
-channel's broadcast. One pulled by FFmpeg's is a media-pp pipeline on a
-thread of its own, the camera's data; its open, which blocks, borrows a
-thread of the runtime's blocking pool while it runs. Each recording is a
+A camera pulled is a media-pp pipeline of its own: a thread writing the
+camera's stream into the channel's broadcast, and one reading the
+connection — and one for each track's UDP socket, pulled over UDP. Its
+open, which blocks, borrows a thread of the runtime's blocking pool while
+it runs. Each recording is a
 pipeline of its own, and so is what a channel converts, while it does: a
 thread reading the channel's stream, and one for each track converted.
 Everything else that waits — the API, WHEP, each channel's source, which
@@ -390,9 +385,8 @@ coming back; a request to play waiting for a camera that never answers and
 saying so; channels made, refused, removed and made again under the same
 name; a removal of a camera being opened answering at once and holding up
 no add; a stop with ten cameras opening waiting for none of them. Played
-and followed alike pulled by either client — `retina`'s by default, FFmpeg's
-when asked — and a camera of two tracks with no `rtptime` pulled by
-FFmpeg's without being asked, both tracks relayed. A camera's AAC played
+and followed alike pulled over TCP and over UDP; a camera of two tracks
+relayed with both; and one sending B-frames relayed, said to reorder. A camera's AAC played
 over WebRTC as Opus and over RTSP as it came; its Opus recorded as AAC in
 time with its pictures; a conversion stopping once no WebRTC player has
 played it for a while, and made again for the next; what WebRTC players

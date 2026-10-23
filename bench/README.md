@@ -56,14 +56,6 @@ sound is there for MediaMTX: it refuses a WHEP offer with a sound section
 for a path that has no sound (`codecs not supported by client`), and a
 browser's offer has one.
 
-relay-pp pulls a camera of this stream with FFmpeg's client: `retina`'s
-takes no Opus, and the camera gives no `rtptime` for two tracks. To measure
-`retina`'s, give `pull` and `record` the pictures alone, in a work
-directory of their own:
-
-```sh
-ffmpeg -i stream.mp4 -map 0:v -c copy pictures/stream.mp4
-```
 
 ## Running it
 

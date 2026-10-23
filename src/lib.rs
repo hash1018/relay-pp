@@ -24,7 +24,7 @@ use media_pp::elements::{
 
 use channel::Listeners;
 pub use channel::{
-    AttachError, ChannelConfig, ChannelError, ChannelStatus, Client, SourceState, Transport,
+    AttachError, ChannelConfig, ChannelError, ChannelStatus, SourceState, Transport,
 };
 use channels::Channels;
 pub use config::{Config, ConvertChoice, ConvertConfig, SoundConversion, VideoConversion};

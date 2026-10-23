@@ -1,7 +1,6 @@
-//! Both RTSP clients a camera is pulled with — `retina`'s and FFmpeg's —
-//! behave alike from outside: the same camera is pulled, played over RTSP
-//! and WHEP, and followed across a drop by either, and a camera `retina`
-//! cannot take is pulled by FFmpeg's without being asked.
+//! A camera pulled with media-pp's RTSP client: played over RTSP and WHEP,
+//! and followed across a drop, over TCP and over UDP; a camera of two
+//! tracks relayed with both; and one sending B-frames relayed in order.
 
 mod common;
 
@@ -12,33 +11,26 @@ use common::*;
 use media_pp::elements::{RtspOptions, RtspSource, RtspTransport};
 use relay_pp::SourceState;
 
-/// Makes `name` pulling the camera at `camera` with `client` — or the
-/// default, where `None` — and waits for it to go live.
-fn made(server: &relay_pp::Server, name: &str, camera: SocketAddr, client: Option<&str>) {
-    let body = match client {
-        Some(client) => {
-            format!(r#"{{"name":"{name}","source":"rtsp://{camera}/cam","client":"{client}"}}"#)
-        }
-        None => channel(name, &format!("rtsp://{camera}/cam")),
-    };
+/// Makes `name` pulling the camera at `camera` over `transport`, and waits
+/// for it to go live.
+fn made(server: &relay_pp::Server, name: &str, camera: SocketAddr, transport: &str) {
+    let body =
+        format!(r#"{{"name":"{name}","source":"rtsp://{camera}/cam","transport":"{transport}"}}"#);
     let (status, _, answer) = http(server.http_addr(), "POST", "/api/v1/channels", Some(&body));
     assert_eq!(status, 201, "{answer}");
     wait_for("the camera live", || state_of(server) == SourceState::Live);
 }
 
 /// The channel played over RTSP and WHEP, and followed across the camera
-/// dropping and coming back, by the same client throughout.
-fn played_and_followed(client: Option<&str>, expected: &str) {
+/// dropping and coming back.
+fn played_and_followed(transport: &str) {
     let camera = Camera::start("127.0.0.1:0".parse().unwrap());
     let camera_addr = camera.addr;
     let server = server();
-    made(&server, "cam1", camera_addr, client);
-    assert_eq!(server.status()[0].client, Some(expected));
+    made(&server, "cam1", camera_addr, transport);
+    assert_eq!(server.status()[0].client, Some("rtsp"));
     let (_, _, listed) = http(server.http_addr(), "GET", "/api/v1/channels/cam1", None);
-    assert!(
-        listed.contains(&format!(r#""client":"{expected}""#)),
-        "{listed}"
-    );
+    assert!(listed.contains(r#""client":"rtsp""#), "{listed}");
 
     let (rtsp, over_rtsp) = rtsp_player(&play_rtsp(server.http_addr(), "cam1"));
     let (whep, over_webrtc) = whep_player(&format!("http://{}/cam1/whep", server.http_addr()));
@@ -54,7 +46,6 @@ fn played_and_followed(client: Option<&str>, expected: &str) {
         let status = &server.status()[0];
         status.state == SourceState::Live && status.connections == 2
     });
-    assert_eq!(server.status()[0].client, Some(expected));
     let before = over_rtsp.get();
     wait_for("RTSP packets after the camera came back", || {
         over_rtsp.get() > before + 20
@@ -71,22 +62,20 @@ fn played_and_followed(client: Option<&str>, expected: &str) {
 }
 
 #[test]
-fn retina_pulls_a_camera_it_takes_by_default() {
-    played_and_followed(None, "retina");
+fn a_camera_pulled_over_tcp_is_played_and_followed() {
+    played_and_followed("tcp");
 }
 
 #[test]
-fn ffmpeg_pulls_a_camera_when_asked() {
-    played_and_followed(Some("ffmpeg"), "ffmpeg");
+fn a_camera_pulled_over_udp_is_played_and_followed() {
+    played_and_followed("udp");
 }
 
 #[test]
-fn a_camera_retina_cannot_take_is_pulled_by_ffmpeg_with_every_track() {
-    // Two tracks and no `rtptime` to line them up by: `retina` says no.
+fn a_camera_of_two_tracks_is_relayed_with_both() {
     let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
     let server = server();
-    made(&server, "cam1", camera.addr, None);
-    assert_eq!(server.status()[0].client, Some("ffmpeg"));
+    made(&server, "cam1", camera.addr, "tcp");
 
     let url = play_rtsp(server.http_addr(), "cam1");
     let (_, streams) = RtspSource::open(
@@ -108,38 +97,43 @@ fn a_camera_retina_cannot_take_is_pulled_by_ffmpeg_with_every_track() {
 }
 
 #[test]
-fn an_unknown_client_is_refused() {
-    let server = server();
-    let (status, _, _) = http(
-        server.http_addr(),
-        "POST",
-        "/api/v1/channels",
-        Some(r#"{"name":"cam1","source":"rtsp://127.0.0.1:1/cam","client":"gstreamer"}"#),
-    );
-    assert!((400..500).contains(&status), "{status}");
-    assert!(server.status().is_empty());
-    server.stop();
-}
-
-#[test]
-fn a_camera_sending_b_frames_is_pulled_by_ffmpeg() {
-    // `retina` takes the description and plays; the pictures then come out
-    // of the order they are shown in, which it cannot stamp.
+fn a_camera_sending_b_frames_is_relayed_in_order() {
     let Some(camera) = Camera::with_b_frames("127.0.0.1:0".parse().unwrap()) else {
         eprintln!("skipping: no libx264 in this FFmpeg");
         return;
     };
     let server = server();
-    made(&server, "cam1", camera.addr, None);
-    wait_for("FFmpeg's client pulling it", || {
-        let status = &server.status()[0];
-        status.state == SourceState::Live && status.client == Some("ffmpeg")
-    });
-    let (rtsp, over_rtsp) = rtsp_player(&play_rtsp(server.http_addr(), "cam1"));
+    made(&server, "cam1", camera.addr, "tcp");
+    let url = play_rtsp(server.http_addr(), "cam1");
+    let (_, streams) = RtspSource::open(
+        "probe",
+        &url,
+        RtspOptions {
+            transport: RtspTransport::Tcp,
+            timeout: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert!(streams[0].reorders(), "said to reorder, as the camera's is");
+    let (rtsp, over_rtsp) = rtsp_player(&url);
     wait_for("RTSP packets", || over_rtsp.get() > 20);
-    assert_eq!(server.status()[0].client, Some("ffmpeg"), "and stays so");
+    assert_eq!(state_of(&server), SourceState::Live, "and stays live");
 
     rtsp.stop();
     server.stop();
     camera.stop();
+}
+
+#[test]
+fn a_client_to_choose_is_no_longer_asked() {
+    let server = server();
+    let (status, _, _) = http(
+        server.http_addr(),
+        "POST",
+        "/api/v1/channels",
+        Some(r#"{"name":"cam1","source":"rtsp://127.0.0.1:1/cam","client":"ffmpeg"}"#),
+    );
+    assert_eq!(status, 400, "an unknown field");
+    assert!(server.status().is_empty());
+    server.stop();
 }

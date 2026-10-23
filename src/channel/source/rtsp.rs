@@ -1,7 +1,7 @@
-//! Pulling a camera with FFmpeg's RTSP client, media-pp's `RtspSource`:
-//! what takes every camera — `rtsps://`, RTP over UDP, any codec FFmpeg
-//! depacketizes — at several times the processor time of `retina`'s, on a
-//! thread of each connection's own.
+//! Pulling a camera with media-pp's RTSP client, its `RtspSource`: a
+//! pipeline of each connection's own, the session read on a thread beside
+//! it — over TCP or UDP, H.264 and H.265 (B-frames given decoding times),
+//! AAC, Opus and G.711.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use media_pp::ffmpeg::media;
 use media_pp::pipeline::Pipeline;
 use tokio::sync::watch;
 
-use super::{CAMERA_TIMEOUT, Ended, Inner, Puller, halted};
+use super::{CAMERA_TIMEOUT, Ended, Inner, halted};
 
 /// Pulls the camera until it fails or the source is halted.
 ///
@@ -38,7 +38,7 @@ pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -
         Ok(pipeline) => pipeline,
         Err(reason) => return Ended::Failed(reason),
     };
-    inner.went_live(Puller::Ffmpeg);
+    inner.went_live();
 
     let ended = tokio::select! {
         reason = watch_bus(&pipeline) => Ended::Failed(reason),
@@ -47,8 +47,8 @@ pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -
         // the camera anew.
         () = inner.publisher.renewal() => Ended::Reconnect,
     };
-    // Stopping joins the pipeline's thread, which a camera gone silent
-    // holds up to its timeout: not on the runtime's own threads.
+    // Stopping joins the pipeline's threads, and tells the camera the
+    // session is over: not on the runtime's own threads.
     let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
     ended
 }

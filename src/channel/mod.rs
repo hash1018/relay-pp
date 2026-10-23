@@ -31,7 +31,7 @@ pub(crate) use hub::Refusal;
 use sink::{ListenerSink, RecordStatus, Unready};
 pub(crate) use sink::{Listeners, Output, Recorder};
 use source::Source;
-pub use source::{Client, Publish, SourceState};
+pub use source::{Publish, SourceState};
 pub(crate) use source::{RTMP_APP, whip_path};
 
 /// What a channel is made from: the body of `POST /api/v1/channels`.
@@ -53,10 +53,6 @@ pub struct ChannelConfig {
     /// default, which loses nothing) or `"udp"`.
     #[serde(default)]
     pub transport: Transport,
-    /// Which RTSP client pulls it: `"auto"`, the default — `retina`'s where
-    /// it takes the camera, FFmpeg's where not — or `"ffmpeg"`.
-    #[serde(default)]
-    pub client: Client,
     /// What is converted for a way out that cannot carry a track, over
     /// the server's `[convert]`: `{"sound": "off", "video": "any"}`, each
     /// left out the server's.
@@ -189,7 +185,8 @@ pub struct ChannelStatus {
     pub error: Option<String>,
     /// How many times the source has gone live.
     pub connections: u64,
-    /// Which client pulled it, live or last: `"retina"` or `"ffmpeg"`.
+    /// How its stream comes in: `"rtsp"` for a camera pulled, or the
+    /// protocol its publisher pushes over — once one has come in.
     pub client: Option<&'static str>,
     /// Readers of its broadcast: players and recorders.
     pub readers: usize,
@@ -517,7 +514,6 @@ mod tests {
             source: Some(source.to_owned()),
             publish: None,
             transport: Transport::Tcp,
-            client: Client::Auto,
             convert: ConvertChoice::default(),
         }
     }

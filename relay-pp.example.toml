@@ -52,3 +52,19 @@ candidates = ["192.168.0.10"]
 # refused where none does; "any", on the processor where no GPU does; or
 # "off", that way out refused.
 # video = "gpu"
+
+# [auth]
+# Without this section, anybody who reaches a port may do anything.
+# What the manager presents for /api/v1, as "Authorization: Bearer <token>".
+# api_token = "a long random string"
+# What play tokens — HS256 JSON Web Tokens the manager signs, with "exp" and
+# the channels they let their holder "play" and watch the "recordings" of —
+# are signed with: 32 characters or more.
+# token_secret = "another long random string, 32 or more"
+
+# Players by name and password: RTSP's Digest or Basic, HTTP's Basic.
+# [[auth.users]]
+# name = "operator"
+# password = "..."
+# play = ["*"]
+# recordings = ["floor2-*"]

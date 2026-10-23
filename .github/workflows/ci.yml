@@ -47,7 +47,7 @@ jobs:
         run: rustup default stable
 
       - name: Set up FFmpeg
-        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@9e14facbb170dad9e96107efe9da5904f3b91b46
+        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@e8c78b7c433988d9e5d065508d89a8d2cedcecfd
         with:
           vcpkg-features: ${{ env.FFMPEG_FEATURES }}
 
@@ -88,7 +88,7 @@ jobs:
           rustup default stable
 
       - name: Set up FFmpeg
-        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@9e14facbb170dad9e96107efe9da5904f3b91b46
+        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@e8c78b7c433988d9e5d065508d89a8d2cedcecfd
         with:
           vcpkg-features: ${{ env.FFMPEG_FEATURES }}
 

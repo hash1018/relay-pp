@@ -48,12 +48,45 @@ has them all with comments.
 | `record.max_size` | none | how much all recordings together may take, the oldest removed first: `"500GB"`, `"2TiB"` |
 | `convert.sound` | `"auto"` | sound a way out cannot carry: `"auto"`, converted for it; `"off"`, left out of it — see "Conversions" |
 | `convert.video` | `"gpu"` | pictures a way out cannot carry: `"gpu"`, converted on a GPU and refused where none takes them; `"any"`, on the processor where no GPU does; `"off"`, that way out refused |
+| `auth.api_token` | none | what the manager presents for the API, 16 characters or more — see "Who may" |
+| `auth.token_secret` | none | what play tokens are signed with, HS256, 32 characters or more |
+| `auth.users` | none | players by `name` and `password`, each with the channels it may `play` live and watch the `recordings` of: names, or patterns with `*` |
 
 Durations are a number and `ms`, `s`, `m`, `h` or `d`; sizes a number of
 bytes, or one with `KB` … `TB` (1000-based) or `KiB` … `TiB` (1024-based).
-A key it does not know, a candidate that is not an address, or a chunk
-shorter than a segment stops the start. So does a listener that cannot be
+A key it does not know, a candidate that is not an address, a chunk
+shorter than a segment, or a token or secret too short stops the start. So does a listener that cannot be
 bound, naming which.
+
+## Who may
+
+Without `[auth]` anybody who reaches a port may do anything — make and
+remove channels, play them, watch every recording — and relay-pp says so as
+it starts. With it:
+
+| What | Who | Presented |
+|---|---|---|
+| The API: make, remove, list channels; record | the manager | `Authorization: Bearer <api_token>` |
+| Play a channel live — over RTSP, or WebRTC through WHEP, and ask for its RTSP URL | a user whose `play` names it, or a play token whose `play` does | RTSP: `rtsp://user:password@…` (Digest, or Basic), or `rtsp://…/cam1?token=…`; WHEP and the API: `Bearer <token>` or `Basic` |
+| Watch a channel's recordings — list them, `/playback`, `/recordings/` | a user or a token whose `recordings` names it | `Bearer`, `Basic`, or `?token=` |
+
+The API token lets its holder do anything, playing included. Anything else
+is answered `401`, saying what is taken.
+
+A **play token** is a JSON Web Token the manager signs with `token_secret`
+(HS256), with any JWT library:
+
+```json
+{"exp": 1792735200, "play": ["cam1", "floor2-*"], "recordings": ["cam1"]}
+```
+
+`exp`, until when it holds in seconds since the Unix epoch, is required;
+`play` and `recordings` name what it lets its holder do, as a user's do. An
+HLS player given a `/playback` URL with `?token=` is given each segment's
+URL with the token in it too; one following a recording's own playlist —
+`/recordings/…/index.m3u8` — sends it as a header (hls.js: `xhrSetup`).
+
+No token or password is logged, nor kept beside the configuration.
 
 ## The API
 
@@ -359,11 +392,13 @@ playing a recording, and a recording of hours.
 | | Phase |
 |---|---|
 | A player page, HLS live | 3 |
-| Authentication — **until then anyone who reaches the HTTP port can make and remove channels, and read every recording** — hooks, metrics | 4 |
+| Hooks, metrics, a manager asked over HTTP who may play | 4 |
 | Published sources (RTSP, RTMP, WHIP), on-demand sources, forwarding, event recording | 5 |
 | Packaging, a soak of a hundred cameras | 6 |
 
-Also not here: HTTPS, changing a channel in place, taking a channel off a
+Also not here: HTTPS — a token and a Basic password cross the network as
+they are, so put relay-pp behind a proxy that terminates TLS where the
+network is not trusted — changing a channel in place, taking a channel off a
 players' listener without removing it, any source other than an RTSP
 camera. A camera that comes back with other tracks than it had — another
 codec, sound added or gone — ends its RTSP players' sessions, whose

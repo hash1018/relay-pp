@@ -12,14 +12,16 @@ use std::time::{Duration, SystemTime};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use media_pp::elements::{SessionId, WebRtcServerError, WebRtcServerHandle};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
 
+use crate::auth::{self, Auth, FromHeader, Presented, Right};
 use crate::channel::{
     AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, Output, PlayError, Refusal,
 };
@@ -41,30 +43,172 @@ pub(crate) struct AppState {
     /// What RTSP URLs begin with in place of the host a request came to
     /// and `rtsp_port`.
     pub(crate) rtsp_public_url: Option<String>,
+    /// Who may do what; anybody anything, where `None`.
+    pub(crate) auth: Option<Arc<Auth>>,
 }
 
-/// Every route.
+/// Every route: the manager's, a player's of a channel live, and a
+/// watcher's of its recordings, each behind who may.
 pub(crate) fn router(state: AppState) -> Router {
-    // A recording's files as they are: its own playlist — which a player
-    // follows while it is written — and the byte ranges of its media.
-    let files = ServeDir::new(&state.channels.record.dir);
-    Router::new()
+    let manager = Router::new()
         .route("/api/v1/channels", get(list_channels).post(create_channel))
         .route(
             "/api/v1/channels/{name}",
             get(one_channel).delete(delete_channel),
         )
-        .route("/api/v1/channels/{name}/play", post(play))
         .route(
             "/api/v1/channels/{name}/record",
             post(record).delete(unrecord),
         )
+        .route_layer(middleware::from_fn_with_state(state.clone(), manager_only));
+    let players = Router::new()
+        .route("/api/v1/channels/{name}/play", post(play))
+        .route("/{name}/whep", post(whep_offer).options(whep_options))
+        .route_layer(middleware::from_fn_with_state(
+            (state.clone(), Right::Play),
+            who_may,
+        ));
+    let watchers = Router::new()
         .route("/api/v1/recordings/{name}", get(list_recordings))
         .route("/playback/{name}/index.m3u8", get(playback))
-        .nest_service(recordings::URL_ROOT, files)
-        .route("/{name}/whep", post(whep_offer).options(whep_options))
+        .route_layer(middleware::from_fn_with_state(
+            (state.clone(), Right::Recordings),
+            who_may,
+        ));
+    // A recording's files as they are: its own playlist — which a player
+    // follows while it is written — and the byte ranges of its media.
+    let files = Router::new()
+        .fallback_service(ServeDir::new(&state.channels.record.dir))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            who_may_watch_files,
+        ));
+    Router::new()
+        .merge(manager)
+        .merge(players)
+        .merge(watchers)
+        .nest(recordings::URL_ROOT, files)
+        // The session's own URL is the secret that ends it.
         .route("/{name}/whep/{session}", axum::routing::delete(whep_end))
         .with_state(state)
+}
+
+/// What a request presented: its `Authorization` header — a `Bearer` token
+/// or a `Basic` user — or else a `?token=` in its URL, which a player that
+/// sets no header carries.
+struct Shown {
+    token: Option<String>,
+    user: Option<(String, String)>,
+}
+
+impl Shown {
+    fn of(request: &Request) -> Self {
+        let header = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(auth::from_header);
+        match header {
+            Some(FromHeader::Token(token)) => {
+                return Self {
+                    token: Some(token),
+                    user: None,
+                };
+            }
+            Some(FromHeader::User { name, password }) => {
+                return Self {
+                    token: None,
+                    user: Some((name, password)),
+                };
+            }
+            None => {}
+        }
+        Self {
+            token: query_token(request.uri().query()),
+            user: None,
+        }
+    }
+
+    fn presented(&self) -> Presented<'_> {
+        match (&self.token, &self.user) {
+            (Some(token), _) => Presented::Token(token),
+            (None, Some((user, password))) => Presented::Password { user, password },
+            (None, None) => Presented::None,
+        }
+    }
+}
+
+/// The `token` a query carries.
+fn query_token(query: Option<&str>) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == "token")
+        .map(|(_, token)| token.into_owned())
+}
+
+/// Lets the manager alone through, where there is auth.
+async fn manager_only(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    match &state.auth {
+        Some(auth) if !auth.is_manager(&Shown::of(&request).presented()) => unauthorized(),
+        _ => next.run(request).await,
+    }
+}
+
+/// Lets through who may do `right` with the channel the route names, where
+/// there is auth; a browser asking what WHEP takes, before it asks with its
+/// credentials, always.
+async fn who_may(
+    State((state, right)): State<(AppState, Right)>,
+    Path(params): Path<HashMap<String, String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(auth) = &state.auth else {
+        return next.run(request).await;
+    };
+    let channel = params.get("name").map(String::as_str).unwrap_or_default();
+    if request.method() == Method::OPTIONS
+        || auth.allows(&Shown::of(&request).presented(), right, channel)
+    {
+        next.run(request).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// [`who_may`] watch the recordings of the channel a recording's file is
+/// under: the first part of its path.
+async fn who_may_watch_files(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(auth) = &state.auth else {
+        return next.run(request).await;
+    };
+    let channel = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if auth.allows(&Shown::of(&request).presented(), Right::Recordings, channel) {
+        next.run(request).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// `401`, saying what is taken: a token, or a user's name and password.
+fn unauthorized() -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, "who are you?\n").into_response();
+    let headers = response.headers_mut();
+    headers.append(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    headers.append(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"relay-pp\""),
+    );
+    response
 }
 
 async fn list_channels(State(state): State<AppState>) -> Response {
@@ -352,12 +496,43 @@ async fn playback(
     match made {
         Ok(Some(playlist)) => (
             [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-            playlist,
+            // A player that came with a token in its URL sets no header: each
+            // segment it asks for next carries the token the same way.
+            match (&state.auth, query.get("token")) {
+                (Some(_), Some(token)) => with_token(&playlist, token),
+                _ => playlist,
+            },
         )
             .into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "nothing recorded then\n").into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// `playlist` with `token` in the URL of each media file it names: each
+/// segment's line, and the `URI` of its initialization section.
+fn with_token(playlist: &str, token: &str) -> String {
+    let query: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("token", token)
+        .finish();
+    playlist
+        .lines()
+        .map(|line| {
+            if line.starts_with(recordings::URL_ROOT) {
+                format!("{line}?{query}")
+            } else if let Some(at) = line.find(&format!("URI=\"{}", recordings::URL_ROOT)) {
+                let closing = line[at + 5..].find('"').map(|end| at + 5 + end);
+                match closing {
+                    Some(end) => format!("{}?{query}{}", &line[..end], &line[end..]),
+                    None => line.to_owned(),
+                }
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 /// `POST /{name}/whep` with an SDP offer: the channel registered on the
@@ -514,5 +689,30 @@ mod tests {
         for (error, status, retry) in cases {
             assert_eq!(answer_to(&error), (status, retry), "{error}");
         }
+    }
+
+    /// A playlist asked for with a token in its URL names each file with
+    /// the token in its URL too, its initialization section's included.
+    #[test]
+    fn a_playlist_carries_the_token_it_was_asked_with() {
+        let playlist = concat!(
+            "#EXTM3U\n",
+            r#"#EXT-X-MAP:URI="/recordings/cam1/d/t/media.m4s",BYTERANGE="800@0""#,
+            "\n#EXTINF:1.0,\n",
+            "#EXT-X-BYTERANGE:4000@800\n",
+            "/recordings/cam1/d/t/media.m4s\n",
+            "#EXT-X-ENDLIST\n",
+        );
+        assert_eq!(
+            with_token(playlist, "a.b+c"),
+            concat!(
+                "#EXTM3U\n",
+                r#"#EXT-X-MAP:URI="/recordings/cam1/d/t/media.m4s?token=a.b%2Bc",BYTERANGE="800@0""#,
+                "\n#EXTINF:1.0,\n",
+                "#EXT-X-BYTERANGE:4000@800\n",
+                "/recordings/cam1/d/t/media.m4s?token=a.b%2Bc\n",
+                "#EXT-X-ENDLIST\n",
+            )
+        );
     }
 }

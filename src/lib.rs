@@ -5,6 +5,7 @@
 //! [`Server::add_channel`] and [`Server::remove_channel`]. [`Server::stop`]
 //! takes it all down again.
 
+mod auth;
 mod channel;
 mod channels;
 mod clock;
@@ -16,7 +17,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use media_pp::driver::DriverRunner;
-use media_pp::elements::{RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions};
+use media_pp::elements::{
+    Access, Authorize, RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions,
+};
 
 use channel::Listeners;
 pub use channel::{
@@ -63,11 +66,33 @@ impl Server {
             }
         };
 
+        let auth = config
+            .auth
+            .as_ref()
+            .map(|auth| Arc::new(auth::Auth::new(auth)));
+        if auth.is_none() {
+            tracing::warn!(
+                "no [auth]: anybody who reaches a port may make and remove channels, play them and watch every recording"
+            );
+        }
+        // An RTSP player plays what it may, as the HTTP routes decide; none
+        // publishes.
+        let rtsp_authorize = auth.clone().map(|auth| {
+            Authorize::new(move |request| {
+                request.access == Access::Play
+                    && auth.allows(
+                        &auth::from_credentials(&request.credentials),
+                        auth::Right::Play,
+                        &request.path,
+                    )
+            })
+        });
         let (rtsp, rtsp_handle) = RtspServer::bind(
             "rtsp",
             config.rtsp.listen,
             RtspServerOptions {
                 udp: config.rtsp.udp,
+                authorize: rtsp_authorize,
                 ..RtspServerOptions::default()
             },
         )
@@ -124,6 +149,7 @@ impl Server {
             webrtc: listeners.webrtc.clone(),
             rtsp_port: listeners.rtsp.local_addr().port(),
             rtsp_public_url: config.rtsp.public_url.clone(),
+            auth,
         });
         let (http_stop, stopped) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn(async move {

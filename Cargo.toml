@@ -13,7 +13,7 @@ publish = false
 # so it is taken from the repository at a revision. To build against a
 # checkout beside this one instead:
 #   cargo build --config 'patch."https://github.com/hash1018/media-pp".media-pp.path="../media-pp/lib"'
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "9e14facbb170dad9e96107efe9da5904f3b91b46", features = ["rtsp-server", "webrtc"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "e8c78b7c433988d9e5d065508d89a8d2cedcecfd", features = ["rtsp-server", "webrtc"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 retina = "0.4"
@@ -25,6 +25,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 toml = "1"
 tracing = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Pictures are converted on the GPU where one takes them: D3D11 on Windows
@@ -32,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # NVENC or else Vulkan Video on Linux. Neither needs an SDK to build, and a
 # machine without the GPU converts in software.
 [target.'cfg(windows)'.dependencies]
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "9e14facbb170dad9e96107efe9da5904f3b91b46", features = ["d3d11"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "e8c78b7c433988d9e5d065508d89a8d2cedcecfd", features = ["d3d11"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "9e14facbb170dad9e96107efe9da5904f3b91b46", features = ["cuda", "vulkan"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "e8c78b7c433988d9e5d065508d89a8d2cedcecfd", features = ["cuda", "vulkan"] }

@@ -28,6 +28,9 @@ pub enum ConfigError {
     /// `[record]`'s lengths do not go together.
     #[error("record: {0}")]
     Record(&'static str),
+    /// `[auth]` would let in more than it means to.
+    #[error("auth: {0}")]
+    Auth(&'static str),
 }
 
 /// Everything the file says.
@@ -50,6 +53,41 @@ pub struct Config {
     /// sends, unless a channel says otherwise.
     #[serde(default)]
     pub convert: ConvertConfig,
+    /// Who may do what. Without it, anybody who reaches a port may do
+    /// anything — make and remove channels, play them, watch every
+    /// recording.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+}
+
+/// `[auth]`: see `crate::auth` for what each presents and where.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// What the manager presents as a `Bearer` token for every request to
+    /// `/api/v1`; it lets its holder do anything.
+    pub api_token: String,
+    /// What play tokens are signed with, HS256: where it is not set, no
+    /// play token is taken.
+    #[serde(default)]
+    pub token_secret: Option<String>,
+    /// Players by name and password.
+    #[serde(default)]
+    pub users: Vec<UserConfig>,
+}
+
+/// `[[auth.users]]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    pub name: String,
+    pub password: String,
+    /// The channels it plays live: names, or patterns with `*`.
+    #[serde(default)]
+    pub play: Vec<String>,
+    /// The channels whose recordings it watches.
+    #[serde(default)]
+    pub recordings: Vec<String>,
 }
 
 /// `[convert]`, and a channel's own say over it: what is converted for a
@@ -362,6 +400,23 @@ impl Config {
         if record.chunk < record.segment {
             return Err(ConfigError::Record("a chunk is at least a segment long"));
         }
+        if let Some(auth) = &config.auth {
+            if auth.api_token.len() < 16 {
+                return Err(ConfigError::Auth("api_token is 16 characters or more"));
+            }
+            if auth
+                .token_secret
+                .as_ref()
+                .is_some_and(|secret| secret.len() < 32)
+            {
+                return Err(ConfigError::Auth(
+                    "token_secret is 32 characters or more, as HS256 wants",
+                ));
+            }
+            if auth.users.iter().any(|user| user.password.is_empty()) {
+                return Err(ConfigError::Auth("a user has a password"));
+            }
+        }
         Ok(config)
     }
 }
@@ -436,6 +491,27 @@ mod tests {
             "[record]\nkeep = \"soon\"",
         ] {
             assert!(Config::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn auth_that_would_let_in_more_than_it_means_to_stops_the_start() {
+        let token = "api_token = \"0123456789abcdef\"";
+        let secret = "token_secret = \"0123456789abcdef0123456789abcdef\"";
+        let config = Config::parse(&format!(
+            "[auth]\n{token}\n{secret}\n[[auth.users]]\nname = \"a\"\npassword = \"b\"\nplay = [\"*\"]"
+        ))
+        .unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.users[0].play, ["*"]);
+        assert!(auth.users[0].recordings.is_empty());
+        for text in [
+            "[auth]\napi_token = \"short\"".to_owned(),
+            format!("[auth]\n{token}\ntoken_secret = \"short\""),
+            format!("[auth]\n{token}\n[[auth.users]]\nname = \"a\"\npassword = \"\""),
+            "[auth]\ntoken_secret = \"0123456789abcdef0123456789abcdef\"".to_owned(),
+        ] {
+            assert!(Config::parse(&text).is_err(), "{text}");
         }
     }
 

@@ -214,11 +214,26 @@ pub fn http(
     path: &str,
     body: Option<&str>,
 ) -> (u16, String, String) {
+    http_as(addr, method, path, body, None)
+}
+
+/// [`http`] with `authorization` as the request's `Authorization`, where
+/// it is given.
+pub fn http_as(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    authorization: Option<&str>,
+) -> (u16, String, String) {
     let mut stream = TcpStream::connect(addr).unwrap();
     let body = body.unwrap_or_default();
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{authorization}\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )

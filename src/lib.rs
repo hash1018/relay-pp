@@ -186,7 +186,10 @@ impl Server {
     /// is off every listener and its source has stopped. Whether there was
     /// one. Blocks the thread; not for an async caller.
     pub fn remove_channel(&self, name: &str) -> bool {
-        self.channels.remove(name)
+        match &self.runtime {
+            Some(runtime) => runtime.block_on(self.channels.remove(name)),
+            None => false,
+        }
     }
 
     /// Takes no more players, stops every channel, then the listeners.
@@ -203,7 +206,9 @@ impl Server {
         }
         // The channels before the runtime: their source tasks run on it, and
         // stop their pipelines there as they end.
-        self.channels.clear();
+        if let Some(runtime) = &self.runtime {
+            runtime.block_on(self.channels.clear());
+        }
         if let Some(runtime) = self.runtime.take() {
             // What is left on it is a request under way and an open a halt
             // let go of, which ends within a camera's timeout by itself.

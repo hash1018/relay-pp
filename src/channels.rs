@@ -94,22 +94,20 @@ impl Channels {
     }
 
     /// Ends the recording of the channel called `name`, returning once it
-    /// is finished, its playlist ended. Blocks the thread: never call it on
-    /// the runtime's.
-    pub(crate) fn unrecord(&self, name: &str) -> Result<(), AttachError> {
+    /// is finished, its playlist ended.
+    pub(crate) async fn unrecord(&self, name: &str) -> Result<(), AttachError> {
         let recorder = self
             .get(name)
             .ok_or_else(|| AttachError::NoChannel(name.to_owned()))?
             .detach_record()?;
-        recorder.wait();
+        recorder.wait().await;
         Ok(())
     }
 
     /// Removes a channel and stops it, returning once it is off every
     /// listener, its recording finished and its source's task ended.
-    /// Whether there was one. Blocks the thread: never call it on the
-    /// runtime's.
-    pub(crate) fn remove(&self, name: &str) -> bool {
+    /// Whether there was one.
+    pub(crate) async fn remove(&self, name: &str) -> bool {
         let removed = {
             let _changing = self.changing();
             let removed = self
@@ -124,7 +122,7 @@ impl Channels {
         };
         match removed {
             Some(channel) => {
-                channel.stop();
+                channel.stop().await;
                 true
             }
             None => false,
@@ -132,9 +130,8 @@ impl Channels {
     }
 
     /// Removes and stops every channel, all at once: each is halted first,
-    /// so their tasks end together, and then each waited for. Blocks the
-    /// thread: never call it on the runtime's.
-    pub(crate) fn clear(&self) {
+    /// so their tasks end together, and then each waited for.
+    pub(crate) async fn clear(&self) {
         let all = {
             let _changing = self.changing();
             let all = std::mem::take(&mut *self.map.write().unwrap_or_else(|p| p.into_inner()));
@@ -144,7 +141,7 @@ impl Channels {
             all
         };
         for channel in all.values() {
-            channel.stop();
+            channel.stop().await;
         }
     }
 

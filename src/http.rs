@@ -98,12 +98,8 @@ async fn create_channel(
                 .into_response();
         }
     };
-    let channels = Arc::clone(&state.channels);
-    let added =
-        tokio::task::spawn_blocking(move || channels.add(&config).map(|channel| channel.status()))
-            .await;
-    match added {
-        Ok(Ok(status)) => {
+    match state.channels.add(&config).map(|channel| channel.status()) {
+        Ok(status) => {
             let mut response = (StatusCode::CREATED, axum::Json(&status)).into_response();
             if let Ok(location) =
                 HeaderValue::from_str(&format!("/api/v1/channels/{}", status.name))
@@ -112,25 +108,23 @@ async fn create_channel(
             }
             response
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             let status = match error {
                 ChannelError::Name(_) | ChannelError::Source { .. } => StatusCode::BAD_REQUEST,
                 ChannelError::Exists(_) => StatusCode::CONFLICT,
             };
             (status, format!("{error}\n")).into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
 /// `DELETE /api/v1/channels/{name}`: answered once the channel is off every
 /// listener, its recording finished and its camera let go of.
 async fn delete_channel(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let channels = Arc::clone(&state.channels);
-    match tokio::task::spawn_blocking(move || channels.remove(&name)).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    if state.channels.remove(&name).await {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -181,7 +175,7 @@ async fn play(
                 .into_response();
         }
     }
-    let channel = match streamed(&state, &name, Protocol::Rtsp).await {
+    let channel = match streamed(&state, &name, Protocol::Rtsp) {
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };
@@ -211,18 +205,15 @@ fn host(headers: &HeaderMap) -> String {
 
 /// The channel called `name`, registered on `protocol`'s listener — or the
 /// answer saying why not.
-async fn streamed(
+fn streamed(
     state: &AppState,
     name: &str,
     protocol: Protocol,
 ) -> Result<Arc<Channel>, (StatusCode, String)> {
-    let channels = Arc::clone(&state.channels);
-    let name = name.to_owned();
-    match tokio::task::spawn_blocking(move || channels.stream(&name, protocol)).await {
-        Ok(Ok(channel)) => Ok(channel),
-        Ok(Err(error)) => Err(attach_refusal(&error)),
-        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, String::new())),
-    }
+    state
+        .channels
+        .stream(name, protocol)
+        .map_err(|error| attach_refusal(&error))
 }
 
 /// `POST /api/v1/channels/{name}/record`: the channel recorded from now —
@@ -237,11 +228,9 @@ async fn record(State(state): State<AppState>, Path(name): Path<String>) -> Resp
 /// `DELETE /api/v1/channels/{name}/record`: answered once the recording
 /// under way is finished, its playlist ended.
 async fn unrecord(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let channels = Arc::clone(&state.channels);
-    match tokio::task::spawn_blocking(move || channels.unrecord(&name)).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) => attach_refused(&error),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    match state.channels.unrecord(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => attach_refused(&error),
     }
 }
 
@@ -352,7 +341,7 @@ async fn whep_offer(
     let Ok(offer) = String::from_utf8(body.to_vec()) else {
         return (StatusCode::BAD_REQUEST, "the offer is not text\n").into_response();
     };
-    let channel = match streamed(&state, &name, Protocol::WebRtc).await {
+    let channel = match streamed(&state, &name, Protocol::WebRtc) {
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };

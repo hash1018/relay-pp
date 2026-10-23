@@ -108,9 +108,8 @@ impl Recorder {
     }
 
     /// Halts it and waits for the recording under way to be finished.
-    /// Blocks the thread: never call it on the runtime's.
-    pub(crate) fn wait(&self) {
-        self.task.wait();
+    pub(crate) async fn wait(&self) {
+        self.task.wait().await;
     }
 }
 

@@ -332,14 +332,14 @@ impl Channel {
 
     /// Halts it, and waits for its recording to be finished and its
     /// source's task to end — no longer than a connection's pipeline takes
-    /// to stop. Blocks the thread: never call it on the runtime's.
-    pub(crate) fn stop(&self) {
+    /// to stop.
+    pub(crate) async fn stop(&self) {
         self.halt();
         let recorder = self.attached().recorder.take();
         if let Some(recorder) = recorder {
-            recorder.wait();
+            recorder.wait().await;
         }
-        self.source.wait();
+        self.source.wait().await;
     }
 
     fn attached(&self) -> std::sync::MutexGuard<'_, Attached> {

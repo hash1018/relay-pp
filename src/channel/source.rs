@@ -168,9 +168,9 @@ impl Source {
 
     /// Halts it and waits for its task to end — no longer than a
     /// connection's pipeline takes to stop, which for a camera gone silent
-    /// is its timeout. Blocks the thread: never call it on the runtime's.
-    pub(super) fn wait(&self) {
-        self.task.wait();
+    /// is its timeout.
+    pub(super) async fn wait(&self) {
+        self.task.wait().await;
     }
 }
 

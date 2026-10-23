@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Why a configuration could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +46,71 @@ pub struct Config {
     /// Recording, for the channels made with `"record": true`.
     #[serde(default)]
     pub record: RecordConfig,
+    /// What is converted for a way out that cannot carry what a camera
+    /// sends, unless a channel says otherwise.
+    #[serde(default)]
+    pub convert: ConvertConfig,
+}
+
+/// `[convert]`, and a channel's own say over it: what is converted for a
+/// way out — WebRTC players, a recording — that cannot carry a track.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConvertConfig {
+    #[serde(default)]
+    pub sound: SoundConversion,
+    #[serde(default)]
+    pub video: VideoConversion,
+}
+
+/// Whether sound a way out cannot carry is converted for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SoundConversion {
+    /// Converted — to Opus for WebRTC, AAC for a recording — on the
+    /// processor, which it costs little of.
+    #[default]
+    Auto,
+    /// Left out of that way out: WebRTC players of a camera's AAC are sent
+    /// its pictures alone.
+    Off,
+}
+
+/// Whether pictures a way out cannot carry are converted for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoConversion {
+    /// Converted where a GPU encoder takes them, and refused where none
+    /// does — none there, or each of its sessions taken — rather than
+    /// encoded on the processor, a core or two a camera.
+    #[default]
+    Gpu,
+    /// Converted on the GPU where one takes them, and on the processor
+    /// where none does.
+    Any,
+    /// Never converted: that way out is refused.
+    Off,
+}
+
+/// What a channel says of its conversions, over `[convert]`: each left out
+/// is the server's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConvertChoice {
+    #[serde(default)]
+    pub sound: Option<SoundConversion>,
+    #[serde(default)]
+    pub video: Option<VideoConversion>,
+}
+
+impl ConvertChoice {
+    /// What it comes to, over `server`'s.
+    pub fn over(self, server: ConvertConfig) -> ConvertConfig {
+        ConvertConfig {
+            sound: self.sound.unwrap_or(server.sound),
+            video: self.video.unwrap_or(server.video),
+        }
+    }
 }
 
 /// `[record]`.

@@ -12,6 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use media_pp::elements::StreamInfo;
+
+use crate::config::{ConvertConfig, SoundConversion, VideoConversion};
 use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 
@@ -65,6 +67,8 @@ pub(crate) struct Plan {
     /// each. One of every track of the source, in order and unconverted, is
     /// the source's own broadcast.
     pub(crate) broadcasts: BTreeMap<Vec<TrackFrom>, BTreeSet<Output>>,
+    /// Each output that reads nothing, and why.
+    pub(crate) refused: BTreeMap<Output, String>,
 }
 
 impl Track {
@@ -122,24 +126,45 @@ impl Output {
 
 impl Plan {
     /// The plan for a source sending `tracks` — in its broadcast's order,
-    /// `None` where no output reads one — read by `outputs`.
-    pub(crate) fn of(tracks: &[Option<Track>], outputs: &BTreeSet<Output>) -> Self {
+    /// `None` where no output reads one — read by `outputs`, converting what
+    /// `convert` allows: sound not converted is left out of an output that
+    /// cannot carry it, and an output whose pictures may not be converted is
+    /// refused.
+    pub(crate) fn of(
+        tracks: &[Option<Track>],
+        outputs: &BTreeSet<Output>,
+        convert: ConvertConfig,
+    ) -> Self {
         let mut plan = Plan::default();
-        for &output in outputs {
-            let read: Vec<TrackFrom> = tracks
-                .iter()
-                .enumerate()
-                .filter_map(|(index, track)| {
-                    let track = track.as_ref()?;
-                    Some(if output.carries(track) {
-                        TrackFrom::Original(index)
-                    } else {
-                        let target = output.target(track.kind);
-                        plan.conversions.insert((index, target));
-                        TrackFrom::Converted(index, target)
-                    })
-                })
-                .collect();
+        'outputs: for &output in outputs {
+            let mut read = Vec::new();
+            let mut conversions = Vec::new();
+            for (index, track) in tracks.iter().enumerate() {
+                let Some(track) = track else { continue };
+                if output.carries(track) {
+                    read.push(TrackFrom::Original(index));
+                    continue;
+                }
+                match (track.kind, convert.sound, convert.video) {
+                    (Kind::Audio, SoundConversion::Off, _) => continue,
+                    (Kind::Video, _, VideoConversion::Off) => {
+                        plan.refused.insert(
+                            output,
+                            format!(
+                                "its pictures, in {:?}, are not carried by {} and are not to be converted",
+                                track.codec,
+                                output.name()
+                            ),
+                        );
+                        continue 'outputs;
+                    }
+                    _ => {}
+                }
+                let target = output.target(track.kind);
+                conversions.push((index, target));
+                read.push(TrackFrom::Converted(index, target));
+            }
+            plan.conversions.extend(conversions);
             plan.broadcasts.entry(read).or_default().insert(output);
         }
         plan
@@ -178,6 +203,7 @@ mod tests {
         let plan = Plan::of(
             &[video(Id::H264), audio(Id::PCM_MULAW)],
             &outputs(&[Rtsp, WebRtc]),
+            ConvertConfig::default(),
         );
         assert!(plan.conversions.is_empty());
         assert_eq!(
@@ -189,7 +215,11 @@ mod tests {
     #[test]
     fn aac_is_converted_for_webrtc_alone() {
         let tracks = [video(Id::H264), audio(Id::AAC)];
-        let plan = Plan::of(&tracks, &outputs(&[Rtsp, WebRtc, Hls]));
+        let plan = Plan::of(
+            &tracks,
+            &outputs(&[Rtsp, WebRtc, Hls]),
+            ConvertConfig::default(),
+        );
         assert_eq!(plan.conversions, BTreeSet::from([(1, Target::Opus)]));
         assert_eq!(
             plan.broadcasts,
@@ -208,6 +238,7 @@ mod tests {
         let plan = Plan::of(
             &[video(Id::H264), audio(Id::PCM_ALAW)],
             &outputs(&[WebRtc, Hls]),
+            ConvertConfig::default(),
         );
         assert_eq!(plan.conversions, BTreeSet::from([(1, Target::Aac)]));
         assert_eq!(plan.broadcasts.len(), 2);
@@ -220,6 +251,7 @@ mod tests {
         let plan = Plan::of(
             &[video(Id::MJPEG), audio(Id::MP3)],
             &outputs(&[WebRtc, Hls]),
+            ConvertConfig::default(),
         );
         assert_eq!(
             plan.conversions,
@@ -247,7 +279,7 @@ mod tests {
             codec: Id::H264,
             reorders: true,
         })];
-        let plan = Plan::of(&tracks, &outputs(&[WebRtc, Hls]));
+        let plan = Plan::of(&tracks, &outputs(&[WebRtc, Hls]), ConvertConfig::default());
         assert_eq!(plan.conversions, BTreeSet::from([(0, Target::H264)]));
         assert_eq!(
             plan.broadcasts[&vec![Original(0)]],
@@ -258,14 +290,22 @@ mod tests {
 
     #[test]
     fn h265_is_converted_for_webrtc() {
-        let plan = Plan::of(&[video(Id::HEVC)], &outputs(&[Rtsp, WebRtc, Hls]));
+        let plan = Plan::of(
+            &[video(Id::HEVC)],
+            &outputs(&[Rtsp, WebRtc, Hls]),
+            ConvertConfig::default(),
+        );
         assert_eq!(plan.conversions, BTreeSet::from([(0, Target::H264)]));
         assert_eq!(plan.broadcasts[&vec![Original(0)]], outputs(&[Rtsp, Hls]));
     }
 
     #[test]
     fn what_no_output_reads_is_left_out() {
-        let plan = Plan::of(&[video(Id::H264), None], &outputs(&[WebRtc]));
+        let plan = Plan::of(
+            &[video(Id::H264), None],
+            &outputs(&[WebRtc]),
+            ConvertConfig::default(),
+        );
         assert_eq!(
             plan.broadcasts,
             BTreeMap::from([(vec![Original(0)], outputs(&[WebRtc]))])
@@ -274,7 +314,54 @@ mod tests {
 
     #[test]
     fn nothing_read_runs_nothing() {
-        let plan = Plan::of(&[video(Id::MJPEG)], &BTreeSet::new());
+        let plan = Plan::of(
+            &[video(Id::MJPEG)],
+            &BTreeSet::new(),
+            ConvertConfig::default(),
+        );
         assert_eq!(plan, Plan::default());
+    }
+
+    #[test]
+    fn sound_not_to_be_converted_is_left_out_where_it_is_not_carried() {
+        let convert = ConvertConfig {
+            sound: SoundConversion::Off,
+            ..ConvertConfig::default()
+        };
+        let plan = Plan::of(
+            &[video(Id::H264), audio(Id::AAC)],
+            &outputs(&[WebRtc, Hls]),
+            convert,
+        );
+        assert!(plan.conversions.is_empty());
+        assert_eq!(
+            plan.broadcasts,
+            BTreeMap::from([
+                (vec![Original(0)], outputs(&[WebRtc])),
+                (vec![Original(0), Original(1)], outputs(&[Hls])),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_output_whose_pictures_are_not_to_be_converted_is_refused() {
+        let convert = ConvertConfig {
+            video: VideoConversion::Off,
+            ..ConvertConfig::default()
+        };
+        let plan = Plan::of(
+            &[video(Id::HEVC), audio(Id::AAC)],
+            &outputs(&[Rtsp, WebRtc, Hls]),
+            convert,
+        );
+        assert!(
+            plan.conversions.is_empty(),
+            "nor its sound for it: {plan:?}"
+        );
+        assert!(plan.refused[&WebRtc].contains("not to be converted"));
+        assert_eq!(
+            plan.broadcasts,
+            BTreeMap::from([(vec![Original(0), Original(1)], outputs(&[Rtsp, Hls]))])
+        );
     }
 }

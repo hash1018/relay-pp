@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
-use crate::config::RecordConfig;
+use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
 use convert::{Converter, Fed};
 use plan::Output;
 use record::RecordStatus;
@@ -55,6 +55,11 @@ pub struct ChannelConfig {
     /// it takes the camera, FFmpeg's where not — or `"ffmpeg"`.
     #[serde(default)]
     pub client: Client,
+    /// What is converted for a way out that cannot carry a track, over
+    /// the server's `[convert]`: `{"sound": "off", "video": "any"}`, each
+    /// left out the server's.
+    #[serde(default)]
+    pub convert: ConvertChoice,
 }
 
 /// How a camera is pulled.
@@ -156,6 +161,8 @@ pub struct ChannelStatus {
     pub recording: Option<String>,
     /// Why its last recording failed, until one is written again.
     pub record_error: Option<String>,
+    /// What is converted for it, its own say over the server's.
+    pub convert: ConvertConfig,
     /// Each track converted, and to what, while it is: `"1:opus"`, track 1
     /// converted to Opus for WebRTC players.
     pub conversions: Vec<String>,
@@ -167,6 +174,8 @@ pub struct Channel {
     source: Source,
     /// What it converts for WebRTC players and its recording.
     converter: Converter,
+    /// What it may convert.
+    convert: ConvertConfig,
     /// What it is attached to, behind one lock — so nothing is attached to
     /// a channel once it is halted.
     attached: Mutex<Attached>,
@@ -194,15 +203,24 @@ impl Channel {
     pub(crate) fn start(
         config: &ChannelConfig,
         record: &RecordConfig,
+        convert: ConvertConfig,
         runtime: &Handle,
     ) -> Result<Self, ChannelError> {
         config.check()?;
+        let convert = config.convert.over(convert);
         let source = Source::new(&config.name, config);
-        let converter = Converter::start(&config.name, source.broadcast(), source.runs(), runtime);
+        let converter = Converter::start(
+            &config.name,
+            source.broadcast(),
+            source.runs(),
+            convert,
+            runtime,
+        );
         let channel = Self {
             name: config.name.clone(),
             source,
             converter,
+            convert,
             attached: Mutex::default(),
             record: record.clone(),
             runtime: runtime.clone(),
@@ -249,6 +267,7 @@ impl Channel {
             sinks,
             recording: record.recording,
             record_error: record.error,
+            convert: self.convert,
             conversions: self.converter.conversions(),
         }
     }
@@ -480,6 +499,7 @@ mod tests {
             source: source.to_owned(),
             transport: Transport::Tcp,
             client: Client::Auto,
+            convert: ConvertChoice::default(),
         }
     }
 

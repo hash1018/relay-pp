@@ -46,6 +46,8 @@ has them all with comments.
 | `record.chunk` | `"1h"` | how long one recording directory runs, at whole multiples of it in UTC |
 | `record.keep` | none | how long a recording is kept from its last write: `"30d"` |
 | `record.max_size` | none | how much all recordings together may take, the oldest removed first: `"500GB"`, `"2TiB"` |
+| `convert.sound` | `"auto"` | sound a way out cannot carry: `"auto"`, converted for it; `"off"`, left out of it — see "Conversions" |
+| `convert.video` | `"gpu"` | pictures a way out cannot carry: `"gpu"`, converted on a GPU and refused where none takes them; `"any"`, on the processor where no GPU does; `"off"`, that way out refused |
 
 Durations are a number and `ms`, `s`, `m`, `h` or `d`; sizes a number of
 bytes, or one with `KB` … `TB` (1000-based) or `KiB` … `TiB` (1024-based).
@@ -83,6 +85,7 @@ and not `api`, `playback` or `recordings`.
 | `source` | required | an `rtsp://` or `rtsps://` URL |
 | `transport` | `"tcp"` | how the camera is pulled: `"tcp"`, RTP on the RTSP connection, which loses nothing; or `"udp"` |
 | `client` | `"auto"` | which RTSP client pulls it: `"auto"`, `retina`'s where it takes the camera and FFmpeg's where it does not (below); or `"ffmpeg"`, FFmpeg's always — for a camera `retina` takes but takes wrongly |
+| `convert` | the server's `[convert]` | its own say over it: `{"sound": "off", "video": "any"}`, each left out the server's |
 
 `201` with its status, `Location` its URL; `400` for a name or source that
 cannot be used, a field missing or unknown, or not JSON; `409` for a name
@@ -118,6 +121,7 @@ there. Each is:
 | `recording` | the playlist of the recording being written, while one is |
 | `record_error` | why its last recording failed, until one is written again |
 | `conversions` | each track converted now, and to what: `"1:opus"` — see "Conversions" |
+| `convert` | what may be converted for it, its own say over the server's: `{"sound": "auto", "video": "gpu"}` |
 
 Credentials never reach an answer or a log line.
 
@@ -259,14 +263,21 @@ converted for it, and what it can carry goes as it came.
   encoded there without being copied out: D3D11 on Windows — NVENC, or the
   Intel or AMD encoder Media Foundation offers — and NVIDIA's NVDEC and
   NVENC, or else Vulkan Video, on Linux. A codec the GPU cannot decode — VP8
-  on many — is decoded on the processor and still encoded on the GPU; with
+  on many — is decoded on the processor and still encoded on the GPU. With
   no GPU encoder, or every session of one taken (eight on a GeForce), it is
-  encoded in software. H.264, a keyframe a second, about a tenth of a bit a
-  pixel: 3.6 Mbit/s for 1080p at 25.
+  refused, or encoded on the processor where `"any"` says so (below).
+  H.264, a keyframe a second, about a tenth of a bit a pixel: 3.6 Mbit/s for
+  1080p at 25.
 - Sound is decoded and encoded on the processor, 48 kHz, one or two
   channels.
-- Where a conversion cannot be made, a WebRTC player is answered `503`
-  saying why, and a recording says so in `record_error`.
+- What is converted is the server's `[convert]`, and each channel's own
+  `convert` over it. Sound is converted unless it says `"off"`, which leaves
+  it out of a way out that cannot carry it. Pictures are converted on a GPU
+  unless it says `"any"`, which converts them on the processor where no GPU
+  takes them — a core or two a camera — or `"off"`, which converts none.
+- Where a conversion cannot be made or is not to be, a WebRTC player is
+  answered `503` saying why, and a recording says so in `record_error`;
+  RTSP goes on as it came.
 
 ## Stopping
 
@@ -305,7 +316,8 @@ over WebRTC as Opus and over RTSP as it came; its Opus recorded as AAC in
 time with its pictures; a conversion stopping once no WebRTC player has
 played it for a while, and made again for the next. A camera's H.265
 played over WebRTC as H.264 and over RTSP as it came; its VP8 recorded as
-H.264 in time with its sound. Recorded
+H.264 in time with its sound. A channel's own `convert` over the server's: its
+sound left out of WebRTC, its pictures refused to WebRTC saying why. Recorded
 in four-second chunks of one-second segments, each one media file read by
 byte range; listed; a stretch across chunks played back as one playlist and
 read back by FFmpeg through the server; a recording ended and begun again as

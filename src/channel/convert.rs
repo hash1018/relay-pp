@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::plan::{Output, Plan, Target, Track, TrackFrom};
 use super::task::Task;
+use crate::config::{ConvertConfig, VideoConversion};
 
 /// How long a WebRTC output's broadcast goes unread, and unasked for,
 /// before its conversions stop.
@@ -92,6 +93,7 @@ impl Converter {
         name: &str,
         original: &Broadcast,
         runs: watch::Receiver<Option<u64>>,
+        convert: ConvertConfig,
         runtime: &Handle,
     ) -> Self {
         let (commands, received) = mpsc::unbounded_channel();
@@ -102,6 +104,7 @@ impl Converter {
             name: name.to_owned(),
             converting: Arc::clone(&converting),
             original: original.clone(),
+            convert,
             fed: BTreeMap::from([(Output::WebRtc, webrtc_fed), (Output::Hls, hls_fed)]),
             wanted: BTreeSet::new(),
             asked: None,
@@ -165,6 +168,8 @@ struct Converting {
     name: String,
     converting: Arc<Mutex<Vec<String>>>,
     original: Broadcast,
+    /// What it may convert.
+    convert: ConvertConfig,
     fed: BTreeMap<Output, watch::Sender<Fed>>,
     wanted: BTreeSet<Output>,
     /// When WebRTC was last asked for.
@@ -288,7 +293,7 @@ impl Converting {
             .copied()
             .filter(|output| *output != Output::Rtsp)
             .collect();
-        let plan = Plan::of(&tracks, &wanted);
+        let plan = Plan::of(&tracks, &wanted, self.convert);
         let own: Vec<TrackFrom> = (0..infos.len()).map(TrackFrom::Original).collect();
         let made: BTreeSet<&Vec<TrackFrom>> = plan
             .broadcasts
@@ -314,7 +319,7 @@ impl Converting {
             self.stop().await;
         }
 
-        let mut failed: BTreeMap<Output, String> = BTreeMap::new();
+        let mut failed: BTreeMap<Output, String> = plan.refused.clone();
         for (read, outputs) in &plan.broadcasts {
             if *read == own {
                 continue;
@@ -399,7 +404,7 @@ impl Converting {
         // broadcast is published with.
         for track in read {
             if let TrackFrom::Converted(index, target) = *track {
-                running.convert(&self.name, index, target, &infos[index])?;
+                running.convert(&self.name, index, target, &infos[index], self.convert.video)?;
             }
         }
         let tracks: Vec<StreamInfo> = read
@@ -514,6 +519,7 @@ impl Running {
         index: usize,
         target: Target,
         info: &StreamInfo,
+        video: VideoConversion,
     ) -> Result<(), String> {
         if self.conversions.contains_key(&(index, target)) {
             return Ok(());
@@ -539,7 +545,7 @@ impl Running {
                 )
             }
             Target::H264 => {
-                let (decoder, encoder, converted) = pictures(name, &label, info)?;
+                let (decoder, encoder, converted) = pictures(name, &label, info, video)?;
                 // Joining a stream under way, the decoder begins at a
                 // keyframe: before one there is nothing it can decode.
                 let built = chain
@@ -622,6 +628,7 @@ fn pictures(
     name: &str,
     label: &str,
     info: &StreamInfo,
+    video: VideoConversion,
 ) -> Result<(VideoDecodeBin, VideoEncodeBin, StreamInfo), String> {
     let (width, height) = info
         .size()
@@ -641,8 +648,14 @@ fn pictures(
         max_b_frames: Some(0),
         color: info.color(),
     };
+    let targets = decode_targets(video);
+    if targets.is_empty() {
+        return Err(format!(
+            "cannot convert {label}'s pictures: no GPU device opened, and they are converted on the GPU alone"
+        ));
+    }
     let mut refused = Vec::new();
-    for target in decode_targets() {
+    for target in targets {
         let decoder = match VideoDecodeBin::open(
             format!("{name}-decode-{label}"),
             info.parameters().clone(),
@@ -660,6 +673,11 @@ fn pictures(
             continue;
         };
         match VideoEncodeBin::open(format!("{name}-encode-{label}"), input, options) {
+            // Every session of the GPU's encoder taken, or none there: the
+            // bin has gone on to software, which this channel refuses.
+            Ok(encoder) if video == VideoConversion::Gpu && !encoder.path().is_hardware() => {
+                refused.push(format!("no GPU encoder opened, only {:?}", encoder.path()));
+            }
             Ok(encoder) => {
                 tracing::info!(
                     track = %label,
@@ -683,7 +701,7 @@ fn pictures(
 /// Where pictures may be decoded to for conversion, the GPU first: each
 /// conversion a device of its own, so one's work does not wait on
 /// another's lock of a shared one.
-fn decode_targets() -> Vec<DecodeTarget> {
+fn decode_targets(video: VideoConversion) -> Vec<DecodeTarget> {
     let mut targets = Vec::new();
     #[cfg(windows)]
     if let Ok(gpu) = media_pp::elements::D3d11Gpu::new() {
@@ -707,7 +725,9 @@ fn decode_targets() -> Vec<DecodeTarget> {
             });
         }
     }
-    targets.push(DecodeTarget::System);
+    if video == VideoConversion::Any {
+        targets.push(DecodeTarget::System);
+    }
     targets
 }
 

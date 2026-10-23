@@ -251,3 +251,102 @@ fn vp8_is_recorded_as_h264_in_time_with_the_sound() {
     server.stop();
     camera.stop();
 }
+
+/// Makes `cam1` pulling `camera` with `convert` — the body's `"convert"`.
+fn made_with(server: &relay_pp::Server, camera: std::net::SocketAddr, convert: &str) {
+    let body = format!(r#"{{"name":"cam1","source":"rtsp://{camera}/cam","convert":{convert}}}"#);
+    let (status, _, answer) = http(server.http_addr(), "POST", "/api/v1/channels", Some(&body));
+    assert_eq!(status, 201, "{answer}");
+    wait_for("the camera live", || state_of(server) == SourceState::Live);
+}
+
+/// A WHEP offer `POST`ed as it is, to see the answer's status and body.
+fn offered(server: &relay_pp::Server) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(server.http_addr()).unwrap();
+    let offer = "v=0\r\n";
+    write!(
+        stream,
+        "POST /cam1/whep HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{offer}",
+        offer.len()
+    )
+    .unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    let status = answer
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, answer)
+}
+
+#[test]
+fn a_channel_sound_is_not_converted_for_is_played_over_webrtc_without_it() {
+    let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
+    let server = server();
+    made_with(&server, camera.addr, r#"{"sound":"off"}"#);
+    assert_eq!(
+        server.status()[0].convert.sound,
+        relay_pp::SoundConversion::Off
+    );
+
+    let (whep, tracks) = whep_tracks(&format!("http://{}/cam1/whep", server.http_addr()));
+    let codecs: Vec<Id> = tracks.iter().map(|(codec, _)| *codec).collect();
+    assert_eq!(codecs, [Id::H264], "its pictures alone");
+    wait_for("pictures over WebRTC", || tracks[0].1.get() > 20);
+    assert!(conversions(&server).is_empty());
+
+    whep.stop();
+    server.stop();
+    camera.stop();
+}
+
+#[test]
+fn a_channel_pictures_are_not_converted_for_refuses_webrtc_saying_why() {
+    let Some(camera) = h265_camera(false) else {
+        eprintln!("skipping: no H.265 encoder in this FFmpeg");
+        return;
+    };
+    let server = server();
+    made_with(&server, camera.addr, r#"{"video":"off"}"#);
+    settled(&server);
+
+    let (status, answer) = offered(&server);
+    assert_eq!(status, 503, "{answer}");
+    assert!(answer.contains("not to be converted"), "{answer}");
+    assert!(conversions(&server).is_empty());
+    let url = play_rtsp(server.http_addr(), "cam1");
+    assert_eq!(rtsp_codecs(&url), [Id::HEVC], "RTSP goes on as it came");
+
+    server.stop();
+    camera.stop();
+}
+
+#[test]
+fn a_channel_says_what_it_converts_over_the_server() {
+    let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
+    let server = server_with("[convert]\nsound = \"off\"");
+    made_with(&server, camera.addr, r#"{"sound":"auto"}"#);
+
+    let (whep, tracks) = whep_tracks(&format!("http://{}/cam1/whep", server.http_addr()));
+    let codecs: Vec<Id> = tracks.iter().map(|(codec, _)| *codec).collect();
+    assert_eq!(
+        codecs,
+        [Id::H264, Id::OPUS],
+        "the channel's say, over the server's"
+    );
+
+    let (status, _, answer) = http(
+        server.http_addr(),
+        "POST",
+        "/api/v1/channels",
+        Some(r#"{"name":"cam2","source":"rtsp://127.0.0.1:1/cam","convert":{"video":"always"}}"#),
+    );
+    assert!((400..500).contains(&status), "{status} {answer}");
+
+    whep.stop();
+    server.stop();
+    camera.stop();
+}

@@ -40,3 +40,15 @@ candidates = ["192.168.0.10"]
 # may take, the oldest removed first. Kept for ever where neither is set.
 # keep = "30d"
 # max_size = "500GB"
+
+[convert]
+# What is converted for a way out that cannot carry what a camera sends —
+# WebRTC players, a recording — where a channel says nothing of it; a
+# channel's own "convert" in POST /api/v1/channels comes first.
+# Sound: "auto", converted on the processor (to Opus for WebRTC, AAC for a
+# recording); or "off", left out of that way out.
+# sound = "auto"
+# Pictures: "gpu", converted to H.264 where a GPU encoder takes them and
+# refused where none does; "any", on the processor where no GPU does; or
+# "off", that way out refused.
+# video = "gpu"

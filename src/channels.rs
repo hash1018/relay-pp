@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 
 use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, Listeners, Protocol};
-use crate::config::RecordConfig;
+use crate::config::{ConvertConfig, RecordConfig};
 
 pub(crate) struct Channels {
     /// Read on every request, written only as a channel is added or
@@ -25,17 +25,25 @@ pub(crate) struct Channels {
     listeners: Listeners,
     /// How a recorded channel is recorded.
     pub(crate) record: RecordConfig,
+    /// What a channel converts, where it says nothing of it.
+    convert: ConvertConfig,
     /// Where every channel's tasks run.
     runtime: Handle,
 }
 
 impl Channels {
-    pub(crate) fn new(listeners: Listeners, record: RecordConfig, runtime: Handle) -> Self {
+    pub(crate) fn new(
+        listeners: Listeners,
+        record: RecordConfig,
+        convert: ConvertConfig,
+        runtime: Handle,
+    ) -> Self {
         Self {
             map: RwLock::default(),
             changing: Mutex::default(),
             listeners,
             record,
+            convert,
             runtime,
         }
     }
@@ -64,7 +72,12 @@ impl Channels {
         if self.get(&config.name).is_some() {
             return Err(ChannelError::Exists(config.name.clone()));
         }
-        let channel = Arc::new(Channel::start(config, &self.record, &self.runtime)?);
+        let channel = Arc::new(Channel::start(
+            config,
+            &self.record,
+            self.convert,
+            &self.runtime,
+        )?);
         self.map
             .write()
             .unwrap_or_else(|p| p.into_inner())

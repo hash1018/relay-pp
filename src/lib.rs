@@ -23,7 +23,7 @@ pub use channel::{
     AttachError, ChannelConfig, ChannelError, ChannelStatus, Client, SourceState, Transport,
 };
 use channels::Channels;
-pub use config::Config;
+pub use config::{Config, ConvertChoice, ConvertConfig, SoundConversion, VideoConversion};
 
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +105,7 @@ impl Server {
         let channels = Arc::new(Channels::new(
             listeners.clone(),
             config.record.clone(),
+            config.convert,
             runtime.handle().clone(),
         ));
         runtime.spawn(recordings::keep(config.record.clone()));

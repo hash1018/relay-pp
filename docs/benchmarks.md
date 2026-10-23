@@ -131,6 +131,39 @@ Recording is now most of what a recorded camera costs — a pipeline and a
 thread of its own each, writing HLS — and still about half MediaMTX's
 processor time.
 
+## Converting for WebRTC players
+
+relay-pp at 90ba8fe on Windows, the same machine, its GPU an NVIDIA GeForce
+RTX 3050 (driver 610.88). N channels, one WebRTC player each (`watch N`), of
+three cameras sending the stream above, 1080p at 25: H.264 and Opus, which
+WebRTC carries as it is; H.264 and AAC, whose sound is converted to Opus on
+the processor; H.265 and Opus, whose pictures are converted to H.264 —
+decoded by D3D11VA and encoded by NVENC, never copied out of the GPU. The
+camera's tracks have no `rtptime`, so FFmpeg's client pulls all three, and
+the first stands for what the other two cost without converting. `GPU`
+columns are `nvidia-smi`'s, over the same 30 seconds.
+
+| Channels | CPU, none / sound / pictures | Memory, none / sound / pictures | Threads, none / pictures | NVENC | NVDEC |
+|---|---|---|---|---|---|
+| 1 | 17 / 22 / 21 | 40 / 42 / 201 MB | 15 / 31 | 17% | 5% |
+| 4 | 33 / 57 / 93 | 54 / 62 / 629 MB | 19 / 72 | 58% | 21% |
+| 8 | 49 / 118 / 152 | 73 / 83 / 1,174 MB | 23 / 128 | 63% | 20% |
+| 10 | — / — / 204 | — / — / 1,448 MB | — / 156 | 69% | 20% |
+
+Every player of every run played to the end with no picture lost, sound
+and all.
+
+- **Sound** costs 6 to 9% of a core a channel: AAC decoded and Opus encoded
+  by `libopus` at its default complexity, which is where to look first.
+- **Pictures** cost 13 to 15% of a core a channel, and about 140 MB and 13
+  threads: a D3D11 device of each conversion's own, its decoder's surfaces
+  and NVENC's buffers. Ten 1080p conversions at once took 69% of the one
+  NVENC — about fourteen in all — and the driver opened every session asked
+  for: where it stops, a conversion asked for after is refused (`"gpu"`).
+  What the processor spends beside the GPU's work has not been profiled.
+- Neither runs without a WebRTC player: a channel nobody watches over WebRTC
+  converts nothing.
+
 ## What it says for relay-pp
 
 - **Pulling cameras costs a fraction of MediaMTX's processor time** with

@@ -264,7 +264,8 @@ converted for it, and what it can carry goes as it came.
   Intel or AMD encoder Media Foundation offers — and NVIDIA's NVDEC and
   NVENC, or else Vulkan Video, on Linux. A codec the GPU cannot decode — VP8
   on many — is decoded on the processor and still encoded on the GPU. With
-  no GPU encoder, or every session of one taken (eight on a GeForce), it is
+  no GPU encoder, or every session of one taken (how many a driver opens
+  varies: ten 1080p ones opened at once on a GeForce RTX 3050), it is
   refused, or encoded on the processor where `"any"` says so (below).
   H.264, a keyframe a second, about a tenth of a bit a pixel: 3.6 Mbit/s for
   1080p at 25.

@@ -8,6 +8,9 @@
 #             record   — <count> channels pulling the camera, each recorded
 #             rtsp     — one channel, <count> RTSP players
 #             webrtc   — one channel, <count> WebRTC (WHEP) players
+#             watch    — <count> channels, one WebRTC player each: what
+#                        converting each for WebRTC costs, where the camera
+#                        sends what WebRTC does not carry
 #   server:   relay | mediamtx
 #
 # <work-dir> holds stream.mp4, the camera's file. Needs, built in release:
@@ -70,6 +73,7 @@ case $scenario in
     pull) ;;
     record) record=true ;;
     rtsp | webrtc) channels=1 ;;
+    watch) ;;
     *) echo "no scenario $scenario" >&2; exit 2 ;;
 esac
 
@@ -100,7 +104,8 @@ EOF
     live() { [ "$(curl -sf "http://$api/api/v1/channels" | grep -o '"state":"live"' | wc -l)" -eq "$channels" ]; }
     rtsp_play() { curl -sf -X POST "http://$api/api/v1/channels/cam1/play" -H 'Content-Type: application/json' \
         -d '{"protocol":"rtsp"}' | sed 's/.*"url":"\([^"]*\)".*/\1/'; }
-    whep=http://$api/cam1/whep
+    whep_of() { echo "http://$api/$1/whep"; }
+    whep=$(whep_of cam1)
     ;;
 mediamtx)
     process=mediamtx
@@ -144,7 +149,8 @@ EOF
     wait_until "MediaMTX" 20 curl -sf "http://$api/v3/paths/list"
     live() { [ "$(curl -sf "http://$api/v3/paths/list?itemsPerPage=10000" | grep -o '"ready":true' | wc -l)" -eq "$channels" ]; }
     rtsp_play() { echo rtsp://127.0.0.1:38554/cam1; }
-    whep=http://127.0.0.1:38889/cam1/whep
+    whep_of() { echo "http://127.0.0.1:38889/$1/whep"; }
+    whep=$(whep_of cam1)
     ;;
 *) echo "no server $server" >&2; exit 2 ;;
 esac
@@ -164,12 +170,41 @@ case $scenario in
         load=$!
         sleep 10
         ;;
+    watch)
+        loads=()
+        for i in $(seq "$channels"); do
+            "$tools/webrtc_load$exe" "$(whep_of "cam$i")" 1 --seconds $((SECONDS_MEASURED + 25)) \
+                >"$run/players-$i.log" 2>&1 &
+            loads+=($!)
+        done
+        sleep 20
+        ;;
 esac
+# The GPU's own use over the same window, where it is an NVIDIA one.
+gpu_samples=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder \
+        --format=csv,noheader,nounits -l 1 >"$run/gpu.csv" 2>/dev/null &
+    gpu_samples=$!
+fi
 server_cost=$(measure "$process" "$SECONDS_MEASURED")
+gpu=""
+if [ -n "$gpu_samples" ]; then
+    kill "$gpu_samples" 2>/dev/null || true
+    gpu=$(tr -d '\r ' <"$run/gpu.csv" | awk -F, 'NF == 3 { g += $1; e += $2; d += $3; n++ }
+        END { if (n) printf "gpu_pct=%.0f enc_pct=%.0f dec_pct=%.0f", g / n, e / n, d / n }')
+fi
 camera_cost=$(measure rtsp_server 5 | sed 's/ write_mbps=.*//')
 players=""
 if [ -n "$load" ]; then
     wait "$load" || true
     players=$(grep -E "^(players|received|pictures|packets|lag spread)" "$run/players.log" | tr '\n' ' ' | tr -s ' ')
 fi
-echo "$scenario $server $count | $server_cost | camera: $camera_cost | $players"
+if [ "$scenario" = watch ]; then
+    for load in "${loads[@]}"; do wait "$load" || true; done
+    players=$(cat "$run"/players-*.log | awk '
+        /^players:/ { played += $2; failed += $4 }
+        /^pictures:/ { pictures += $2; gaps += $6; sub(/.*sounds: /, ""); sounds += $1 }
+        END { printf "played=%d failed=%d pictures=%d after_gap=%d sounds=%d", played, failed, pictures, gaps, sounds }')
+fi
+echo "$scenario $server $count | $server_cost $gpu | camera: $camera_cost | $players"

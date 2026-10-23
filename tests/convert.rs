@@ -350,3 +350,44 @@ fn a_channel_says_what_it_converts_over_the_server() {
     server.stop();
     camera.stop();
 }
+
+#[test]
+fn what_webrtc_players_read_follows_the_camera_when_it_comes_back_in_other_codecs() {
+    let Some(probe) = Camera::with_opus("127.0.0.1:0".parse().unwrap()) else {
+        eprintln!("skipping: no libopus in this FFmpeg");
+        return;
+    };
+    probe.stop();
+    let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
+    let camera_addr = camera.addr;
+    let server = server();
+    made(&server, camera_addr);
+    let whep_url = format!("http://{}/cam1/whep", server.http_addr());
+    let (whep, tracks) = whep_tracks(&whep_url);
+    wait_for("sound over WebRTC", || tracks[1].1.get() > 20);
+    assert_eq!(conversions(&server), ["1:opus"]);
+    whep.stop();
+    drop(whep);
+
+    // It comes back sending Opus, which WebRTC carries: what WebRTC players
+    // read is the channel's own broadcast again, nothing converted.
+    camera.stop();
+    wait_for("the drop noticed", || {
+        state_of(&server) != SourceState::Live
+    });
+    let camera = Camera::with_opus(camera_addr).expect("libopus, as above");
+    wait_for("the camera live again", || {
+        let status = &server.status()[0];
+        status.state == SourceState::Live && status.connections >= 2
+    });
+    wait_for("nothing converted", || conversions(&server).is_empty());
+    let (whep, tracks) = whep_tracks(&whep_url);
+    let codecs: Vec<Id> = tracks.iter().map(|(codec, _)| *codec).collect();
+    assert_eq!(codecs, [Id::H264, Id::OPUS]);
+    wait_for("sound over WebRTC, as it came", || tracks[1].1.get() > 20);
+    assert!(conversions(&server).is_empty());
+
+    whep.stop();
+    server.stop();
+    camera.stop();
+}

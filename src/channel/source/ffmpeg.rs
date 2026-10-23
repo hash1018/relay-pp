@@ -81,10 +81,7 @@ fn start(
     source: RtspSource,
     streams: &[StreamInfo],
 ) -> Result<Arc<Pipeline>, String> {
-    let sinks = inner
-        .broadcast
-        .publish(streams)
-        .map_err(|error| format!("cannot publish: {error}"))?;
+    let sinks = inner.publisher.publish(streams)?;
     let (pipeline, ()) = Pipeline::new(format!("{}-pull", inner.name), source, |source, ctx| {
         for (stream, sink) in streams.iter().zip(sinks) {
             ctx.attach(source, stream.index(), ctx.branch().to(sink)?)?;

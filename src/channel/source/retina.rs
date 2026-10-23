@@ -177,7 +177,6 @@ impl Connection<'_> {
                 if let Err(reason) = self.publish(demuxed) {
                     return failed(reason);
                 }
-                self.inner.new_run();
                 tracing::info!(channel = %self.inner.name, "the camera's pictures changed; published anew");
             }
             if let Err(stopped) = self.write(demuxed, item) {
@@ -221,11 +220,7 @@ impl Connection<'_> {
             .iter()
             .map(|&index| track(&demuxed.streams()[index]))
             .collect::<Result<Vec<_>, _>>()?;
-        self.sinks = self
-            .inner
-            .broadcast
-            .publish(&tracks)
-            .map_err(|error| format!("cannot publish: {error}"))?;
+        self.sinks = self.inner.publisher.publish(&tracks)?;
         self.picture_ticks = self
             .kept
             .iter()

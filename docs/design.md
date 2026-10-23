@@ -56,19 +56,30 @@ reconnecting, recording files and their retention, HTTP, and reporting.
 ## The model
 
 ```
-            ┌────────────────────── channel "cam1" ────────────────────────┐
- source ──▶ │ Source ──▶ Broadcast ──┬──▶ RtspServer   (players)           │
- (pull or   │ (reconnects)           ├──▶ WebRtcServer (players)           │
-  publish)  │                        ├──▶ HLS (live, over HTTP)            │
-            │                        ├──▶ recorder (segments + retention)  │
-            │                        └──▶ forward (push out)               │
-            └──────────────────────────────────────────────────────────────┘
+            ┌──────────────────────────── channel "cam1" ─────────────────────────────┐
+ source ──▶ │ Source ──▶ Hub ──────────────────────────┬──▶ RtspServer   (players)    │
+ (pull or   │ (reconnects) its Broadcast, and those it ├──▶ WebRtcServer (players)    │
+  publish)  │              converts for a sink that    ├──▶ HLS (live, over HTTP)     │
+            │              cannot carry what came in   ├──▶ recorder                  │
+            │                                          └──▶ forward (push out)        │
+            └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-A **channel** is a name, one source, one `Broadcast`, and the sinks that read
-it: the unit of configuration, authorization, statistics and recording. It
-is made with its source alone; what reads it is asked for separately — a
+A **channel** is a name, one source, one hub, and the sinks that read it:
+the unit of configuration, authorization, statistics and recording. It is
+made with its source alone; what reads it is asked for separately — a
 player by its protocol, a recording over the API — and attached as it is.
+
+The **hub** stands between them, so that neither knows the other. The
+source publishes each connection's tracks to it and writes them into the
+hub's `Broadcast`. A sink subscribes saying what it carries — what its
+media-pp server or muxer sends (`RtspServer::carries` and the like),
+narrowed to what its players play — and the hub tells it which broadcast to
+read: its own where the sink carries every track, and else one it makes,
+converting each track the sink does not carry, once however many sinks need
+it, and only while one reads it. A source of any protocol and a sink of any
+protocol meet there, whatever codecs the one sends and the other takes; see
+[status.md](status.md), "Conversions".
 
 **Sources**:
 
@@ -85,7 +96,8 @@ outlives every reconnection, so players stay connected and go on at the next
 keyframe.
 
 **Sinks**: a players' listener, registered when a player first asks for the
-channel by that protocol — an RTSP player through the API, which answers
+channel by that protocol, and moved to whatever the hub gives it from then
+on — an RTSP player through the API, which answers
 with the URL to open since an RTSP player never reaches the HTTP port, a
 WebRTC player by its WHEP offer — and kept until the channel goes;
 **recording**, attached and detached over the API; **forwarding** per

@@ -20,7 +20,7 @@ use media_pp::elements::{SessionId, WebRtcServerError, WebRtcServerHandle};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
 
-use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, Protocol};
+use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, Output};
 use crate::channels::Channels;
 use crate::{clock, recordings};
 
@@ -175,12 +175,12 @@ async fn play(
                 .into_response();
         }
     }
-    let channel = match streamed(&state, &name, Protocol::Rtsp) {
+    let channel = match found(&state, &name) {
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };
-    if let Err(reason) = channel.live(LIVE_WITHIN).await {
-        return (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")).into_response();
+    if let Err(reason) = playable(&state, &channel, Output::Rtsp).await {
+        return reason.into_response();
     }
     let url = match &state.rtsp_public_url {
         Some(public) => format!("{}/{name}", public.trim_end_matches('/')),
@@ -203,17 +203,30 @@ fn host(headers: &HeaderMap) -> String {
     }
 }
 
-/// The channel called `name`, registered on `protocol`'s listener — or the
-/// answer saying why not.
-fn streamed(
-    state: &AppState,
-    name: &str,
-    protocol: Protocol,
-) -> Result<Arc<Channel>, (StatusCode, String)> {
+/// The channel called `name` — or the answer saying there is none.
+fn found(state: &AppState, name: &str) -> Result<Arc<Channel>, (StatusCode, String)> {
     state
         .channels
-        .stream(name, protocol)
+        .found(name)
         .map_err(|error| attach_refusal(&error))
+}
+
+/// Waits for `channel`'s camera to be live and what players over `output`
+/// read to be made — or the answer saying why it is not.
+async fn playable(
+    state: &AppState,
+    channel: &Channel,
+    output: Output,
+) -> Result<(), (StatusCode, String)> {
+    channel
+        .live(LIVE_WITHIN)
+        .await
+        .map_err(|reason| (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")))?;
+    state
+        .channels
+        .ready(channel, output, LIVE_WITHIN)
+        .await
+        .map_err(|reason| (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")))
 }
 
 /// `POST /api/v1/channels/{name}/record`: the channel recorded from now —
@@ -341,15 +354,12 @@ async fn whep_offer(
     let Ok(offer) = String::from_utf8(body.to_vec()) else {
         return (StatusCode::BAD_REQUEST, "the offer is not text\n").into_response();
     };
-    let channel = match streamed(&state, &name, Protocol::WebRtc) {
+    let channel = match found(&state, &name) {
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };
-    if let Err(reason) = channel.live(LIVE_WITHIN).await {
-        return (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")).into_response();
-    }
-    if let Err(reason) = state.channels.webrtc(&channel, LIVE_WITHIN).await {
-        return (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")).into_response();
+    if let Err(reason) = playable(&state, &channel, Output::WebRtc).await {
+        return reason.into_response();
     }
     let webrtc = state.webrtc.clone();
     let played = {

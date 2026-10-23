@@ -242,21 +242,32 @@ empty. A recording being written is never taken, whatever it costs.
 
 Each way out carries some codecs and not others, and a channel's stream
 goes out each way whatever its camera sends: a track one cannot carry is
-converted for it, and what it can carry goes as it came.
+converted for it, and what it can carry goes as it came. What each carries
+is what its media-pp server or muxer sends, narrowed to what its players
+play.
 
 | Out | Carries | Converted to |
 |---|---|---|
-| RTSP | whatever came in | — |
+| RTSP | what RTP carries: H.264, H.265, VP8, VP9, MJPEG, MPEG-4; AAC, Opus, G.711, MP3 and more — not AV1 nor AC-3 | H.264; AAC |
 | WebRTC | H.264 without B-frames, VP8, VP9, AV1; Opus, G.711 | H.264; Opus |
 | Recording | H.264, H.265; AAC | H.264; AAC |
+
+A camera over RTSP sends nothing RTSP cannot carry; what is converted for
+RTSP players is for a source of another kind, which relay-pp has none of
+yet.
 
 - A track is converted once however many ways out need it, beside what goes
   on unconverted, on the same timeline: a camera's pictures and its sound
   converted stay in time.
 - What is converted for WebRTC is converted while players play it, and
   stops once none has for 30 seconds; a player asking again starts it again.
-  What is converted for a recording, for as long as the channel is recorded.
-  A channel whose ways out carry what its camera sends costs nothing here.
+  What is converted for RTSP players, who reach the listener without asking,
+  from when the first asks for the channel's URL; for a recording, for as
+  long as the channel is recorded. A channel whose ways out carry what its
+  camera sends costs nothing here.
+- Where what a way out reads changes — a camera that comes back sending
+  other codecs — its players' listener is moved to it at once; those
+  playing go on with what they had until it ends.
 - `conversions` in a channel's status says what is converted now: `"1:opus"`
   is track 1 converted to Opus.
 - Pictures are converted on the GPU where one takes them, decoded and
@@ -296,9 +307,10 @@ thread of its own, the camera's data; its open, which blocks, borrows a
 thread of the runtime's blocking pool while it runs. Each recording is a
 pipeline of its own, and so is what a channel converts, while it does: a
 thread reading the channel's stream, and one for each track converted.
-Everything else that waits — the API, WHEP, each
-channel's watcher, which waits on its connection and before connecting
-again, and each recorder's — is a task on the same runtime. The RTSP and WebRTC listeners have
+Everything else that waits — the API, WHEP, each channel's source, which
+waits on its connection and before connecting again, its hub, which decides
+what is converted, each listener registration, which follows what its
+players read, and each recorder — is a task on the same runtime. The RTSP and WebRTC listeners have
 threads of their own, shared by every channel.
 
 ## Verified
@@ -315,7 +327,9 @@ when asked — and a camera of two tracks with no `rtptime` pulled by
 FFmpeg's without being asked, both tracks relayed. A camera's AAC played
 over WebRTC as Opus and over RTSP as it came; its Opus recorded as AAC in
 time with its pictures; a conversion stopping once no WebRTC player has
-played it for a while, and made again for the next. A camera's H.265
+played it for a while, and made again for the next; what WebRTC players
+read moved back to the channel's own broadcast when its camera came back
+sending Opus. A camera's H.265
 played over WebRTC as H.264 and over RTSP as it came; its VP8 recorded as
 H.264 in time with its sound. A channel's own `convert` over the server's: its
 sound left out of WebRTC, its pictures refused to WebRTC saying why. Recorded

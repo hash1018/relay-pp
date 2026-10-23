@@ -1,12 +1,13 @@
 //! A channel's source: what takes its stream in and writes it into the
-//! channel's `Broadcast`.
+//! channel's hub, through its [`Publisher`].
 //!
 //! The source here is a camera pulled over RTSP, connected again whenever
 //! it drops. Each connection is made by one of two clients: `retina`'s, a
 //! task on the runtime ([`retina`]), where it takes the camera — most do —
 //! and FFmpeg's, media-pp's `RtspSource` in a pipeline of its own
-//! ([`ffmpeg`]), where it does not. Both write into the broadcast, which
-//! outlives every connection; what reads the broadcast never knows which.
+//! ([`ffmpeg`]), where it does not. Both publish each connection's tracks
+//! to the hub and write them into what it gives back, which outlives every
+//! connection; what reads the hub never knows which.
 //!
 //! What watches a connection — waits on it, waits before connecting again,
 //! hears a halt — is the source's task, holding no thread while it waits.
@@ -16,15 +17,16 @@ mod retina;
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use media_pp::elements::{Broadcast, BroadcastOptions, RtspTransport};
+use media_pp::elements::RtspTransport;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 
+use super::hub::Publisher;
 use super::task::Task;
 use super::{ChannelConfig, Transport, redact};
 
@@ -97,7 +99,7 @@ pub(in crate::channel) struct SourceStatus {
     pub(in crate::channel) client: Option<&'static str>,
 }
 
-/// A camera pulled by a task, into a broadcast.
+/// A camera pulled by a task, into a hub.
 pub(in crate::channel) struct Source {
     /// What the source's task shares with it.
     inner: Arc<Inner>,
@@ -115,13 +117,10 @@ struct Inner {
     /// Set once `retina` has said it cannot take this camera: FFmpeg's
     /// client pulls it from then on, without asking again.
     ffmpeg_only: AtomicBool,
-    broadcast: Broadcast,
+    /// What each connection's tracks are published through: a run each, and
+    /// another where a camera changes its pictures partway.
+    publisher: Publisher,
     state: Mutex<State>,
-    /// Which run of the broadcast is live — a count — while one is: what a
-    /// recorder begins a recording on, and ends one at. A connection begins
-    /// one, and so does a camera that changes its pictures partway.
-    runs: watch::Sender<Option<u64>>,
-    run: AtomicU64,
     /// Rung to end the live connection and open the camera again at once —
     /// see [`Source::reconnect`].
     reconnect: Arc<Notify>,
@@ -136,9 +135,13 @@ struct State {
 }
 
 impl Source {
-    /// A source for the channel called `name`, its broadcast made and nothing
-    /// opened yet: what reads the broadcast is attached before [`Self::run`].
-    pub(in crate::channel) fn new(name: &str, config: &ChannelConfig) -> Self {
+    /// A source for the channel called `name`, writing through `publisher`,
+    /// nothing opened yet.
+    pub(in crate::channel) fn new(
+        name: &str,
+        config: &ChannelConfig,
+        publisher: Publisher,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 name: name.to_owned(),
@@ -149,7 +152,7 @@ impl Source {
                 },
                 client: config.client,
                 ffmpeg_only: AtomicBool::new(false),
-                broadcast: Broadcast::new(name, BroadcastOptions::default()),
+                publisher,
                 state: Mutex::new(State {
                     state: SourceState::Connecting,
                     since: SystemTime::now(),
@@ -157,8 +160,6 @@ impl Source {
                     connections: 0,
                     client: None,
                 }),
-                runs: watch::Sender::new(None),
-                run: AtomicU64::new(0),
                 reconnect: Arc::new(Notify::new()),
             }),
             task: Task::new(),
@@ -172,16 +173,6 @@ impl Source {
     /// no connection is live.
     pub(in crate::channel) fn reconnect(&self) -> Arc<Notify> {
         Arc::clone(&self.inner.reconnect)
-    }
-
-    /// What it writes into.
-    pub(in crate::channel) fn broadcast(&self) -> &Broadcast {
-        &self.inner.broadcast
-    }
-
-    /// Which run is live, while one is, and each change of it.
-    pub(in crate::channel) fn runs(&self) -> watch::Receiver<Option<u64>> {
-        self.inner.runs.subscribe()
     }
 
     /// Starts pulling the camera on `runtime`, connecting again whenever it
@@ -239,7 +230,7 @@ impl Inner {
             self.set(SourceState::Connecting, last.clone());
             let began = Instant::now();
             let ended = self.pull(&mut halt).await;
-            self.runs.send_replace(None);
+            self.publisher.ended();
             let reason = match ended {
                 Ended::Halted => break,
                 Ended::Failed(reason) => reason,
@@ -267,7 +258,6 @@ impl Inner {
             }
             wait = (wait * 2).min(LONGEST_WAIT);
         }
-        self.broadcast.close();
     }
 
     /// One connection, by `retina`'s client where it may take the camera,
@@ -287,7 +277,7 @@ impl Inner {
                     self.ffmpeg_only.store(true, Ordering::Release);
                     // What retina may have had live has ended: nothing waits
                     // on it while FFmpeg's client opens the camera.
-                    self.runs.send_replace(None);
+                    self.publisher.ended();
                     self.set(SourceState::Connecting, None);
                 }
             }
@@ -312,14 +302,7 @@ impl Inner {
             state.connections += 1;
             state.client = Some(client);
         }
-        self.new_run();
         tracing::info!(channel = %self.name, client = client.name(), "live");
-    }
-
-    /// The broadcast was published again: another run is live.
-    fn new_run(&self) {
-        let run = self.run.fetch_add(1, Ordering::AcqRel) + 1;
-        self.runs.send_replace(Some(run));
     }
 }
 

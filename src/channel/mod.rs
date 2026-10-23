@@ -1,39 +1,34 @@
-//! A channel: one [`Source`](source::Source) writing a stream into a
-//! `Broadcast`, what reads it — see `docs/design.md`, "The model" — and
-//! what it converts for an output that cannot carry what the source sends
-//! ([`Converter`](convert::Converter)).
+//! A channel: one [`Source`](source::Source) taking a stream in, one
+//! [`Hub`](hub::Hub) it writes into, and the sinks reading the hub — see
+//! `docs/design.md`, "The model".
 //!
 //! A channel is made with its source alone, which it pulls from then on.
-//! What reads it is attached and detached while it runs: streaming — the
-//! channel registered on the RTSP and WebRTC listeners, as
-//! [`Sink`](sink::Sink)s — and recording, by a
-//! [`Recorder`](record::Recorder).
+//! Its sinks are attached and detached while it runs: RTSP and WebRTC
+//! players, through the listeners every channel shares, as a player first
+//! asks for the channel ([`ListenerSink`](sink::ListenerSink)), and a
+//! recording ([`Recorder`](sink::Recorder)). Each sink says what it
+//! carries, and the hub gives it that — the source's own broadcast, or one
+//! converted for it — so that neither source nor sink knows the other.
 //!
-//! Neither source nor sink is media-pp's trait of the same name. A relay-pp
-//! source is whatever takes a stream in, over as many media-pp pipelines as
-//! its input takes connections; a sink is whatever reads the broadcast.
+//! None of source, hub nor sink is media-pp's trait of the same name.
 
-mod convert;
-mod plan;
-mod record;
+mod hub;
 mod sink;
 mod source;
 mod task;
 
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
-use convert::{Converter, Fed};
-use plan::Output;
-use record::RecordStatus;
-pub(crate) use record::Recorder;
-use sink::Sink;
-pub(crate) use sink::{Listeners, Protocol};
+use hub::Hub;
+use sink::{ListenerSink, RecordStatus};
+pub(crate) use sink::{Listeners, Output, Recorder};
 use source::Source;
 pub use source::{Client, SourceState};
 
@@ -172,8 +167,8 @@ pub struct ChannelStatus {
 pub struct Channel {
     name: String,
     source: Source,
-    /// What it converts for WebRTC players and its recording.
-    converter: Converter,
+    /// What the source writes into and the sinks read, converted for them.
+    hub: Hub,
     /// What it may convert.
     convert: ConvertConfig,
     /// What it is attached to, behind one lock — so nothing is attached to
@@ -183,7 +178,7 @@ pub struct Channel {
     record: RecordConfig,
     runtime: Handle,
     /// Set by the first [`Channel::halt`], under `attached`'s lock. Its
-    /// streaming sinks are detached by name, so a second detach would take
+    /// listener sinks are detached by name, so a second detach would take
     /// a channel of the same name made since off its listeners.
     halted: AtomicBool,
 }
@@ -192,7 +187,7 @@ pub struct Channel {
 struct Attached {
     /// Its registrations on the players' listeners, each made as a player
     /// first asks for it by that protocol.
-    stream: Vec<Sink>,
+    listened: BTreeMap<Output, Arc<ListenerSink>>,
     /// Its recorder, while it is recorded.
     recorder: Option<Recorder>,
 }
@@ -208,18 +203,12 @@ impl Channel {
     ) -> Result<Self, ChannelError> {
         config.check()?;
         let convert = config.convert.over(convert);
-        let source = Source::new(&config.name, config);
-        let converter = Converter::start(
-            &config.name,
-            source.broadcast(),
-            source.runs(),
-            convert,
-            runtime,
-        );
+        let hub = Hub::start(&config.name, convert, runtime);
+        let source = Source::new(&config.name, config, hub.publisher());
         let channel = Self {
             name: config.name.clone(),
             source,
-            converter,
+            hub,
             convert,
             attached: Mutex::default(),
             record: record.clone(),
@@ -234,13 +223,13 @@ impl Channel {
     /// What it is doing now.
     pub fn status(&self) -> ChannelStatus {
         let source = self.source.status();
-        let stats = self.source.broadcast().stats();
+        let stats = self.hub.stats();
         let (sinks, record) = {
             let attached = self.attached();
             let mut sinks: Vec<&'static str> = attached
-                .stream
-                .iter()
-                .map(|sink| sink.protocol().name())
+                .listened
+                .keys()
+                .map(|output| output.name())
                 .collect();
             let record = match &attached.recorder {
                 Some(recorder) => {
@@ -268,91 +257,52 @@ impl Channel {
             recording: record.recording,
             record_error: record.error,
             convert: self.convert,
-            conversions: self.converter.conversions(),
+            conversions: self.hub.conversions(),
         }
     }
 
-    /// Registers it on `protocol`'s listener, unless it is already: from
-    /// then on players open it there, from the newest keyframe it holds,
-    /// until the channel goes. WebRTC is only asked for here, what it reads
-    /// being made, perhaps, once the source is live: [`Self::webrtc`]
-    /// registers it.
-    pub(crate) fn stream(
-        &self,
-        protocol: Protocol,
-        listeners: &Listeners,
-    ) -> Result<(), AttachError> {
-        let mut attached = self.attached_unless_halted()?;
-        if protocol == Protocol::WebRtc {
-            self.converter.want(Output::WebRtc);
-            return Ok(());
-        }
-        if attached
-            .stream
-            .iter()
-            .any(|sink| sink.protocol() == protocol)
-        {
-            return Ok(());
-        }
-        let sink = Sink::attach(protocol, &self.name, self.source.broadcast(), listeners).map_err(
-            |error| AttachError::Listener {
-                channel: self.name.clone(),
-                error,
-            },
-        )?;
-        attached.stream.push(sink);
-        tracing::info!(channel = %self.name, protocol = protocol.name(), "streamed");
-        Ok(())
-    }
-
-    /// Waits, up to `within`, for what WebRTC players read to be made — the
-    /// source's own broadcast where WebRTC carries it, one converted for it
-    /// where not — and registers the channel on the WebRTC listener reading
-    /// it, or moves it there from another; or says why it cannot be made.
+    /// Has players reach it over `output` — RTSP or WebRTC — and waits, up
+    /// to `within`, for what they read to be made, which is at once where
+    /// they carry the source's own broadcast: registered on that listener
+    /// the first time, kept registered until the channel goes, and moved to
+    /// whatever its hub gives it from then on. Or says why it cannot be.
     /// After [`Self::live`].
-    pub(crate) async fn webrtc(
+    pub(crate) async fn ready(
         &self,
+        output: Output,
         listeners: &Listeners,
         within: Duration,
     ) -> Result<(), String> {
-        self.converter.want(Output::WebRtc);
-        let mut fed = self.converter.webrtc();
-        let made = tokio::time::timeout(within, fed.wait_for(|fed| *fed != Fed::Idle))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .map(|fed| fed.clone());
-        let feed = match made {
-            Some(Fed::Live(feed)) => feed,
-            Some(Fed::Failed(reason)) => {
-                return Err(format!("channel {}: {reason}", self.name));
+        let sink = {
+            let mut attached = self
+                .attached_unless_halted()
+                .map_err(|error| error.to_string())?;
+            match attached.listened.get(&output) {
+                Some(sink) => Arc::clone(sink),
+                None => {
+                    let sink = ListenerSink::attach(
+                        output,
+                        &self.name,
+                        &self.hub,
+                        listeners,
+                        &self.runtime,
+                    )
+                    .ok_or_else(|| format!("no listener serves {}", output.name()))?;
+                    let sink = Arc::new(sink);
+                    attached.listened.insert(output, Arc::clone(&sink));
+                    sink
+                }
             }
-            _ => return Err(format!("channel {}: not ready for WebRTC yet", self.name)),
         };
-        let mut attached = self
-            .attached_unless_halted()
-            .map_err(|error| error.to_string())?;
-        let at = attached
-            .stream
-            .iter()
-            .position(|sink| sink.protocol() == Protocol::WebRtc);
-        if let Some(at) = at {
-            if attached.stream[at].reads(&feed.broadcast) {
-                return Ok(());
-            }
-            attached.stream.remove(at).detach(&self.name);
-        }
-        let sink = Sink::attach(Protocol::WebRtc, &self.name, &feed.broadcast, listeners)
-            .map_err(|error| format!("channel {}: {error}", self.name))?;
-        attached.stream.push(sink);
-        tracing::info!(channel = %self.name, broadcast = %feed.broadcast.name(), "streamed over WebRTC");
-        Ok(())
+        sink.ready(within)
+            .await
+            .map_err(|reason| format!("channel {}: {reason}", self.name))
     }
 
     /// Waits, up to `within`, for its source to be live — at once where it
     /// is — or says what it is doing instead.
     pub(crate) async fn live(&self, within: Duration) -> Result<(), String> {
-        let mut runs = self.source.runs();
+        let mut runs = self.hub.runs();
         let live = tokio::time::timeout(within, async {
             runs.wait_for(Option::is_some).await.is_ok()
         })
@@ -376,10 +326,10 @@ impl Channel {
         if attached.recorder.is_some() {
             return Err(AttachError::Attached(self.name.clone()));
         }
-        self.converter.want(Output::Hls);
         attached.recorder = Some(Recorder::start(
             &self.name,
-            self.converter.hls(),
+            self.hub
+                .subscribe(Output::Record.profile(), Output::Record.demand()),
             self.source.reconnect(),
             &self.record,
             &self.runtime,
@@ -397,7 +347,6 @@ impl Channel {
             .take()
             .ok_or_else(|| AttachError::NotAttached(self.name.clone()))?;
         recorder.halt();
-        self.converter.unwant(Output::Hls);
         tracing::info!(channel = %self.name, "no longer recorded");
         Ok(recorder)
     }
@@ -411,15 +360,15 @@ impl Channel {
         if self.halted.swap(true, Ordering::AcqRel) {
             return;
         }
-        for sink in std::mem::take(&mut attached.stream) {
-            sink.detach(&self.name);
+        for sink in std::mem::take(&mut attached.listened).into_values() {
+            sink.detach();
         }
         if let Some(recorder) = &attached.recorder {
             recorder.halt();
         }
         drop(attached);
-        self.converter.halt();
         self.source.halt();
+        self.hub.halt();
         tracing::info!(channel = %self.name, "removed");
     }
 
@@ -432,8 +381,8 @@ impl Channel {
         if let Some(recorder) = recorder {
             recorder.wait().await;
         }
-        self.converter.wait().await;
         self.source.wait().await;
+        self.hub.wait().await;
     }
 
     fn attached(&self) -> std::sync::MutexGuard<'_, Attached> {

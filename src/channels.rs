@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 
-use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, Listeners, Protocol};
+use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, Listeners, Output};
 use crate::config::{ConvertConfig, RecordConfig};
 
 pub(crate) struct Channels {
@@ -85,25 +85,21 @@ impl Channels {
         Ok(channel)
     }
 
-    /// The channel called `name`, registered on `protocol`'s listener
-    /// where it was not yet.
-    pub(crate) fn stream(
-        &self,
-        name: &str,
-        protocol: Protocol,
-    ) -> Result<Arc<Channel>, AttachError> {
-        let _changing = self.changing();
-        let channel = self
-            .get(name)
-            .ok_or_else(|| AttachError::NoChannel(name.to_owned()))?;
-        channel.stream(protocol, &self.listeners)?;
-        Ok(channel)
+    /// The channel called `name`, or why there is none.
+    pub(crate) fn found(&self, name: &str) -> Result<Arc<Channel>, AttachError> {
+        self.get(name)
+            .ok_or_else(|| AttachError::NoChannel(name.to_owned()))
     }
 
-    /// Has `channel` registered on the WebRTC listener reading what WebRTC
-    /// players read of it — see [`Channel::webrtc`].
-    pub(crate) async fn webrtc(&self, channel: &Channel, within: Duration) -> Result<(), String> {
-        channel.webrtc(&self.listeners, within).await
+    /// Has `channel`'s players reach it over `output` — see
+    /// [`Channel::ready`].
+    pub(crate) async fn ready(
+        &self,
+        channel: &Channel,
+        output: Output,
+        within: Duration,
+    ) -> Result<(), String> {
+        channel.ready(output, &self.listeners, within).await
     }
 
     /// Begins recording the channel called `name`.

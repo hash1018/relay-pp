@@ -22,8 +22,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
-use super::convert::{Fed, Feed};
-use super::task::Task;
+use crate::channel::hub::{Fed, Feed, Subscription};
+use crate::channel::task::Task;
 use crate::config::RecordConfig;
 use crate::recordings::{self, Chunk};
 
@@ -32,16 +32,18 @@ const AGAIN_AFTER: Duration = Duration::from_secs(5);
 
 /// What a recorder is doing, at one moment.
 #[derive(Default, Clone)]
-pub(super) struct RecordStatus {
+pub(crate) struct RecordStatus {
     /// The playlist of the recording being written, as it is served.
-    pub(super) recording: Option<String>,
+    pub(crate) recording: Option<String>,
     /// Why the last recording failed, until one is written again.
-    pub(super) error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 pub(crate) struct Recorder {
     status: Arc<Mutex<RecordStatus>>,
     task: Task,
+    /// What it records, held for as long as it does.
+    _subscription: Subscription,
 }
 
 /// What the recorder's task works with.
@@ -68,11 +70,11 @@ struct Writing {
 }
 
 impl Recorder {
-    /// Starts recording on `runtime` what `fed` says to, whenever it says
-    /// a run of it is live — the channel's broadcast, or one made for it.
-    pub(super) fn start(
+    /// Starts recording on `runtime` what `subscription` is fed, whenever a
+    /// run of it is live — the channel's broadcast, or one made for it.
+    pub(crate) fn start(
         name: &str,
-        fed: watch::Receiver<Fed>,
+        subscription: Subscription,
         reconnect: Arc<Notify>,
         config: &RecordConfig,
         runtime: &Handle,
@@ -88,11 +90,16 @@ impl Recorder {
             reconnect,
         });
         let task = Task::new();
+        let fed = subscription.fed();
         task.spawn(runtime, |halt| recording.run(fed, halt));
-        Self { status, task }
+        Self {
+            status,
+            task,
+            _subscription: subscription,
+        }
     }
 
-    pub(super) fn status(&self) -> RecordStatus {
+    pub(crate) fn status(&self) -> RecordStatus {
         self.status
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -101,7 +108,7 @@ impl Recorder {
 
     /// Tells it to stop, without waiting: the recording under way is
     /// finished, its playlist ended.
-    pub(super) fn halt(&self) {
+    pub(crate) fn halt(&self) {
         self.task.halt();
     }
 

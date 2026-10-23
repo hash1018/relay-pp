@@ -241,7 +241,9 @@ impl Connection<'_> {
                 frame.stream_id(),
                 frame.data(),
                 frame.timestamp(),
-                frame.is_random_access_point(),
+                frame.is_random_access_point()
+                    || (demuxed.streams()[frame.stream_id()].encoding_name() == "h265"
+                        && begins_h265_group(frame.data())),
                 None,
             ),
             CodecItem::AudioFrame(frame) => (
@@ -379,6 +381,19 @@ fn decode(text: &str) -> String {
         .map_or_else(|| text.to_owned(), |(_, value)| value.into_owned())
 }
 
+/// Whether an H.265 picture, Annex-B, is one a decoder can begin at: any
+/// IRAP picture — BLA, IDR or CRA, NAL types 16 to 23. `retina` takes only
+/// an IDR for one, and x265 — OBS's among others — begins each group of
+/// pictures after the first with a CRA: a reader joining such a
+/// stream under way — a conversion, a recording, a player — would wait for
+/// a keyframe that never comes. The parameter sets a CRA goes without
+/// in-band are in the track's description.
+fn begins_h265_group(data: &[u8]) -> bool {
+    data.windows(4)
+        .filter(|window| window[..3] == [0, 0, 1])
+        .any(|window| (16..=23).contains(&((window[3] >> 1) & 0x3f)))
+}
+
 fn failed(reason: String) -> Pulled {
     Pulled::Ended(Ended::Failed(reason))
 }
@@ -406,6 +421,25 @@ mod tests {
         let (_, none) = split_credentials("rtsp://10.0.0.1/live").unwrap();
         assert!(none.is_none());
         assert!(split_credentials("rtsps://10.0.0.1/live").is_err());
+    }
+
+    #[test]
+    fn an_h265_group_begins_at_any_irap_picture() {
+        // A NAL header's type is the six bits after the first.
+        let picture = |types: &[u8]| -> Vec<u8> {
+            types
+                .iter()
+                .flat_map(|&nal| [0, 0, 0, 1, nal << 1, 1, 0xaf, 0x00])
+                .collect()
+        };
+        // IDR, CRA, BLA — with an SEI in front of the CRA.
+        assert!(begins_h265_group(&picture(&[19])));
+        assert!(begins_h265_group(&picture(&[39, 21])));
+        assert!(begins_h265_group(&picture(&[16])));
+        // Trailing, RASL and the parameter sets begin nothing.
+        assert!(!begins_h265_group(&picture(&[1])));
+        assert!(!begins_h265_group(&picture(&[8])));
+        assert!(!begins_h265_group(&picture(&[32, 33, 34])));
     }
 
     #[test]

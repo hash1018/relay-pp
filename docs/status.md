@@ -255,10 +255,18 @@ converted for it, and what it can carry goes as it came.
   A channel whose ways out carry what its camera sends costs nothing here.
 - `conversions` in a channel's status says what is converted now: `"1:opus"`
   is track 1 converted to Opus.
+- Pictures are converted on the GPU where one takes them, decoded and
+  encoded there without being copied out: D3D11 on Windows — NVENC, or the
+  Intel or AMD encoder Media Foundation offers — and NVIDIA's NVDEC and
+  NVENC, or else Vulkan Video, on Linux. A codec the GPU cannot decode — VP8
+  on many — is decoded on the processor and still encoded on the GPU; with
+  no GPU encoder, or every session of one taken (eight on a GeForce), it is
+  encoded in software. H.264, a keyframe a second, about a tenth of a bit a
+  pixel: 3.6 Mbit/s for 1080p at 25.
 - Sound is decoded and encoded on the processor, 48 kHz, one or two
-  channels. Pictures are not converted yet: a WebRTC player of pictures it
-  cannot carry — H.265, B-frames, MJPEG — is answered `503`, and a recording
-  of them says so in `record_error`.
+  channels.
+- Where a conversion cannot be made, a WebRTC player is answered `503`
+  saying why, and a recording says so in `record_error`.
 
 ## Stopping
 
@@ -295,7 +303,9 @@ when asked — and a camera of two tracks with no `rtptime` pulled by
 FFmpeg's without being asked, both tracks relayed. A camera's AAC played
 over WebRTC as Opus and over RTSP as it came; its Opus recorded as AAC in
 time with its pictures; a conversion stopping once no WebRTC player has
-played it for a while, and made again for the next. Recorded
+played it for a while, and made again for the next. A camera's H.265
+played over WebRTC as H.264 and over RTSP as it came; its VP8 recorded as
+H.264 in time with its sound. Recorded
 in four-second chunks of one-second segments, each one media file read by
 byte range; listed; a stretch across chunks played back as one playlist and
 read back by FFmpeg through the server; a recording ended and begun again as

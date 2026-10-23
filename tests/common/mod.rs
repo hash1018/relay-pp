@@ -31,27 +31,39 @@ pub struct Camera {
 
 impl Camera {
     pub fn start(addr: SocketAddr) -> Self {
-        Self::started(addr, None, false).expect("OpenH264 is always there")
+        Self::started(addr, VideoCodec::OpenH264, None, false).expect("OpenH264 is always there")
     }
 
     /// One with sound as well — AAC — and so two tracks, which this
     /// camera, media-pp's RTSP server, describes with no `rtptime`.
     pub fn with_sound(addr: SocketAddr) -> Self {
-        Self::started(addr, Some(AudioCodec::Aac), false).expect("OpenH264 is always there")
+        Self::started(addr, VideoCodec::OpenH264, Some(AudioCodec::Aac), false)
+            .expect("OpenH264 is always there")
     }
 
     /// One whose pictures have B-frames — sent out of the order they are
     /// shown in — by `libx264`: `None` where this FFmpeg has none.
     pub fn with_b_frames(addr: SocketAddr) -> Option<Self> {
-        Self::started(addr, None, true)
+        Self::started(addr, VideoCodec::H264, None, true)
     }
 
     /// One with Opus sound, by `libopus`: `None` where this FFmpeg has none.
     pub fn with_opus(addr: SocketAddr) -> Option<Self> {
-        Self::started(addr, Some(AudioCodec::Opus), false)
+        Self::started(addr, VideoCodec::OpenH264, Some(AudioCodec::Opus), false)
     }
 
-    fn started(addr: SocketAddr, sound: Option<AudioCodec>, b_frames: bool) -> Option<Self> {
+    /// One whose pictures are in `codec`, and with AAC sound where `sound`:
+    /// `None` where this FFmpeg has no encoder of it.
+    pub fn with_pictures(addr: SocketAddr, codec: VideoCodec, sound: bool) -> Option<Self> {
+        Self::started(addr, codec, sound.then_some(AudioCodec::Aac), false)
+    }
+
+    fn started(
+        addr: SocketAddr,
+        pictures: VideoCodec,
+        sound: Option<AudioCodec>,
+        b_frames: bool,
+    ) -> Option<Self> {
         let (server, handle) = RtspServer::bind("camera", addr, RtspServerOptions::default())
             .expect("bind the camera");
         let broadcast = Broadcast::new("cam", BroadcastOptions::default());
@@ -63,18 +75,14 @@ impl Camera {
         let encoder = SwEncoder::new(
             "encoder",
             SwEncoderOptions {
-                codec: if b_frames {
-                    VideoCodec::H264
-                } else {
-                    VideoCodec::OpenH264
-                },
+                codec: pictures,
                 width: 320,
                 height: 240,
                 pixel_format: ffmpeg::format::Pixel::YUV420P,
                 frame_rate: ffmpeg::Rational::new(15, 1),
                 bit_rate: 300_000,
                 gop_size: 15,
-                max_b_frames: b_frames.then_some(2),
+                max_b_frames: Some(if b_frames { 2 } else { 0 }),
             },
         )
         .ok()?;
@@ -341,9 +349,15 @@ pub fn rtsp_opens(url: &str) -> bool {
 }
 
 /// A WHEP player offering pictures and sound: each track it was given, by
-/// codec, and how many packets of it have come.
+/// codec, and how many packets of it have come. It waits longer than a
+/// player's default for the first: pictures converted in software, where
+/// no GPU is, come out of x264 seconds after they went in.
 pub fn whep_tracks(url: &str) -> (Arc<Pipeline>, Vec<(ffmpeg::codec::Id, CounterHandle)>) {
-    let (source, streams) = WhepSource::open("player", url, WhepOptions::default())
+    let options = WhepOptions {
+        describe_within: Duration::from_secs(15),
+        ..WhepOptions::default()
+    };
+    let (source, streams) = WhepSource::open("player", url, options)
         .unwrap_or_else(|error| panic!("{url} opens: {error}"));
     let mut tracks = Vec::new();
     let mut counters = Vec::new();

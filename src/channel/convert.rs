@@ -19,11 +19,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use media_pp::element::Context;
+use media_pp::buffer::MediaBuffer;
+use media_pp::bus::BusEvent;
+use media_pp::element::{Context, Filter, Output as Pushed};
 use media_pp::elements::{
-    AudioCodec, Broadcast, BroadcastOptions, BroadcastSource, StreamInfo, SwAudioEncoder,
-    SwAudioEncoderOptions, SwDecoder, TeeHandle,
+    AudioCodec, Broadcast, BroadcastOptions, BroadcastSource, DecodeTarget, EncodeInput,
+    StreamInfo, SwAudioEncoder, SwAudioEncoderOptions, SwDecoder, TeeHandle, VideoDecodeBin,
+    VideoEncodeBin, VideoEncodeOptions,
 };
+use media_pp::ffmpeg::Rational;
 use media_pp::graph::BranchId;
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
@@ -39,6 +43,9 @@ const IDLE: Duration = Duration::from_secs(30);
 const IDLE_CHECK: Duration = Duration::from_secs(5);
 /// What a converted track's branch may hold before its decoder, as packets.
 const CONVERT_QUEUE: usize = 64;
+/// What a converted track's pictures may be held by after its decoder: the
+/// encoder's own, as many as a GPU encoder keeps while it works.
+const DOWNSTREAM_FRAMES: i32 = 4;
 
 /// What an output reads: a broadcast, and which run of it.
 #[derive(Clone)]
@@ -227,6 +234,20 @@ impl Converting {
                         }
                     }
                     self.apply().await;
+                }
+                event = bus_of(self.running.as_ref().map(|running| Arc::clone(&running.pipeline))) => {
+                    match event {
+                        Some(BusEvent::Error { error, .. }) => {
+                            tracing::warn!(channel = %self.name, "a conversion failed: {error}");
+                        }
+                        Some(_) => {}
+                        // The pipeline ended by itself: what it wrote is
+                        // made again.
+                        None => {
+                            self.running = None;
+                            self.apply().await;
+                        }
+                    }
                 }
                 _ = idle.tick() => {
                     if self.webrtc_idle() {
@@ -498,42 +519,38 @@ impl Running {
             return Ok(());
         }
         let label = format!("{index}-{}", target_name(target));
-        let decoder = SwDecoder::new(format!("{name}-decode-{label}"), info.parameters().clone())
-            .map_err(|error| format!("cannot decode track {index}: {error}"))?;
-        let codec = match target {
-            Target::Opus => AudioCodec::Opus,
-            Target::Aac => AudioCodec::Aac,
-            Target::H264 => {
-                return Err(format!("track {index}'s pictures cannot be converted yet"));
-            }
-        };
-        let channels = channels_of(info).clamp(1, 2);
-        let encoder = SwAudioEncoder::new(
-            format!("{name}-encode-{label}"),
-            SwAudioEncoderOptions {
-                codec,
-                sample_rate: 48_000,
-                channels,
-                bit_rate: 64_000 * usize::from(channels),
-            },
-        )
-        .map_err(|error| format!("cannot encode {}: {error}", target_name(target)))?;
-        let converted = StreamInfo::from(&encoder);
         let (out_branch, out) = self
             .context
             .tee(format!("converted-{label}"))
             .build_dynamic()
             .map_err(|error| format!("cannot wire a conversion: {error}"))?;
         let input = &self.inputs[index];
-        let branch = input
+        let chain = input
             .branch()
-            .and_then(|chain| {
-                chain
-                    .queue(format!("convert-{label}"), CONVERT_QUEUE)
+            .map_err(|error| format!("cannot wire a conversion: {error}"))?
+            .queue(format!("convert-{label}"), CONVERT_QUEUE);
+        let (built, converted) = match target {
+            Target::Opus | Target::Aac => {
+                let (decoder, encoder) = sound(name, &label, target, info)?;
+                let converted = StreamInfo::from(&encoder);
+                (
+                    chain.pipe(decoder).pipe(encoder).to_branch(out_branch),
+                    converted,
+                )
+            }
+            Target::H264 => {
+                let (decoder, encoder, converted) = pictures(name, &label, info)?;
+                // Joining a stream under way, the decoder begins at a
+                // keyframe: before one there is nothing it can decode.
+                let built = chain
+                    .pipe(FromKeyframe::default())
                     .pipe(decoder)
                     .pipe(encoder)
-                    .to_branch(out_branch)
-            })
+                    .to_branch(out_branch);
+                (built, converted)
+            }
+        };
+        let branch = built
             .and_then(|branch| input.attach(branch))
             .map_err(|error| format!("cannot wire a conversion: {error}"))?;
         self.conversions.insert(
@@ -566,6 +583,167 @@ impl Running {
             let conversion = self.conversions.remove(&key).expect("listed");
             let _ = self.inputs[key.0].detach(conversion.branch);
         }
+    }
+}
+
+/// A sound track's decoder, and its encoder to `target`: on the processor,
+/// at 48 kHz, in one channel or two.
+fn sound(
+    name: &str,
+    label: &str,
+    target: Target,
+    info: &StreamInfo,
+) -> Result<(SwDecoder, SwAudioEncoder), String> {
+    let decoder = SwDecoder::new(format!("{name}-decode-{label}"), info.parameters().clone())
+        .map_err(|error| format!("cannot decode {label}: {error}"))?;
+    let codec = match target {
+        Target::Opus => AudioCodec::Opus,
+        Target::Aac | Target::H264 => AudioCodec::Aac,
+    };
+    let channels = channels_of(info).clamp(1, 2);
+    let encoder = SwAudioEncoder::new(
+        format!("{name}-encode-{label}"),
+        SwAudioEncoderOptions {
+            codec,
+            sample_rate: 48_000,
+            channels,
+            bit_rate: 64_000 * usize::from(channels),
+        },
+    )
+    .map_err(|error| format!("cannot encode {}: {error}", target_name(target)))?;
+    Ok((decoder, encoder))
+}
+
+/// A picture track's decoder and its H.264 encoder, on the first GPU that
+/// opens both — the decoder's pictures handed to the encoder on the GPU,
+/// never copied out — and in software where none does; and what the
+/// encoder's track is.
+fn pictures(
+    name: &str,
+    label: &str,
+    info: &StreamInfo,
+) -> Result<(VideoDecodeBin, VideoEncodeBin, StreamInfo), String> {
+    let (width, height) = info
+        .size()
+        .ok_or_else(|| format!("{label}: its pictures' size is not known"))?;
+    let rate = info
+        .frame_rate()
+        .filter(|rate| rate.numerator() > 0 && rate.denominator() > 0)
+        .unwrap_or(Rational::new(25, 1));
+    let per_second = f64::from(rate);
+    let options = VideoEncodeOptions {
+        width,
+        height,
+        frame_rate: rate,
+        bit_rate: bit_rate(width, height, per_second),
+        // A keyframe a second: a player joining waits no longer.
+        gop_size: per_second.round().max(1.0) as u32,
+        max_b_frames: Some(0),
+        color: info.color(),
+    };
+    let mut refused = Vec::new();
+    for target in decode_targets() {
+        let decoder = match VideoDecodeBin::open(
+            format!("{name}-decode-{label}"),
+            info.parameters().clone(),
+            target.clone(),
+            None,
+        ) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                refused.push(error.to_string());
+                continue;
+            }
+        };
+        let Some(input) = EncodeInput::for_decoded(&target, decoder.output_format()) else {
+            refused.push("no encoder takes the decoder's pictures".to_owned());
+            continue;
+        };
+        match VideoEncodeBin::open(format!("{name}-encode-{label}"), input, options) {
+            Ok(encoder) => {
+                tracing::info!(
+                    track = %label,
+                    decoding = ?decoder.path(),
+                    encoding = ?encoder.path(),
+                    "pictures converted"
+                );
+                let converted = StreamInfo::new(encoder.parameters(), encoder.time_base())
+                    .with_frame_rate(rate);
+                return Ok((decoder, encoder, converted));
+            }
+            Err(error) => refused.push(error.to_string()),
+        }
+    }
+    Err(format!(
+        "cannot convert {label}'s pictures: {}",
+        refused.join("; ")
+    ))
+}
+
+/// Where pictures may be decoded to for conversion, the GPU first: each
+/// conversion a device of its own, so one's work does not wait on
+/// another's lock of a shared one.
+fn decode_targets() -> Vec<DecodeTarget> {
+    let mut targets = Vec::new();
+    #[cfg(windows)]
+    if let Ok(gpu) = media_pp::elements::D3d11Gpu::new() {
+        targets.push(DecodeTarget::D3d11 {
+            gpu,
+            downstream_hw_frames: DOWNSTREAM_FRAMES,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(device) = media_pp::elements::CudaDevice::new() {
+            targets.push(DecodeTarget::Cuda {
+                device,
+                downstream_hw_frames: DOWNSTREAM_FRAMES,
+            });
+        }
+        if let Ok(device) = media_pp::elements::VulkanDevice::new() {
+            targets.push(DecodeTarget::Vulkan {
+                device,
+                downstream_hw_frames: DOWNSTREAM_FRAMES,
+            });
+        }
+    }
+    targets.push(DecodeTarget::System);
+    targets
+}
+
+/// What a converted stream of `width`×`height` at `per_second` pictures
+/// is encoded at: about a tenth of a bit a pixel, 3.6 Mbit/s for 1080p at
+/// 25, within half a megabit and twenty.
+fn bit_rate(width: u32, height: u32, per_second: f64) -> usize {
+    let bits = f64::from(width) * f64::from(height) * per_second * 0.07;
+    (bits as usize).clamp(500_000, 20_000_000)
+}
+
+/// Hands on a track's packets from its first keyframe, and from the first
+/// after a `Flush`.
+#[derive(Default)]
+struct FromKeyframe {
+    begun: bool,
+}
+
+impl Filter for FromKeyframe {
+    fn transform(&mut self, buf: MediaBuffer, out: &mut Pushed) -> media_pp::Result<()> {
+        if !self.begun {
+            let key = match &buf {
+                MediaBuffer::Packet(packet) => packet.is_key(),
+                _ => true,
+            };
+            if !key {
+                return Ok(());
+            }
+            self.begun = true;
+        }
+        out.push(buf);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.begun = false;
     }
 }
 
@@ -602,6 +780,15 @@ fn names(outputs: &BTreeSet<Output>) -> String {
         .map(|output| output.name())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The next event on `pipeline`'s bus — `None` once it has ended — or never,
+/// where none runs.
+async fn bus_of(pipeline: Option<Arc<Pipeline>>) -> Option<BusEvent> {
+    match pipeline {
+        Some(pipeline) => pipeline.bus().recv_async().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn halted(halt: &mut watch::Receiver<bool>) {

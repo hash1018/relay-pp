@@ -9,15 +9,31 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::*;
+use media_pp::elements::VideoCodec;
 use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 use relay_pp::SourceState;
 
 fn made(server: &relay_pp::Server, camera: std::net::SocketAddr) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
     let body = channel("cam1", &format!("rtsp://{camera}/cam"));
     let (status, _, answer) = http(server.http_addr(), "POST", "/api/v1/channels", Some(&body));
     assert_eq!(status, 201, "{answer}");
     wait_for("the camera live", || state_of(server) == SourceState::Live);
+}
+
+/// Waits for the channel to have settled on how it pulls its camera: one
+/// `retina` cannot take after all — Kvazaar's H.265 reorders its pictures
+/// whatever it is asked — is connected again by FFmpeg's a moment after
+/// going live.
+fn settled(server: &relay_pp::Server) {
+    std::thread::sleep(Duration::from_millis(2500));
+    wait_for("the camera live, settled", || {
+        state_of(server) == SourceState::Live
+    });
 }
 
 fn conversions(server: &relay_pp::Server) -> Vec<String> {
@@ -165,4 +181,73 @@ fn first_of_each(path: &Path) -> (Vec<Id>, Vec<f64>) {
             .map(|start| start.expect("a packet of each"))
             .collect(),
     )
+}
+
+/// A camera of H.265 pictures, by whichever encoder this FFmpeg has.
+fn h265_camera(sound: bool) -> Option<Camera> {
+    [VideoCodec::Kvazaar, VideoCodec::H265]
+        .into_iter()
+        .find_map(|codec| Camera::with_pictures("127.0.0.1:0".parse().unwrap(), codec, sound))
+}
+
+#[test]
+fn h265_reaches_webrtc_players_as_h264_and_rtsp_players_as_it_is() {
+    let Some(camera) = h265_camera(false) else {
+        eprintln!("skipping: no H.265 encoder in this FFmpeg");
+        return;
+    };
+    let server = server();
+    made(&server, camera.addr);
+    settled(&server);
+
+    let (whep, tracks) = whep_tracks(&format!("http://{}/cam1/whep", server.http_addr()));
+    let codecs: Vec<Id> = tracks.iter().map(|(codec, _)| *codec).collect();
+    assert_eq!(codecs, [Id::H264]);
+    wait_for("pictures over WebRTC", || tracks[0].1.get() > 20);
+    assert_eq!(conversions(&server), ["0:h264"]);
+
+    let url = play_rtsp(server.http_addr(), "cam1");
+    assert_eq!(rtsp_codecs(&url), [Id::HEVC], "RTSP as it came");
+
+    whep.stop();
+    server.stop();
+    camera.stop();
+}
+
+#[test]
+fn vp8_is_recorded_as_h264_in_time_with_the_sound() {
+    let Some(camera) = Camera::with_pictures("127.0.0.1:0".parse().unwrap(), VideoCodec::Vp8, true)
+    else {
+        eprintln!("skipping: no VP8 encoder in this FFmpeg");
+        return;
+    };
+    let root = scratch("convert_vp8");
+    let server = server_with(&format!(
+        "[record]\ndir = {:?}\nsegment = \"1s\"\nchunk = \"1h\"",
+        root.display().to_string()
+    ));
+    made(&server, camera.addr);
+    std::thread::sleep(Duration::from_secs(3));
+    let (status, _, _) = http(
+        server.http_addr(),
+        "POST",
+        "/api/v1/channels/cam1/record",
+        None,
+    );
+    assert_eq!(status, 201);
+    wait_for("a recording", || server.status()[0].recording.is_some());
+    assert_eq!(conversions(&server), ["0:h264"]);
+    std::thread::sleep(Duration::from_secs(4));
+
+    let media = find(&root, "media.m4s").expect("a recording's media file");
+    let (codecs, starts) = first_of_each(&media);
+    assert_eq!(codecs, [Id::H264, Id::AAC]);
+    let apart = (starts[0] - starts[1]).abs();
+    assert!(
+        apart < 0.5,
+        "pictures {apart:.2}s from the sound: {starts:?}"
+    );
+
+    server.stop();
+    camera.stop();
 }

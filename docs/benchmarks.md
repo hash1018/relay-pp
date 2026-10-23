@@ -87,16 +87,90 @@ picture and waited over a second for the next.
 
 ## What it says for relay-pp
 
+On Windows, below; on Linux, where it would run, further down.
+
 - **Sending to players is where it is strong**: RTSP for a fraction of
-  MediaMTX's processor time, WebRTC for less and losing nothing.
-- **Pulling cameras is where it is weak**, and pulling is the CCTV case:
-  twice the processor time and many times the memory per camera, recording
-  included. Worth looking at, in this order: the memory a broadcast retains
-  (a shorter `retain` for cameras that only record), and where the
-  processor time of pulling goes — FFmpeg's RTSP demuxer and the pipeline
-  per camera — against a profile before any change.
+  MediaMTX's processor time, WebRTC for less and losing nothing — on Linux
+  too, and with a steadier stream at scale.
+- **Pulling cameras costs twice MediaMTX's processor time on Windows**, all
+  of it FFmpeg's RTSP demuxer there; on Linux relay-pp pulls for less than
+  MediaMTX. Recording costs a little more than MediaMTX's on either.
+- **Memory per camera is the gap left**: a broadcast's retained stretch was
+  most of it and is now a second; what is left is what a pull of FFmpeg's
+  holds, and, on Linux, what opening every camera at once leaves behind.
+
+## On Linux
+
+The same runs in Docker on the same machine — a Linux VM of 12 processors
+and 16 GB — relay-pp on media-pp f96bb6ae, MediaMTX v1.20.1 for Linux,
+everything in one container over its loopback, recordings on the
+container's own disk. Memory is resident memory (`bench/measure.sh`), not
+private bytes.
+
+### Pulling cameras, nothing reading
+
+| Channels | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory |
+|---|---|---|---|---|
+| 50 | 98 | 128 | 256 MB | 55 MB |
+| 100 | 159 | 213 | 364 MB | 67 MB |
+| 200 | 195 | 317 | 1,287 MB | 101 MB |
+
+### Recording every camera
+
+| Channels | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | written, relay-pp / MediaMTX |
+|---|---|---|---|---|---|
+| 50 | 206 | 169 | 467 MB | 168 MB | 218 / 204 Mbit/s |
+| 100 | 308 | 246 | 857 MB | 266 MB | 389 / 422 Mbit/s |
+| 200 | 373 | 334 | 1,957 MB | 439 MB | 825 / 844 Mbit/s |
+
+relay-pp logged no recording falling behind at 100; Linux counts a process's
+writes as the page cache is flushed, which a 30-second window takes
+unevenly.
+
+### RTSP players of one camera
+
+| Players | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | lag spread p99, relay-pp / MediaMTX |
+|---|---|---|---|---|---|
+| 50 | 14 | 22 | 60 MB | 48 MB | 6 / 4 ms |
+| 200 | 41 | 208 | 65 MB | 63 MB | 7 / 24 ms |
+| 500 | 94 | 397 | 74 MB | 94 MB | 23 / 31 ms |
+
+### WebRTC players of one camera
+
+| Players | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | lag spread p99, relay-pp / MediaMTX |
+|---|---|---|---|---|---|
+| 25 | 24 | 46 | 105 MB | 151 MB | 20 / 32 ms |
+| 50 | 38 | 84 | 147 MB | 257 MB | 28 / 178 ms |
+| 100 | 61 | 136 | 231 MB | 470 MB | 28 / 267 ms |
+
+Nothing lost by either, in any run.
+
+### Where pulling's processor time goes
+
+A hundred pulls of the camera by a program that does no more than each
+layer, all hundred open before measuring:
+
+| | Windows CPU | Linux CPU |
+|---|---|---|
+| FFmpeg's RTSP demuxer alone, packets read and dropped | 311 | 151 |
+| + a media-pp pipeline: `RtspSource` → `PacketCounter` | 316 | 165 |
+| + a broadcast: `RtspSource` → `BroadcastSink` | 316 | 169 |
+| relay-pp | 312 | 159 |
+
+FFmpeg's demuxer is nearly all of it, on either system; it costs twice as
+much on Windows, which is the whole of relay-pp's difference from MediaMTX
+there. On Linux relay-pp pulls for less than MediaMTX does.
+
+### Where Linux's memory at 200 goes
+
+The same program opening 200 pulls one after another holds 548 MB; relay-pp,
+opening them all at once, 1,183 MB, and as much again with
+`MALLOC_ARENA_MAX=2`. What FFmpeg takes to look into a stream as it opens
+it, two hundred times at once, is let go of after but stays with the
+process, as glibc keeps a heap it has grown. Opening a few cameras at a time
+would keep it near the first figure.
 
 ## Not measured here
 
-Linux, where both would run in production; runs repeated to show their
-spread; players on another machine; UDP; more than one camera with players.
+Runs repeated to show their spread; players on another machine; UDP; more
+than one camera with players; a camera opened with fewer at a time.

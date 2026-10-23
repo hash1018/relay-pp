@@ -2,8 +2,8 @@
 
 [`compare.sh`](compare.sh) runs one scenario against one server on this
 machine, over the loopback, and prints one line of what it cost;
-[`measure.ps1`](measure.ps1) is what measures a process. Windows only, for
-now: it reads processes through PowerShell. Results are in
+[`measure.ps1`](measure.ps1) on Windows (Git Bash) and [`measure.sh`](measure.sh)
+on Linux are what measure a process. Results are in
 [docs/benchmarks.md](../docs/benchmarks.md).
 
 ## What runs

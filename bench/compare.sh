@@ -11,9 +11,9 @@
 #   server:   relay | mediamtx
 #
 # <work-dir> holds stream.mp4, the camera's file. Needs, built in release:
-# media-pp's rtsp_server, rtsp_load and webrtc_load ($MEDIA_PP/target/release),
-# relay-pp ($RELAY_PP/target/release), and MediaMTX ($MEDIAMTX). Prints one
-# line of results.
+# media-pp's rtsp_server, rtsp_load and webrtc_load (in $TOOLS), relay-pp
+# ($RELAY), and MediaMTX ($MEDIAMTX). Prints one line of results. Runs on
+# Windows (Git Bash) and on Linux.
 set -euo pipefail
 
 work=$1 scenario=$2 server=$3 count=$4
@@ -23,7 +23,22 @@ MEDIAMTX=${MEDIAMTX:?the MediaMTX executable}
 WARM=${WARM:-15}
 SECONDS_MEASURED=${SECONDS_MEASURED:-30}
 here=$(cd "$(dirname "$0")" && pwd)
-tools=$MEDIA_PP/target/release
+case $(uname -s) in
+    MINGW* | MSYS* | CYGWIN*)
+        exe=.exe
+        native() { cygpath -m "$1"; }
+        kill_named() { taskkill //F //IM "$1.exe" >/dev/null 2>&1 || true; }
+        measure() { powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$here/measure.ps1")" -Name "$1" -Seconds "$2" | tr -d '\r'; }
+        ;;
+    *)
+        exe=
+        native() { echo "$1"; }
+        kill_named() { pkill -x "$1" >/dev/null 2>&1 || true; }
+        measure() { "$here/measure.sh" "$1" "$2"; }
+        ;;
+esac
+tools=${TOOLS:-$MEDIA_PP/target/release}
+relay=${RELAY:-$RELAY_PP/target/release/relay-pp$exe}
 run=$work/run-$scenario-$server-$count
 rm -rf "$run" && mkdir -p "$run"
 
@@ -31,11 +46,7 @@ CAMERA=127.0.0.1:18554
 camera_url=rtsp://$CAMERA/file
 
 stop_all() {
-    taskkill //F //IM relay-pp.exe >/dev/null 2>&1 || true
-    taskkill //F //IM mediamtx.exe >/dev/null 2>&1 || true
-    taskkill //F //IM rtsp_server.exe >/dev/null 2>&1 || true
-    taskkill //F //IM rtsp_load.exe >/dev/null 2>&1 || true
-    taskkill //F //IM webrtc_load.exe >/dev/null 2>&1 || true
+    for name in relay-pp mediamtx rtsp_server rtsp_load webrtc_load; do kill_named "$name"; done
 }
 trap stop_all EXIT
 stop_all
@@ -50,7 +61,7 @@ wait_until() { # what, seconds, command...
     exit 1
 }
 
-"$tools/rtsp_server.exe" "$work/stream.mp4" "$CAMERA" --seconds 100000 >"$run/camera.log" 2>&1 &
+"$tools/rtsp_server$exe" "$work/stream.mp4" "$CAMERA" --seconds 100000 >"$run/camera.log" 2>&1 &
 wait_until "the camera" 20 grep -q "serving" "$run/camera.log"
 
 record=false
@@ -75,11 +86,11 @@ listen = "127.0.0.1:28189"
 [http]
 listen = "$api"
 [record]
-dir = "$(cygpath -m "$run/recordings")"
+dir = "$(native "$run/recordings")"
 segment = "4s"
 chunk = "1h"
 EOF
-    (cd "$run" && RUST_LOG=warn "$RELAY_PP/target/release/relay-pp.exe" relay-pp.toml >relay.log 2>&1 &)
+    (cd "$run" && RUST_LOG=warn "$relay" relay-pp.toml >relay.log 2>&1 &)
     wait_until "relay-pp" 20 curl -sf "http://$api/api/v1/channels"
     for i in $(seq "$channels"); do
         curl -sf -X POST "http://$api/api/v1/channels" -H 'Content-Type: application/json' \
@@ -119,7 +130,7 @@ pathDefaults:
   sourceOnDemand: false
   rtspTransport: tcp
   record: $record
-  recordPath: $(cygpath -m "$run/recordings")/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordPath: $(native "$run/recordings")/%path/%Y-%m-%d_%H-%M-%S-%f
   recordFormat: fmp4
   recordSegmentDuration: 1h
   recordDeleteAfter: 0s
@@ -144,18 +155,18 @@ sleep "$WARM"
 load=""
 case $scenario in
     rtsp)
-        "$tools/rtsp_load.exe" "$(rtsp_play)" "$count" --seconds $((SECONDS_MEASURED + 15)) >"$run/players.log" 2>&1 &
+        "$tools/rtsp_load$exe" "$(rtsp_play)" "$count" --seconds $((SECONDS_MEASURED + 15)) >"$run/players.log" 2>&1 &
         load=$!
         sleep 10
         ;;
     webrtc)
-        "$tools/webrtc_load.exe" "$whep" "$count" --seconds $((SECONDS_MEASURED + 15)) >"$run/players.log" 2>&1 &
+        "$tools/webrtc_load$exe" "$whep" "$count" --seconds $((SECONDS_MEASURED + 15)) >"$run/players.log" 2>&1 &
         load=$!
         sleep 10
         ;;
 esac
-server_cost=$(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$here/measure.ps1")" -Name "$process" -Seconds "$SECONDS_MEASURED" | tr -d '\r')
-camera_cost=$(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$here/measure.ps1")" -Name rtsp_server -Seconds 5 | tr -d '\r' | sed 's/ write_mbps=.*//')
+server_cost=$(measure "$process" "$SECONDS_MEASURED")
+camera_cost=$(measure rtsp_server 5 | sed 's/ write_mbps=.*//')
 players=""
 if [ -n "$load" ]; then
     wait "$load" || true

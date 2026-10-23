@@ -20,7 +20,7 @@ use media_pp::elements::{RtspServer, RtspServerOptions, WebRtcServer, WebRtcServ
 
 use channel::Listeners;
 pub use channel::{
-    AttachError, ChannelConfig, ChannelError, ChannelStatus, SourceState, Transport,
+    AttachError, ChannelConfig, ChannelError, ChannelStatus, Client, SourceState, Transport,
 };
 use channels::Channels;
 pub use config::Config;

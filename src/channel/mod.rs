@@ -29,7 +29,7 @@ pub(crate) use record::Recorder;
 use sink::Sink;
 pub(crate) use sink::{Listeners, Protocol};
 use source::Source;
-pub use source::SourceState;
+pub use source::{Client, SourceState};
 
 /// What a channel is made from: the body of `POST /api/v1/channels`.
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +45,10 @@ pub struct ChannelConfig {
     /// default, which loses nothing) or `"udp"`.
     #[serde(default)]
     pub transport: Transport,
+    /// Which RTSP client pulls it: `"auto"`, the default — `retina`'s where
+    /// it takes the camera, FFmpeg's where not — or `"ffmpeg"`.
+    #[serde(default)]
+    pub client: Client,
 }
 
 /// How a camera is pulled.
@@ -133,6 +137,8 @@ pub struct ChannelStatus {
     pub error: Option<String>,
     /// How many times the source has gone live.
     pub connections: u64,
+    /// Which client pulled it, live or last: `"retina"` or `"ffmpeg"`.
+    pub client: Option<&'static str>,
     /// Readers of its broadcast: players and recorders.
     pub readers: usize,
     /// What its broadcast has been written, over every connection.
@@ -223,6 +229,7 @@ impl Channel {
                 .map_or(0, |since| since.as_millis() as u64),
             error: source.error,
             connections: source.connections,
+            client: source.client,
             readers: stats.readers,
             bytes: stats.bytes,
             sinks,
@@ -404,6 +411,7 @@ mod tests {
             name: name.to_owned(),
             source: source.to_owned(),
             transport: Transport::Tcp,
+            client: Client::Auto,
         }
     }
 

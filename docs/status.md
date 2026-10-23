@@ -82,6 +82,7 @@ and not `api`, `playback` or `recordings`.
 | `name` | required | what it goes by: in the API, `rtsp://host:8554/<name>`, `/<name>/whep` |
 | `source` | required | an `rtsp://` or `rtsps://` URL |
 | `transport` | `"tcp"` | how the camera is pulled: `"tcp"`, RTP on the RTSP connection, which loses nothing; or `"udp"` |
+| `client` | `"auto"` | which RTSP client pulls it: `"auto"`, `retina`'s where it takes the camera and FFmpeg's where it does not (below); or `"ffmpeg"`, FFmpeg's always — for a camera `retina` takes but takes wrongly |
 
 `201` with its status, `Location` its URL; `400` for a name or source that
 cannot be used, a field missing or unknown, or not JSON; `409` for a name
@@ -110,6 +111,7 @@ there. Each is:
 | `since_ms` | since when, in milliseconds since the Unix epoch |
 | `error` | why it last failed, while it is not live |
 | `connections` | how many times it has gone live |
+| `client` | which client pulled it, live or last: `"retina"` or `"ffmpeg"`; none before it first goes live |
 | `readers` | players and recordings reading it now |
 | `bytes` | what it has been sent, over every connection |
 | `sinks` | what reads it: `"rtsp"` and `"webrtc"` once a player has asked for it so, `"record"` while it is recorded |
@@ -123,6 +125,14 @@ Credentials never reach an answer or a log line.
 - Opened when the channel is made, with a 5-second timeout, which also
   bounds how long it may go without sending before it is taken to be gone.
 - Its pictures and sound are kept; a data or metadata stream is left out.
+- Pulled by one of two RTSP clients. `retina`'s, in Rust, takes most
+  cameras at a fifth of the processor time or less ([benchmarks.md](benchmarks.md));
+  FFmpeg's, media-pp's `RtspSource`, takes the rest. With `client` `"auto"`
+  `retina`'s is tried first over TCP, and FFmpeg's pulls the camera instead —
+  from then on, until the channel is made again — where `retina`'s cannot:
+  `rtsps://`, RTP over UDP, a codec other than H.264, H.265, AAC and G.711,
+  or a camera of several tracks that gives no `rtptime` to line them up by.
+  What reads the channel never knows which.
 - When it fails it is opened again after 1 second, then 2, 4 … up to 30,
   each spread ±20% so cameras one outage dropped are not all opened again
   in the same instant. A camera that stayed live for 10 seconds starts again
@@ -227,12 +237,14 @@ seconds — then closes the listeners.
 
 ## Threads
 
-Each live camera's connection is a media-pp pipeline on a thread of its
-own, the camera's data, and so is each recording. Everything that waits —
-the API, WHEP, each channel's watcher, which opens its camera, waits on its
-pipeline and before connecting again, and each recorder's — is a task on one
-tokio runtime of two threads; an open, which blocks, borrows a thread of the
-runtime's blocking pool while it runs. The RTSP and WebRTC listeners have
+A camera pulled by `retina`'s client is a task on one tokio runtime of two
+threads, reading its connection and writing what it reads into the
+channel's broadcast. One pulled by FFmpeg's is a media-pp pipeline on a
+thread of its own, the camera's data; its open, which blocks, borrows a
+thread of the runtime's blocking pool while it runs. Each recording is a
+pipeline of its own. Everything else that waits — the API, WHEP, each
+channel's watcher, which waits on its connection and before connecting
+again, and each recorder's — is a task on the same runtime. The RTSP and WebRTC listeners have
 threads of their own, shared by every channel.
 
 ## Verified
@@ -243,7 +255,10 @@ API gave, and played over WHEP; followed across the camera going away and
 coming back; a request to play waiting for a camera that never answers and
 saying so; channels made, refused, removed and made again under the same
 name; a removal of a camera being opened answering at once and holding up
-no add; a stop with ten cameras opening waiting for none of them. Recorded
+no add; a stop with ten cameras opening waiting for none of them. Played
+and followed alike pulled by either client — `retina`'s by default, FFmpeg's
+when asked — and a camera of two tracks with no `rtptime` pulled by
+FFmpeg's without being asked, both tracks relayed. Recorded
 in four-second chunks of one-second segments, each one media file read by
 byte range; listed; a stretch across chunks played back as one playlist and
 read back by FFmpeg through the server; a recording ended and begun again as

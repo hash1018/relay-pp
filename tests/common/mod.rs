@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use media_pp::driver::DriverRunner;
 use media_pp::elements::{
-    Broadcast, BroadcastOptions, CounterHandle, PacketCounter, RtspOptions, RtspPathMode,
-    RtspServer, RtspServerOptions, RtspSource, RtspTransport, StreamInfo, SwEncoder,
-    SwEncoderOptions, TestVideoOptions, TestVideoSource, VideoCodec, WhepOptions, WhepSource,
+    AudioCodec, Broadcast, BroadcastOptions, CounterHandle, PacketCounter, RtspOptions,
+    RtspPathMode, RtspServer, RtspServerOptions, RtspSource, RtspTransport, StreamInfo,
+    SwAudioEncoder, SwAudioEncoderOptions, SwEncoder, SwEncoderOptions, TestAudioOptions,
+    TestAudioSource, TestVideoOptions, TestVideoSource, VideoCodec, WhepOptions, WhepSource,
 };
 use media_pp::ffmpeg;
-use media_pp::pipeline::Pipeline;
-use relay_pp::{ChannelConfig, Config, Server, SourceState, Transport};
+use media_pp::pipeline::{Pipeline, PipelineBuilder};
+use relay_pp::{ChannelConfig, Client, Config, Server, SourceState, Transport};
 
 pub const WITHIN: Duration = Duration::from_secs(20);
 
@@ -30,6 +31,16 @@ pub struct Camera {
 
 impl Camera {
     pub fn start(addr: SocketAddr) -> Self {
+        Self::started(addr, false)
+    }
+
+    /// One with sound as well — AAC — and so two tracks, which this
+    /// camera, media-pp's RTSP server, describes with no `rtptime`.
+    pub fn with_sound(addr: SocketAddr) -> Self {
+        Self::started(addr, true)
+    }
+
+    fn started(addr: SocketAddr, sound: bool) -> Self {
         let (server, handle) = RtspServer::bind("camera", addr, RtspServerOptions::default())
             .expect("bind the camera");
         let broadcast = Broadcast::new("cam", BroadcastOptions::default());
@@ -52,10 +63,25 @@ impl Camera {
             },
         )
         .expect("OpenH264 is always there");
-        let sink = broadcast
-            .publish(&[StreamInfo::from(&encoder)])
-            .unwrap()
-            .remove(0);
+        let sound_encoder = sound.then(|| {
+            SwAudioEncoder::new(
+                "sound-encoder",
+                SwAudioEncoderOptions {
+                    codec: AudioCodec::Aac,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    bit_rate: 64_000,
+                },
+            )
+            .expect("AAC is always there")
+        });
+        let mut tracks = vec![StreamInfo::from(&encoder)];
+        if let Some(sound_encoder) = &sound_encoder {
+            tracks.push(StreamInfo::from(sound_encoder));
+        }
+        let mut sinks = broadcast.publish(&tracks).unwrap();
+        let sound_sink = sound.then(|| sinks.remove(1));
+        let sink = sinks.remove(0);
         let pictures = TestVideoSource::new(
             "pictures",
             TestVideoOptions {
@@ -64,12 +90,39 @@ impl Camera {
                 frame_rate: ffmpeg::Rational::new(15, 1),
             },
         );
-        let (input, ()) = Pipeline::new("camera-input", pictures, |source, ctx| {
-            let branch = ctx.branch().queue("encode", 4).pipe(encoder).to(sink)?;
-            ctx.attach(source, 0, branch)?;
-            Ok(())
-        })
-        .unwrap();
+        let (builder, ()) = PipelineBuilder::new("camera-input")
+            .add_source(pictures, |source, ctx| {
+                let branch = ctx.branch().queue("encode", 4).pipe(encoder).to(sink)?;
+                ctx.attach(source, 0, branch)?;
+                Ok(())
+            })
+            .unwrap();
+        let builder = match (sound_encoder, sound_sink) {
+            (Some(sound_encoder), Some(sound_sink)) => {
+                let tone = TestAudioSource::new(
+                    "tone",
+                    TestAudioOptions {
+                        sample_rate: 48_000,
+                        channels: 1,
+                        ..TestAudioOptions::default()
+                    },
+                );
+                builder
+                    .add_source(tone, |source, ctx| {
+                        let branch = ctx
+                            .branch()
+                            .queue("encode-sound", 8)
+                            .pipe(sound_encoder)
+                            .to(sound_sink)?;
+                        ctx.attach(source, 0, branch)?;
+                        Ok(())
+                    })
+                    .unwrap()
+                    .0
+            }
+            _ => builder,
+        };
+        let input = builder.build();
         input.run().unwrap();
         Self {
             addr: handle.local_addr(),
@@ -238,6 +291,7 @@ pub fn pulling(name: &str, camera: SocketAddr) -> ChannelConfig {
         name: name.to_owned(),
         source: format!("rtsp://{camera}/cam"),
         transport: Transport::Tcp,
+        client: Client::Auto,
     }
 }
 

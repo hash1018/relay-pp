@@ -1,29 +1,27 @@
 //! A channel's source: what takes its stream in and writes it into the
 //! channel's `Broadcast`.
 //!
-//! The source here is a camera pulled over RTSP. A media-pp source is used
-//! once — a camera that drops is opened again as a new one, in a pipeline of
-//! its own — so this keeps how to open it, and the broadcast, which outlives
-//! every one of them.
+//! The source here is a camera pulled over RTSP, connected again whenever
+//! it drops. Each connection is made by one of two clients: `retina`'s, a
+//! task on the runtime ([`retina`]), where it takes the camera — most do —
+//! and FFmpeg's, media-pp's `RtspSource` in a pipeline of its own
+//! ([`ffmpeg`]), where it does not. Both write into the broadcast, which
+//! outlives every connection; what reads the broadcast never knows which.
 //!
-//! Each connection's pipeline runs on its own thread, as media-pp runs
-//! every pipeline: that is the camera's data. What watches it — opens the
-//! camera, waits on the pipeline's bus, waits before connecting again, and
-//! hears a halt — is a task on the server's runtime, holding no thread while
-//! it waits; the open, which blocks, goes to the runtime's blocking pool.
+//! What watches a connection — waits on it, waits before connecting again,
+//! hears a halt — is the source's task, holding no thread while it waits.
+
+mod ffmpeg;
+mod retina;
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use media_pp::bus::BusEvent;
-use media_pp::elements::{
-    Broadcast, BroadcastOptions, RtspOptions, RtspSource, RtspTransport, StreamInfo,
-};
-use media_pp::ffmpeg::media;
-use media_pp::pipeline::Pipeline;
-use serde::Serialize;
+use media_pp::elements::{Broadcast, BroadcastOptions, RtspTransport};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 
@@ -54,20 +52,52 @@ pub enum SourceState {
     Waiting,
 }
 
+/// Which RTSP client a channel's camera is pulled with — the body of
+/// `POST /api/v1/channels`' `client`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Client {
+    /// `retina`'s where it takes the camera, FFmpeg's where it does not:
+    /// `rtsps://`, RTP over UDP, a codec other than H.264, H.265, AAC and
+    /// G.711, or a camera that gives no `rtptime` to line its tracks up by.
+    #[default]
+    Auto,
+    /// FFmpeg's, always — for a camera `retina` takes but takes wrongly.
+    Ffmpeg,
+}
+
+/// Which client made a connection, as the status names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Puller {
+    Retina,
+    Ffmpeg,
+}
+
+impl Puller {
+    fn name(self) -> &'static str {
+        match self {
+            Puller::Retina => "retina",
+            Puller::Ffmpeg => "ffmpeg",
+        }
+    }
+}
+
 /// What a source is doing, at one moment.
-pub(super) struct SourceStatus {
+pub(in crate::channel) struct SourceStatus {
     /// Its URL, with any credentials cut out.
-    pub(super) url: String,
-    pub(super) state: SourceState,
-    pub(super) since: SystemTime,
+    pub(in crate::channel) url: String,
+    pub(in crate::channel) state: SourceState,
+    pub(in crate::channel) since: SystemTime,
     /// Why it last failed, while it is not live.
-    pub(super) error: Option<String>,
+    pub(in crate::channel) error: Option<String>,
     /// How many times it has gone live.
-    pub(super) connections: u64,
+    pub(in crate::channel) connections: u64,
+    /// The client of the connection live, or the last.
+    pub(in crate::channel) client: Option<&'static str>,
 }
 
 /// A camera pulled by a task, into a broadcast.
-pub(super) struct Source {
+pub(in crate::channel) struct Source {
     /// What the source's task shares with it.
     inner: Arc<Inner>,
     task: Task,
@@ -79,11 +109,18 @@ struct Inner {
     /// The camera's URL, credentials and all: what is opened.
     url: String,
     transport: RtspTransport,
+    /// The client asked for.
+    client: Client,
+    /// Set once `retina` has said it cannot take this camera: FFmpeg's
+    /// client pulls it from then on, without asking again.
+    ffmpeg_only: AtomicBool,
     broadcast: Broadcast,
     state: Mutex<State>,
-    /// Which connection is live — its count — while one is: what a
-    /// recorder begins a recording on, and ends one at.
+    /// Which run of the broadcast is live — a count — while one is: what a
+    /// recorder begins a recording on, and ends one at. A connection begins
+    /// one, and so does a camera that changes its pictures partway.
     runs: watch::Sender<Option<u64>>,
+    run: AtomicU64,
     /// Rung to end the live connection and open the camera again at once —
     /// see [`Source::reconnect`].
     reconnect: Arc<Notify>,
@@ -94,12 +131,13 @@ struct State {
     since: SystemTime,
     error: Option<String>,
     connections: u64,
+    client: Option<Puller>,
 }
 
 impl Source {
     /// A source for the channel called `name`, its broadcast made and nothing
     /// opened yet: what reads the broadcast is attached before [`Self::run`].
-    pub(super) fn new(name: &str, config: &ChannelConfig) -> Self {
+    pub(in crate::channel) fn new(name: &str, config: &ChannelConfig) -> Self {
         Self {
             inner: Arc::new(Inner {
                 name: name.to_owned(),
@@ -108,14 +146,18 @@ impl Source {
                     Transport::Tcp => RtspTransport::Tcp,
                     Transport::Udp => RtspTransport::Udp,
                 },
+                client: config.client,
+                ffmpeg_only: AtomicBool::new(false),
                 broadcast: Broadcast::new(name, BroadcastOptions::default()),
                 state: Mutex::new(State {
                     state: SourceState::Connecting,
                     since: SystemTime::now(),
                     error: None,
                     connections: 0,
+                    client: None,
                 }),
                 runs: watch::Sender::new(None),
+                run: AtomicU64::new(0),
                 reconnect: Arc::new(Notify::new()),
             }),
             task: Task::new(),
@@ -127,28 +169,28 @@ impl Source {
     /// connection began as — a recording of a camera that changed its
     /// picture size, which a new connection describes anew. Nothing where
     /// no connection is live.
-    pub(super) fn reconnect(&self) -> Arc<Notify> {
+    pub(in crate::channel) fn reconnect(&self) -> Arc<Notify> {
         Arc::clone(&self.inner.reconnect)
     }
 
     /// What it writes into.
-    pub(super) fn broadcast(&self) -> &Broadcast {
+    pub(in crate::channel) fn broadcast(&self) -> &Broadcast {
         &self.inner.broadcast
     }
 
-    /// Which connection is live, while one is, and each change of it.
-    pub(super) fn runs(&self) -> watch::Receiver<Option<u64>> {
+    /// Which run is live, while one is, and each change of it.
+    pub(in crate::channel) fn runs(&self) -> watch::Receiver<Option<u64>> {
         self.inner.runs.subscribe()
     }
 
     /// Starts pulling the camera on `runtime`, connecting again whenever it
     /// fails.
-    pub(super) fn run(&self, runtime: &Handle) {
+    pub(in crate::channel) fn run(&self, runtime: &Handle) {
         let inner = Arc::clone(&self.inner);
         self.task.spawn(runtime, |halt| inner.run(halt));
     }
 
-    pub(super) fn status(&self) -> SourceStatus {
+    pub(in crate::channel) fn status(&self) -> SourceStatus {
         let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         SourceStatus {
             url: redact(&self.inner.url),
@@ -156,20 +198,21 @@ impl Source {
             since: state.since,
             error: state.error.clone(),
             connections: state.connections,
+            client: state.client.map(Puller::name),
         }
     }
 
     /// Tells its task to stop, without waiting: the task lets go of an open
-    /// under way at once — it finishes on the blocking pool and is dropped
-    /// — and stops a connection's pipeline.
-    pub(super) fn halt(&self) {
+    /// under way at once — FFmpeg's finishes on the blocking pool and is
+    /// dropped — and stops the connection.
+    pub(in crate::channel) fn halt(&self) {
         self.task.halt();
     }
 
     /// Halts it and waits for its task to end — no longer than a
-    /// connection's pipeline takes to stop, which for a camera gone silent
+    /// connection takes to stop, which for FFmpeg's of a camera gone silent
     /// is its timeout.
-    pub(super) async fn wait(&self) {
+    pub(in crate::channel) async fn wait(&self) {
         self.task.wait().await;
     }
 }
@@ -194,7 +237,9 @@ impl Inner {
         loop {
             self.set(SourceState::Connecting, last.clone());
             let began = Instant::now();
-            let reason = match Arc::clone(&self).pull(&mut halt).await {
+            let ended = self.pull(&mut halt).await;
+            self.runs.send_replace(None);
+            let reason = match ended {
                 Ended::Halted => break,
                 Ended::Failed(reason) => reason,
                 Ended::Reconnect => {
@@ -217,93 +262,32 @@ impl Inner {
             last = Some(reason);
             tokio::select! {
                 () = tokio::time::sleep(spread) => {}
-                _ = halt.wait_for(|halted| *halted) => break,
+                () = halted(&mut halt) => break,
             }
             wait = (wait * 2).min(LONGEST_WAIT);
         }
         self.broadcast.close();
     }
 
-    /// Opens the camera: a media-pp source, and the streams of it a
-    /// broadcast carries — pictures and sound, not a camera's data or
-    /// metadata streams. Blocks, up to the camera's timeout.
-    fn open(&self) -> Result<(RtspSource, Vec<StreamInfo>), String> {
-        let (source, streams) = RtspSource::open(
-            format!("{}-camera", self.name),
-            &self.url,
-            RtspOptions {
-                transport: self.transport,
-                timeout: CAMERA_TIMEOUT,
-            },
-        )
-        .map_err(|error| format!("cannot open the camera: {error}"))?;
-        let kept: Vec<StreamInfo> = streams
-            .into_iter()
-            .filter(|stream| matches!(stream.kind(), media::Type::Video | media::Type::Audio))
-            .collect();
-        if kept.is_empty() {
-            return Err("the camera sends neither pictures nor sound".into());
-        }
-        Ok((source, kept))
-    }
-
-    /// Pulls the camera until it fails or the source is halted.
-    ///
-    /// Each connection is a pipeline of its own ending in the broadcast,
-    /// published again: the broadcast is what outlives it, and publishing
-    /// again is what tells its readers that one run ended and another began.
-    async fn pull(self: Arc<Self>, halt: &mut watch::Receiver<bool>) -> Ended {
-        let opening = tokio::task::spawn_blocking({
-            let inner = Arc::clone(&self);
-            move || inner.open()
-        });
-        let opened = tokio::select! {
-            opened = opening => opened,
-            // The open goes on to its end on the blocking pool, and what it
-            // opens is dropped there.
-            _ = halt.wait_for(|halted| *halted) => return Ended::Halted,
-        };
-        let (source, streams) = match opened {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(reason)) => return Ended::Failed(reason),
-            Err(_) => return Ended::Failed("opening the camera panicked".into()),
-        };
-        let pipeline = match self.start(source, &streams) {
-            Ok(pipeline) => pipeline,
-            Err(reason) => return Ended::Failed(reason),
-        };
-        self.went_live();
-
-        let ended = tokio::select! {
-            reason = watch_bus(&pipeline) => Ended::Failed(reason),
-            _ = halt.wait_for(|halted| *halted) => Ended::Halted,
-            () = self.reconnect.notified() => Ended::Reconnect,
-        };
-        // Stopping joins the pipeline's thread, which a camera gone silent
-        // holds up to its timeout: not on the runtime's own threads.
-        let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
-        self.runs.send_replace(None);
-        ended
-    }
-
-    /// Publishes `streams` again and starts a pipeline writing `source`
-    /// into them.
-    fn start(&self, source: RtspSource, streams: &[StreamInfo]) -> Result<Arc<Pipeline>, String> {
-        let sinks = self
-            .broadcast
-            .publish(streams)
-            .map_err(|error| format!("cannot publish: {error}"))?;
-        let (pipeline, ()) = Pipeline::new(format!("{}-pull", self.name), source, |source, ctx| {
-            for (stream, sink) in streams.iter().zip(sinks) {
-                ctx.attach(source, stream.index(), ctx.branch().to(sink)?)?;
+    /// One connection, by `retina`'s client where it may take the camera,
+    /// and by FFmpeg's where it may not or says it cannot.
+    async fn pull(self: &Arc<Self>, halt: &mut watch::Receiver<bool>) -> Ended {
+        let retina_may = self.client == Client::Auto
+            && self.transport == RtspTransport::Tcp
+            && !self.ffmpeg_only.load(Ordering::Acquire);
+        if retina_may {
+            match retina::pull(self, halt).await {
+                retina::Pulled::Ended(ended) => return ended,
+                retina::Pulled::Unsupported(why) => {
+                    tracing::info!(
+                        channel = %self.name,
+                        "retina does not take this camera ({why}); FFmpeg's client pulls it"
+                    );
+                    self.ffmpeg_only.store(true, Ordering::Release);
+                }
             }
-            Ok(())
-        })
-        .map_err(|error| format!("cannot wire the camera: {error}"))?;
-        pipeline
-            .run()
-            .map_err(|error| format!("cannot start the camera: {error}"))?;
-        Ok(pipeline)
+        }
+        ffmpeg::pull(self, halt).await
     }
 
     fn set(&self, state: SourceState, error: Option<String>) {
@@ -315,30 +299,29 @@ impl Inner {
         current.error = error;
     }
 
-    fn went_live(&self) {
+    /// A connection by `client` is live, its first run published.
+    fn went_live(&self, client: Puller) {
         self.set(SourceState::Live, None);
-        let connection = {
+        {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.connections += 1;
-            state.connections
-        };
-        self.runs.send_replace(Some(connection));
-        tracing::info!(channel = %self.name, "live");
+            state.client = Some(client);
+        }
+        self.new_run();
+        tracing::info!(channel = %self.name, client = client.name(), "live");
+    }
+
+    /// The broadcast was published again: another run is live.
+    fn new_run(&self) {
+        let run = self.run.fetch_add(1, Ordering::AcqRel) + 1;
+        self.runs.send_replace(Some(run));
     }
 }
 
-/// Why a connection's pipeline ended, as its bus says — which it does only
-/// for a failure or the camera ending its stream, since nothing else stops
-/// it while this waits.
-async fn watch_bus(pipeline: &Pipeline) -> String {
-    loop {
-        match pipeline.bus().recv_async().await {
-            Some(BusEvent::Error { error, .. }) => return format!("the camera failed: {error}"),
-            Some(BusEvent::Finished) => return "the camera ended its stream".to_owned(),
-            Some(_) => {}
-            None => return "the camera's pipeline ended".to_owned(),
-        }
-    }
+/// Waits for `halt` to say halted. What `wait_for` gives back holds the
+/// watch's lock, which a `select!` would keep across its other arms' awaits.
+async fn halted(halt: &mut watch::Receiver<bool>) {
+    let _ = halt.wait_for(|halted| *halted).await;
 }
 
 /// A number in `[0, 1)`, different every call: `RandomState` is seeded

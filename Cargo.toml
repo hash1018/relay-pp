@@ -13,9 +13,12 @@ publish = false
 # so it is taken from the repository at a revision. To build against a
 # checkout beside this one instead:
 #   cargo build --config 'patch."https://github.com/hash1018/media-pp".media-pp.path="../media-pp/lib"'
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "f96bb6aecb8f2397eb2c93f52369fcf5e26f51f5", features = ["rtsp-server", "webrtc"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "cec23f2ac507453f16dbd041b861f3d9917d98cd", features = ["rtsp-server", "webrtc"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
+retina = "0.4"
+futures = "0.3"
+url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

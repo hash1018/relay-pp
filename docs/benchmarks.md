@@ -2,7 +2,8 @@
 
 Measured 2026-10-23 on one Windows 11 machine — Intel i5-12400F (6 cores,
 12 threads), 32 GB — over the loopback, with [`bench/`](../bench/README.md):
-relay-pp at 55ce8bb on media-pp e4a39241, MediaMTX v1.20.1. One run of each,
+relay-pp at 55ce8bb on media-pp e4a39241 (and again on f96bb6ae, below),
+MediaMTX v1.20.1. One run of each,
 30 seconds measured.
 
 The stream is 1080p at 25 pictures a second, H.264 High at 4 Mbit/s, a
@@ -21,11 +22,30 @@ logs, the players' is not measured.
 | 200 | 380 | 199 | 1,100 MB | 142 MB | 215 | 21 |
 
 relay-pp takes about twice the processor time of MediaMTX to pull a camera,
-and about 5 MB of memory each to MediaMTX's 0.3 MB. Most of the memory is
+and about 5 MB of memory each to MediaMTX's 0.3 MB. Most of the memory was
 the broadcast's retained stretch — at least five seconds and a group of
 pictures, 2.5 to 3.5 MB of a 4 Mbit/s stream — kept so that a player starts
 at once at a keyframe; MediaMTX keeps no such stretch, and sends a player
 what arrives after it joins. Threads are one per camera, as built.
+
+### After media-pp f96bb6ae: a broadcast keeps a second
+
+A broadcast now keeps the newest second, packet by packet, and no group of
+pictures: a player joining waits for the next keyframe where none is held,
+as MediaMTX's does. relay-pp again, MediaMTX as above:
+
+| Channels | relay-pp memory, before → after | MediaMTX memory | relay-pp CPU after |
+|---|---|---|---|
+| 50 | 306 → 160 MB | 86 MB | 200 |
+| 100 | 570 → 266 MB | 107 MB | 312 |
+| 200 | 1,100 → 480 MB | 142 MB | 353 |
+
+About 2.3 MB a camera, from 5.4; what is left of the difference from
+MediaMTX is not the broadcast — half a megabyte at most — and is to be
+looked for in a profile, with the processor time. Recording every camera:
+330, 509 and 944 MB at 50, 100 and 200 channels, from 445, 881 and 1,613.
+The players are unchanged: 200 RTSP players took 60% of a core and 50
+WebRTC players 49%, nothing lost.
 
 ## Recording every camera
 

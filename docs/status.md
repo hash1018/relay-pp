@@ -155,6 +155,12 @@ Either waits up to 10 seconds for the camera to be live — a channel just
 made, or a camera connecting again — and answers `503` saying why where it
 is not; `404` for no such channel.
 
+A player starts at a keyframe of the last second the channel holds, or
+waits for the next one: up to the camera's keyframe interval before its
+first picture. A channel keeps only that second, as room for a player to
+fall behind — about half a megabyte of a 4 Mbit/s camera — and no group of
+pictures.
+
 ## Recording
 
 `POST /api/v1/channels/{name}/record` begins recording a channel, from the

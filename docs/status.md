@@ -131,7 +131,9 @@ Credentials never reach an answer or a log line.
   `retina`'s is tried first over TCP, and FFmpeg's pulls the camera instead —
   from then on, until the channel is made again — where `retina`'s cannot:
   `rtsps://`, RTP over UDP, a codec other than H.264, H.265, AAC and G.711,
-  or a camera of several tracks that gives no `rtptime` to line them up by.
+  a camera of several tracks that gives no `rtptime` to line them up by, or
+  pictures sent out of the order they are shown in (B-frames), which RTP
+  gives `retina` no way to stamp.
   What reads the channel never knows which.
 - When it fails it is opened again after 1 second, then 2, 4 … up to 30,
   each spread ±20% so cameras one outage dropped are not all opened again

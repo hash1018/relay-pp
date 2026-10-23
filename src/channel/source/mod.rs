@@ -59,7 +59,8 @@ pub enum SourceState {
 pub enum Client {
     /// `retina`'s where it takes the camera, FFmpeg's where it does not:
     /// `rtsps://`, RTP over UDP, a codec other than H.264, H.265, AAC and
-    /// G.711, or a camera that gives no `rtptime` to line its tracks up by.
+    /// G.711, a camera that gives no `rtptime` to line its tracks up by, or
+    /// pictures with B-frames.
     #[default]
     Auto,
     /// FFmpeg's, always — for a camera `retina` takes but takes wrongly.

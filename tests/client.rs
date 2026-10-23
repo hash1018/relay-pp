@@ -120,3 +120,26 @@ fn an_unknown_client_is_refused() {
     assert!(server.status().is_empty());
     server.stop();
 }
+
+#[test]
+fn a_camera_sending_b_frames_is_pulled_by_ffmpeg() {
+    // `retina` takes the description and plays; the pictures then come out
+    // of the order they are shown in, which it cannot stamp.
+    let Some(camera) = Camera::with_b_frames("127.0.0.1:0".parse().unwrap()) else {
+        eprintln!("skipping: no libx264 in this FFmpeg");
+        return;
+    };
+    let server = server();
+    made(&server, "cam1", camera.addr, None);
+    wait_for("FFmpeg's client pulling it", || {
+        let status = &server.status()[0];
+        status.state == SourceState::Live && status.client == Some("ffmpeg")
+    });
+    let (rtsp, over_rtsp) = rtsp_player(&play_rtsp(server.http_addr(), "cam1"));
+    wait_for("RTSP packets", || over_rtsp.get() > 20);
+    assert_eq!(server.status()[0].client, Some("ffmpeg"), "and stays so");
+
+    rtsp.stop();
+    server.stop();
+    camera.stop();
+}

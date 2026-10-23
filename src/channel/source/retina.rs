@@ -7,8 +7,9 @@
 //! What it hands the broadcast is what FFmpeg's client would: H.264 and
 //! H.265 in Annex B, keyframes carrying their parameter sets, raw AAC, with
 //! the same configuration in each track's description. It takes what most
-//! cameras send — `rtsp://` over TCP, H.264 or H.265, AAC or G.711 — and
-//! says so where a camera sends anything else, for FFmpeg's to take it.
+//! cameras send — `rtsp://` over TCP, H.264 or H.265, AAC or G.711 — with
+//! no B-frames, and says so where a camera sends anything else, for
+//! FFmpeg's to take it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +44,8 @@ pub(super) enum Pulled {
 }
 
 /// Pulls the camera until it fails, is halted — or turns out to send what
-/// `retina` cannot take, before anything is published.
+/// `retina` cannot take: a codec, said in its description, or pictures out
+/// of the order they are shown in, seen once they come.
 pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -> Pulled {
     let (url, creds) = match split_credentials(&inner.url) {
         Ok(split) => split,
@@ -120,7 +122,7 @@ pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -
         picture_ticks: Vec::new(),
         last: Vec::new(),
     };
-    Pulled::Ended(connection.run(&mut demuxed, halt).await)
+    connection.run(&mut demuxed, halt).await
 }
 
 /// A pull under way: which of the session's streams are the broadcast's
@@ -138,33 +140,33 @@ struct Connection<'a> {
 }
 
 impl Connection<'_> {
-    async fn run(&mut self, demuxed: &mut Demuxed, halt: &mut watch::Receiver<bool>) -> Ended {
+    async fn run(&mut self, demuxed: &mut Demuxed, halt: &mut watch::Receiver<bool>) -> Pulled {
         // Until every track is described, what arrives is kept, to be
         // written once the tracks are published.
         let mut early = Vec::new();
         let deadline = tokio::time::Instant::now() + DESCRIBED_WITHIN;
         while !self.described(demuxed) {
             if early.len() >= KEPT_WHILE_DESCRIBING || tokio::time::Instant::now() >= deadline {
-                return Ended::Failed("the camera did not describe its tracks".to_owned());
+                return failed("the camera did not describe its tracks".to_owned());
             }
             match self.next(demuxed, halt).await {
                 Ok(item) => early.push(item),
-                Err(ended) => return ended,
+                Err(ended) => return Pulled::Ended(ended),
             }
         }
         if let Err(reason) = self.publish(demuxed) {
-            return Ended::Failed(reason);
+            return failed(reason);
         }
         self.inner.went_live(Puller::Retina);
         for item in early {
-            if let Err(reason) = self.write(demuxed, item) {
-                return Ended::Failed(reason);
+            if let Err(stopped) = self.write(demuxed, item) {
+                return stopped.into();
             }
         }
         loop {
             let item = match self.next(demuxed, halt).await {
                 Ok(item) => item,
-                Err(ended) => return ended,
+                Err(ended) => return Pulled::Ended(ended),
             };
             if let CodecItem::VideoFrame(frame) = &item
                 && frame.has_new_parameters()
@@ -173,13 +175,13 @@ impl Connection<'_> {
                 // anew, rather than one its readers' descriptions no longer
                 // hold for.
                 if let Err(reason) = self.publish(demuxed) {
-                    return Ended::Failed(reason);
+                    return failed(reason);
                 }
                 self.inner.new_run();
                 tracing::info!(channel = %self.inner.name, "the camera's pictures changed; published anew");
             }
-            if let Err(reason) = self.write(demuxed, item) {
-                return Ended::Failed(reason);
+            if let Err(stopped) = self.write(demuxed, item) {
+                return stopped.into();
             }
         }
     }
@@ -236,7 +238,7 @@ impl Connection<'_> {
     /// Writes a frame into its track's sink, as FFmpeg's client would hand
     /// it on; anything else the session gives — sender reports, a camera's
     /// metadata — goes nowhere.
-    fn write(&mut self, demuxed: &Demuxed, item: CodecItem) -> Result<(), String> {
+    fn write(&mut self, demuxed: &Demuxed, item: CodecItem) -> Result<(), Stopped> {
         // What a frame lasts: a sound's its samples; a picture's what its
         // camera's rate says, or the time since the last one.
         let (stream, data, timestamp, key, samples) = match &item {
@@ -262,6 +264,12 @@ impl Connection<'_> {
         let clock = demuxed.streams()[stream].clock_rate_hz();
         let mut packet = ffmpeg::Packet::copy(data);
         let pts = timestamp.elapsed();
+        // Pictures sent out of the order they are shown in — B-frames: RTP
+        // gives each its time shown and no other, so the order they are
+        // decoded in cannot be stamped here. FFmpeg's client works it out.
+        if samples.is_none() && self.last[track].is_some_and(|last| pts < last) {
+            return Err(Stopped::Reorders);
+        }
         let since_last = self.last[track]
             .map(|last| pts - last)
             .filter(|ticks| *ticks > 0);
@@ -279,7 +287,25 @@ impl Connection<'_> {
         }
         self.sinks[track]
             .consume(MediaBuffer::packet(packet))
-            .map_err(|error| format!("cannot write into the broadcast: {error}"))
+            .map_err(|error| Stopped::Failed(format!("cannot write into the broadcast: {error}")))
+    }
+}
+
+/// Why a frame could not be written.
+enum Stopped {
+    Failed(String),
+    /// The camera sends pictures out of the order they are shown in.
+    Reorders,
+}
+
+impl From<Stopped> for Pulled {
+    fn from(stopped: Stopped) -> Self {
+        match stopped {
+            Stopped::Failed(reason) => failed(reason),
+            Stopped::Reorders => Pulled::Unsupported(
+                "pictures sent out of the order they are shown in (B-frames)".to_owned(),
+            ),
+        }
     }
 }
 

@@ -31,16 +31,22 @@ pub struct Camera {
 
 impl Camera {
     pub fn start(addr: SocketAddr) -> Self {
-        Self::started(addr, false)
+        Self::started(addr, false, false).expect("OpenH264 is always there")
     }
 
     /// One with sound as well — AAC — and so two tracks, which this
     /// camera, media-pp's RTSP server, describes with no `rtptime`.
     pub fn with_sound(addr: SocketAddr) -> Self {
-        Self::started(addr, true)
+        Self::started(addr, true, false).expect("OpenH264 is always there")
     }
 
-    fn started(addr: SocketAddr, sound: bool) -> Self {
+    /// One whose pictures have B-frames — sent out of the order they are
+    /// shown in — by `libx264`: `None` where this FFmpeg has none.
+    pub fn with_b_frames(addr: SocketAddr) -> Option<Self> {
+        Self::started(addr, false, true)
+    }
+
+    fn started(addr: SocketAddr, sound: bool, b_frames: bool) -> Option<Self> {
         let (server, handle) = RtspServer::bind("camera", addr, RtspServerOptions::default())
             .expect("bind the camera");
         let broadcast = Broadcast::new("cam", BroadcastOptions::default());
@@ -52,17 +58,21 @@ impl Camera {
         let encoder = SwEncoder::new(
             "encoder",
             SwEncoderOptions {
-                codec: VideoCodec::OpenH264,
+                codec: if b_frames {
+                    VideoCodec::H264
+                } else {
+                    VideoCodec::OpenH264
+                },
                 width: 320,
                 height: 240,
                 pixel_format: ffmpeg::format::Pixel::YUV420P,
                 frame_rate: ffmpeg::Rational::new(15, 1),
                 bit_rate: 300_000,
                 gop_size: 15,
-                max_b_frames: None,
+                max_b_frames: b_frames.then_some(2),
             },
         )
-        .expect("OpenH264 is always there");
+        .ok()?;
         let sound_encoder = sound.then(|| {
             SwAudioEncoder::new(
                 "sound-encoder",
@@ -124,11 +134,11 @@ impl Camera {
         };
         let input = builder.build();
         input.run().unwrap();
-        Self {
+        Some(Self {
             addr: handle.local_addr(),
             server,
             input,
-        }
+        })
     }
 
     pub fn stop(self) {

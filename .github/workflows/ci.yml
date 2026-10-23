@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the run under way:
+# the newest commit holds everything before it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Hosted runners have no GPU: pictures are converted on the processor here,
+# which the tests that convert them allow (`"video": "any"`), and on the GPU
+# on a machine of one's own.
+#
+# FFmpeg comes from media-pp's own action, at the revision Cargo.toml takes
+# media-pp at: the FFmpeg its bindings are built against, from vcpkg, built
+# once and cached. Beside its defaults, the encoders the tests' cameras use —
+# Opus for sound, x264 for B-frames, x265 for H.265, libvpx for VP8 — each
+# test skipping, saying so, where its encoder is missing.
+env:
+  FFMPEG_FEATURES: openh264,vulkan,opus,gpl,x264,x265,vpx
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # One command per step: pwsh reports only the last command's exit code.
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Select Rust toolchain
+        shell: pwsh
+        run: rustup default stable
+
+      - name: Set up FFmpeg
+        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@9e14facbb170dad9e96107efe9da5904f3b91b46
+        with:
+          vcpkg-features: ${{ env.FFMPEG_FEATURES }}
+
+      - name: Cache downloaded crates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        shell: pwsh
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Every server, camera and player binds the loopback alone.
+      - name: Test
+        shell: pwsh
+        run: cargo test
+
+  linux:
+    runs-on: ubuntu-26.04
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Set up FFmpeg
+        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@9e14facbb170dad9e96107efe9da5904f3b91b46
+        with:
+          vcpkg-features: ${{ env.FFMPEG_FEATURES }}
+
+      - name: Cache downloaded crates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Linux's own code — CUDA and Vulkan devices — is compiled nowhere else.
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

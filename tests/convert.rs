@@ -36,6 +36,10 @@ fn settled(server: &relay_pp::Server) {
     });
 }
 
+/// A channel's `"convert"` converting pictures on the processor where no
+/// GPU encoder opens.
+const ANY_VIDEO: &str = r#"{"video":"any"}"#;
+
 fn conversions(server: &relay_pp::Server) -> Vec<String> {
     server.status()[0].conversions.clone()
 }
@@ -197,7 +201,9 @@ fn h265_reaches_webrtc_players_as_h264_and_rtsp_players_as_it_is() {
         return;
     };
     let server = server();
-    made(&server, camera.addr);
+    // On the GPU where there is one, and on the processor where not — a
+    // runner of CI's — so that the conversion is tested either way.
+    made_with(&server, camera.addr, ANY_VIDEO);
     settled(&server);
 
     let (whep, tracks) = whep_tracks(&format!("http://{}/cam1/whep", server.http_addr()));
@@ -226,7 +232,7 @@ fn vp8_is_recorded_as_h264_in_time_with_the_sound() {
         "[record]\ndir = {:?}\nsegment = \"1s\"\nchunk = \"1h\"",
         root.display().to_string()
     ));
-    made(&server, camera.addr);
+    made_with(&server, camera.addr, ANY_VIDEO);
     std::thread::sleep(Duration::from_secs(3));
     let (status, _, _) = http(
         server.http_addr(),

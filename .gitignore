@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # What relay-pp and media-pp log, beside where it runs
 /logs
+
+# The FFmpeg tree CI builds and caches
+/.vcpkg

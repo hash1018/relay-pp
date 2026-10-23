@@ -2,7 +2,8 @@
 
 Measured 2026-10-23 on one Windows 11 machine — Intel i5-12400F (6 cores,
 12 threads), 32 GB — over the loopback, with [`bench/`](../bench/README.md):
-relay-pp at 55ce8bb on media-pp e4a39241 (and again on f96bb6ae, below),
+relay-pp at 55ce8bb on media-pp e4a39241 (and again on f96bb6ae, and at
+6aa8188 with `retina`'s client, below),
 MediaMTX v1.20.1. One run of each,
 30 seconds measured.
 
@@ -85,19 +86,62 @@ picture. MediaMTX's median spread is the lower — about 40 ms to
 relay-pp's 70 — but at 25 and 100 players some of its players lost a
 picture and waited over a second for the next.
 
+## Pulling with `retina`'s client
+
+relay-pp at 6aa8188 pulls a camera with `retina`'s RTSP client, a task on
+its runtime, where it takes the camera, and with FFmpeg's where it does not.
+The stream above has Opus sound, which `retina` does not take, and the
+camera — media-pp's `rtsp_server` — gives no `rtptime` for a stream of two
+tracks: either sends relay-pp to FFmpeg's client. These runs are of the same
+pictures with no sound (`ffmpeg -i stream.mp4 -map 0:v -c copy`), which
+`retina` takes as it does an IP camera's; MediaMTX was measured again on
+them. Both OSes, the same machine; on Linux memory is resident memory.
+
+### Pulling cameras, nothing reading
+
+| | Channels | relay-pp CPU, FFmpeg's → `retina`'s | MediaMTX CPU | relay-pp memory, FFmpeg's → `retina`'s | MediaMTX memory | relay-pp threads |
+|---|---|---|---|---|---|---|
+| Windows | 50 | 200 → 13 | | 160 → 73 MB | | 65 → 13 |
+| | 100 | 312 → 27 | 116 | 266 → 109 MB | 102 MB | 115 → 13 |
+| | 200 | 353 → 43 | | 480 → 179 MB | | 215 → 13 |
+| Linux | 50 | 98 → 13 | | 256 → 88 MB | | 59 → 9 |
+| | 100 | 159 → 20 | 168 | 364 → 128 MB | 65 MB | 109 → 9 |
+| | 200 | 195 → 29 | | 1,287 → 212 MB | | 209 → 9 |
+
+FFmpeg's figures are those above, of the stream with sound. A hundred
+cameras now take a quarter of a core on Windows and a fifth on Linux, from
+three cores and one and a half — a tenth of it, and a fourth to an eighth of
+MediaMTX's. Every pull is a task on the runtime's two threads: the thread
+count no longer grows with the cameras. Memory is 0.7–0.9 MB a camera; on
+Linux the 1.3 GB of opening two hundred FFmpeg pulls at once is gone with
+FFmpeg's client.
+
+### Recording every camera
+
+| | Channels | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | written, relay-pp / MediaMTX |
+|---|---|---|---|---|---|---|
+| Windows | 50 | 64 | | 192 MB | | 200 Mbit/s |
+| | 100 | 107 | 197 | 335 MB | 288 MB | 425 / 399 Mbit/s |
+| | 200 | 126 | | 671 MB | | 800 Mbit/s |
+| Linux | 50 | 67 | | 200 MB | | 213 Mbit/s |
+| | 100 | 113 | 206 | 404 MB | 249 MB | 426 / 413 Mbit/s |
+| | 200 | 196 | | 801 MB | | 792 Mbit/s |
+
+Recording is now most of what a recorded camera costs — a pipeline and a
+thread of its own each, writing HLS — and still about half MediaMTX's
+processor time.
+
 ## What it says for relay-pp
 
-On Windows, below; on Linux, where it would run, further down.
-
+- **Pulling cameras costs a fraction of MediaMTX's processor time** with
+  `retina`'s client, on Windows as on Linux; FFmpeg's, which takes what
+  `retina` does not, costs twice MediaMTX's on Windows and about the same on
+  Linux.
 - **Sending to players is where it is strong**: RTSP for a fraction of
   MediaMTX's processor time, WebRTC for less and losing nothing — on Linux
   too, and with a steadier stream at scale.
-- **Pulling cameras costs twice MediaMTX's processor time on Windows**, all
-  of it FFmpeg's RTSP demuxer there; on Linux relay-pp pulls for less than
-  MediaMTX. Recording costs a little more than MediaMTX's on either.
-- **Memory per camera is the gap left**: a broadcast's retained stretch was
-  most of it and is now a second; what is left is what a pull of FFmpeg's
-  holds, and, on Linux, what opening every camera at once leaves behind.
+- **Memory per camera is the gap left**, smaller: about 1 MB a camera to
+  MediaMTX's 0.3–0.5, and about 3 MB a camera recorded, a pipeline each.
 
 ## On Linux
 

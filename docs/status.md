@@ -273,8 +273,7 @@ minute.
 What it costs against MediaMTX on Windows is in [benchmarks.md](benchmarks.md).
 
 Not yet: Ctrl+C on the binary, a real IP camera, a browser through WHEP or
-playing a recording, the costs on Linux, and a
-recording of hours.
+playing a recording, and a recording of hours.
 
 ## Not here yet
 

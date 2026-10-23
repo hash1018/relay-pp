@@ -249,8 +249,10 @@ the camera, FFmpeg playing over RTSP (TCP and UDP), two WHEP players through
 media-pp's `webrtc_load`, and reconnection after the camera was gone for a
 minute.
 
+What it costs against MediaMTX on Windows is in [benchmarks.md](benchmarks.md).
+
 Not yet: Ctrl+C on the binary, a real IP camera, a browser through WHEP or
-playing a recording, how many cameras one machine pulls and records, and a
+playing a recording, the costs on Linux, and a
 recording of hours.
 
 ## Not here yet

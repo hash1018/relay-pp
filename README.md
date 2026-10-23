@@ -9,6 +9,7 @@ Phases 1 and 2 are built — channels made over an HTTP API, each an RTSP camera
 pulled, played over RTSP and WebRTC (WHEP) and recorded as HLS.
 [docs/status.md](docs/status.md)
 is what it does now, in full, and what it does not yet;
+[docs/benchmarks.md](docs/benchmarks.md) measures it against MediaMTX;
 [docs/design.md](docs/design.md) is the agreed scope and the order the rest
 is built in.
 

@@ -6,7 +6,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 use media_pp::elements::VideoCodec;
@@ -91,10 +91,8 @@ fn opus_is_recorded_as_it_came_in_time_with_the_pictures() {
     assert_eq!(status, 201);
     wait_for("a recording", || server.status()[0].recording.is_some());
     assert!(conversions(&server).is_empty(), "fMP4 holds Opus");
-    std::thread::sleep(Duration::from_secs(3));
 
-    let media = find(&root, "media.m4s").expect("a recording's media file");
-    let (codecs, starts) = first_of_each(&media);
+    let (codecs, starts) = recorded(&root);
     assert_eq!(codecs, [Id::H264, Id::OPUS]);
     let apart = (starts[0] - starts[1]).abs();
     assert!(
@@ -150,17 +148,32 @@ fn find(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// [`first_of_each`] of the recording under `root`, once it has a packet of
+/// each: a recording begins at a keyframe that comes after it was asked
+/// for, the conversion's own among them, and is written a segment at a
+/// time.
+fn recorded(root: &Path) -> (Vec<Id>, Vec<f64>) {
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        if let Some(found) = find(root, "media.m4s").and_then(|media| first_of_each(&media)) {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a recording with pictures and sound within {WITHIN:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// The codecs of a file's pictures and sound, in that order, and where the
-/// first packet of each is, in seconds.
-fn first_of_each(path: &Path) -> (Vec<Id>, Vec<f64>) {
-    let mut input = media_pp::ffmpeg::format::input(path).expect("the recording opens");
+/// first packet of each is, in seconds — none while the file holds less.
+fn first_of_each(path: &Path) -> Option<(Vec<Id>, Vec<f64>)> {
+    let mut input = media_pp::ffmpeg::format::input(path).ok()?;
     let mut codecs = Vec::new();
     let mut indices = Vec::new();
     for kind in [media::Type::Video, media::Type::Audio] {
-        let stream = input
-            .streams()
-            .best(kind)
-            .expect("a picture and a sound track");
+        let stream = input.streams().best(kind)?;
         codecs.push(stream.parameters().id());
         indices.push(stream.index());
     }
@@ -178,13 +191,7 @@ fn first_of_each(path: &Path) -> (Vec<Id>, Vec<f64>) {
             break;
         }
     }
-    (
-        codecs,
-        starts
-            .into_iter()
-            .map(|start| start.expect("a packet of each"))
-            .collect(),
-    )
+    Some((codecs, starts.into_iter().collect::<Option<Vec<_>>>()?))
 }
 
 /// A camera of H.265 pictures, by whichever encoder this FFmpeg has.
@@ -243,10 +250,8 @@ fn vp8_is_recorded_as_h264_in_time_with_the_sound() {
     assert_eq!(status, 201);
     wait_for("a recording", || server.status()[0].recording.is_some());
     assert_eq!(conversions(&server), ["0:h264"]);
-    std::thread::sleep(Duration::from_secs(4));
 
-    let media = find(&root, "media.m4s").expect("a recording's media file");
-    let (codecs, starts) = first_of_each(&media);
+    let (codecs, starts) = recorded(&root);
     assert_eq!(codecs, [Id::H264, Id::AAC]);
     let apart = (starts[0] - starts[1]).abs();
     assert!(

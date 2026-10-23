@@ -163,6 +163,8 @@ fn a_listener_that_cannot_bind_stops_the_start_saying_which() {
         listen = "127.0.0.1:0"
         [webrtc]
         listen = "127.0.0.1:0"
+        [rtmp]
+        listen = "127.0.0.1:0"
         [http]
         listen = "{}"
         "#,

@@ -211,3 +211,52 @@ fn a_recording_is_watched_with_a_token_carried_on_in_its_urls() {
     server.stop();
     camera.stop();
 }
+
+#[test]
+fn publishers_present_a_token_that_lets_them_publish() {
+    let server = server_with(&auth(""));
+    for (name, publish) in [("studio", "rtmp"), ("browser", "whip")] {
+        let body = format!(r#"{{"name":"{name}","publish":"{publish}"}}"#);
+        let (status, _, answer) = http_as(
+            server.http_addr(),
+            "POST",
+            "/api/v1/channels",
+            Some(&body),
+            manager(),
+        );
+        assert_eq!(status, 201, "{answer}");
+    }
+    let rtmp = format!("rtmp://{}/live/studio", server.rtmp_addr());
+    assert!(
+        push(&rtmp, Push::Rtmp, None).unwrap().is_err(),
+        "nobody publishes"
+    );
+    let player = token(r#""play":["*"]"#);
+    assert!(
+        push(&format!("{rtmp}?token={player}"), Push::Rtmp, None)
+            .unwrap()
+            .is_err(),
+        "playing is not publishing"
+    );
+    let publisher = token(r#""publish":["studio","browser"]"#);
+    let pushed = push(&format!("{rtmp}?token={publisher}"), Push::Rtmp, None)
+        .unwrap()
+        .expect("a token that lets it publish");
+    wait_for("the publisher live", || {
+        server
+            .status()
+            .iter()
+            .any(|channel| channel.name == "studio" && channel.state == SourceState::Live)
+    });
+    pushed.stop();
+
+    let whip = format!("http://{}/browser/whip", server.http_addr());
+    if let Some(refused) = push(&whip, Push::Whip, None) {
+        assert!(refused.is_err(), "nobody publishes over WHIP");
+        let pushed = push(&whip, Push::Whip, Some(publisher))
+            .unwrap()
+            .expect("with its token");
+        pushed.stop();
+    }
+    server.stop();
+}

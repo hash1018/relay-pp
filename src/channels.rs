@@ -78,6 +78,7 @@ impl Channels {
             config,
             &self.record,
             self.convert,
+            &self.listeners,
             &self.runtime,
         )?);
         self.map

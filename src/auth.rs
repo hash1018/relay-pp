@@ -40,6 +40,8 @@ pub(crate) enum Right {
     Play,
     /// Watch and list its recordings.
     Recordings,
+    /// Publish into it, over RTSP, RTMP or WHIP.
+    Publish,
 }
 
 /// What a client presented to say who it is.
@@ -69,6 +71,7 @@ struct User {
     password: String,
     play: Vec<String>,
     recordings: Vec<String>,
+    publish: Vec<String>,
 }
 
 /// What a play token says.
@@ -81,6 +84,8 @@ struct Claims {
     play: Vec<String>,
     #[serde(default)]
     recordings: Vec<String>,
+    #[serde(default)]
+    publish: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +109,7 @@ impl Auth {
                     password: user.password.clone(),
                     play: user.play.clone(),
                     recordings: user.recordings.clone(),
+                    publish: user.publish.clone(),
                 })
                 .collect(),
         }
@@ -148,6 +154,7 @@ impl Auth {
             let patterns = match right {
                 Right::Play => &claims.play,
                 Right::Recordings => &claims.recordings,
+                Right::Publish => &claims.publish,
             };
             covers(patterns, channel)
         })
@@ -180,6 +187,7 @@ impl User {
         match right {
             Right::Play => covers(&self.play, channel),
             Right::Recordings => covers(&self.recordings, channel),
+            Right::Publish => covers(&self.publish, channel),
         }
     }
 }
@@ -291,6 +299,7 @@ pub(crate) mod tests {
                 password: "pw".to_owned(),
                 play: vec!["floor2-*".to_owned()],
                 recordings: vec![],
+                publish: vec![],
             }],
         })
     }

@@ -272,6 +272,8 @@ pub fn server_with(more: &str) -> Server {
         listen = "127.0.0.1:0"
         [http]
         listen = "127.0.0.1:0"
+        [rtmp]
+        listen = "127.0.0.1:0"
         {more}
         "#
     ))
@@ -330,7 +332,8 @@ pub fn silent_camera() -> std::net::TcpListener {
 pub fn pulling(name: &str, camera: SocketAddr) -> ChannelConfig {
     ChannelConfig {
         name: name.to_owned(),
-        source: format!("rtsp://{camera}/cam"),
+        source: Some(format!("rtsp://{camera}/cam")),
+        publish: None,
         transport: Transport::Tcp,
         client: Client::Auto,
         convert: ConvertChoice::default(),
@@ -408,4 +411,164 @@ pub fn rtsp_codecs(url: &str) -> Vec<ffmpeg::codec::Id> {
         .iter()
         .map(|stream| stream.parameters().id())
         .collect()
+}
+
+/// How a test's publisher pushes its stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Push {
+    Rtmp,
+    Rtsp,
+    Whip,
+}
+
+/// A publisher pushing to `url` over `over`, as OBS or an encoder would:
+/// pictures by OpenH264 and sound by AAC — Opus over WHIP, which carries no
+/// AAC — at their own pace. `token` goes as WHIP's Bearer token. `None`
+/// where this FFmpeg has no Opus encoder for WHIP; `Err` where the server
+/// refuses the publisher.
+pub fn push(
+    url: &str,
+    over: Push,
+    token: Option<String>,
+) -> Option<media_pp::Result<Arc<Pipeline>>> {
+    use media_pp::elements::{RtmpMuxer, RtspMuxer, WhipOptions, WhipPublisher};
+    let pictures_encoder = SwEncoder::new(
+        "push-encoder",
+        SwEncoderOptions {
+            codec: VideoCodec::OpenH264,
+            width: 320,
+            height: 240,
+            pixel_format: ffmpeg::format::Pixel::YUV420P,
+            frame_rate: ffmpeg::Rational::new(15, 1),
+            bit_rate: 300_000,
+            gop_size: 15,
+            max_b_frames: Some(0),
+        },
+    )
+    .expect("OpenH264 is always there");
+    let sound_encoder = SwAudioEncoder::new(
+        "push-sound-encoder",
+        SwAudioEncoderOptions {
+            codec: if over == Push::Whip {
+                AudioCodec::Opus
+            } else {
+                AudioCodec::Aac
+            },
+            sample_rate: 48_000,
+            channels: 1,
+            bit_rate: 64_000,
+        },
+    )
+    .ok()?;
+    let pictures = StreamInfo::from(&pictures_encoder);
+    let sound = StreamInfo::from(&sound_encoder);
+    let made = (|| -> media_pp::Result<Arc<Pipeline>> {
+        match over {
+            Push::Rtmp => {
+                let mut muxer = RtmpMuxer::create(url)?;
+                let (a, b) = (
+                    muxer.add_stream("pictures", pictures.clone())?,
+                    muxer.add_stream("sound", sound.clone())?,
+                );
+                let mut sinks = muxer.open()?;
+                pushing(
+                    pictures_encoder,
+                    sinks.take(a)?,
+                    sound_encoder,
+                    sinks.take(b)?,
+                )
+            }
+            Push::Rtsp => {
+                let mut muxer = RtspMuxer::create(
+                    url,
+                    RtspOptions {
+                        transport: RtspTransport::Tcp,
+                        timeout: Duration::from_secs(5),
+                    },
+                )?;
+                let (a, b) = (
+                    muxer.add_stream("pictures", pictures.clone())?,
+                    muxer.add_stream("sound", sound.clone())?,
+                );
+                let mut sinks = muxer.open()?;
+                pushing(
+                    pictures_encoder,
+                    sinks.take(a)?,
+                    sound_encoder,
+                    sinks.take(b)?,
+                )
+            }
+            Push::Whip => {
+                let mut publisher = WhipPublisher::create(
+                    "publisher",
+                    url,
+                    WhipOptions {
+                        bearer_token: token,
+                        ..WhipOptions::default()
+                    },
+                )?;
+                let a = publisher.add_track(pictures.parameters())?;
+                let b = publisher.add_track(sound.parameters())?;
+                let mut sinks = publisher.open()?;
+                pushing(
+                    pictures_encoder,
+                    sinks.take(a)?,
+                    sound_encoder,
+                    sinks.take(b)?,
+                )
+            }
+        }
+    })();
+    Some(made)
+}
+
+/// A pipeline of the test's own pictures and tone, encoded and written into
+/// `pictures_sink` and `sound_sink`.
+fn pushing<A, B, MA, MB>(
+    pictures_encoder: SwEncoder,
+    pictures_sink: A,
+    sound_encoder: SwAudioEncoder,
+    sound_sink: B,
+) -> media_pp::Result<Arc<Pipeline>>
+where
+    A: media_pp::element::IntoTerminal<MA>,
+    B: media_pp::element::IntoTerminal<MB>,
+{
+    let pictures = TestVideoSource::new(
+        "push-pictures",
+        TestVideoOptions {
+            width: 320,
+            height: 240,
+            frame_rate: ffmpeg::Rational::new(15, 1),
+        },
+    );
+    let tone = TestAudioSource::new(
+        "push-tone",
+        TestAudioOptions {
+            sample_rate: 48_000,
+            channels: 1,
+            ..TestAudioOptions::default()
+        },
+    );
+    let (builder, ()) = PipelineBuilder::new("publisher").add_source(pictures, |source, ctx| {
+        let branch = ctx
+            .branch()
+            .queue("push-encode", 4)
+            .pipe(pictures_encoder)
+            .to(pictures_sink)?;
+        ctx.attach(source, 0, branch)?;
+        Ok(())
+    })?;
+    let (builder, ()) = builder.add_source(tone, |source, ctx| {
+        let branch = ctx
+            .branch()
+            .queue("push-encode-sound", 8)
+            .pipe(sound_encoder)
+            .to(sound_sink)?;
+        ctx.attach(source, 0, branch)?;
+        Ok(())
+    })?;
+    let pipeline = builder.build();
+    pipeline.run()?;
+    Ok(pipeline)
 }

@@ -46,6 +46,9 @@ pub struct Config {
     /// The API, and WHEP.
     #[serde(default)]
     pub http: HttpConfig,
+    /// RTMP publishers: OBS, encoders.
+    #[serde(default)]
+    pub rtmp: RtmpConfig,
     /// Recording, for the channels made with `"record": true`.
     #[serde(default)]
     pub record: RecordConfig,
@@ -88,6 +91,9 @@ pub struct UserConfig {
     /// The channels whose recordings it watches.
     #[serde(default)]
     pub recordings: Vec<String>,
+    /// The channels it publishes into: over RTSP, RTMP or WHIP.
+    #[serde(default)]
+    pub publish: Vec<String>,
 }
 
 /// `[convert]`, and a channel's own say over it: what is converted for a
@@ -372,6 +378,29 @@ impl HttpConfig {
 }
 
 impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            listen: Self::default_listen(),
+        }
+    }
+}
+
+/// `[rtmp]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RtmpConfig {
+    /// Where RTMP publishers connect: `rtmp://<host>:1935/live/<channel>`.
+    #[serde(default = "RtmpConfig::default_listen")]
+    pub listen: SocketAddr,
+}
+
+impl RtmpConfig {
+    fn default_listen() -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], 1935))
+    }
+}
+
+impl Default for RtmpConfig {
     fn default() -> Self {
         Self {
             listen: Self::default_listen(),

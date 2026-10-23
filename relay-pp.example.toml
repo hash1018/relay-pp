@@ -28,6 +28,11 @@ candidates = ["192.168.0.10"]
 # The API, WHEP for browsers (POST /<name>/whep) and recordings.
 # listen = "0.0.0.0:8888"
 
+[rtmp]
+# Where RTMP publishers — OBS, encoders — connect, to a channel made with
+# "publish": "rtmp": rtmp://<host>:1935/live/<channel>.
+# listen = "0.0.0.0:1935"
+
 [record]
 # Where recordings go: <dir>/<name>/<YYYY-MM-DD>/<HH-MM-SS>/, in UTC, each an
 # HLS playlist and one media file.
@@ -68,3 +73,4 @@ candidates = ["192.168.0.10"]
 # password = "..."
 # play = ["*"]
 # recordings = ["floor2-*"]
+# publish = ["studio"]

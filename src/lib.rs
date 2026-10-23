@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use media_pp::driver::DriverRunner;
 use media_pp::elements::{
-    Access, Authorize, RtspServer, RtspServerOptions, WebRtcServer, WebRtcServerOptions,
+    Access, Authorize, RtmpServer, RtmpServerOptions, RtspServer, RtspServerOptions, WebRtcServer,
+    WebRtcServerOptions,
 };
 
 use channel::Listeners;
@@ -50,6 +51,7 @@ pub struct Server {
     listeners: Listeners,
     rtsp: Arc<DriverRunner>,
     webrtc: Arc<DriverRunner>,
+    rtmp: Arc<DriverRunner>,
     http_addr: SocketAddr,
     runtime: Option<tokio::runtime::Runtime>,
     http_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -75,18 +77,25 @@ impl Server {
                 "no [auth]: anybody who reaches a port may make and remove channels, play them and watch every recording"
             );
         }
-        // An RTSP player plays what it may, as the HTTP routes decide; none
-        // publishes.
-        let rtsp_authorize = auth.clone().map(|auth| {
+        // A player plays, and a publisher publishes, what it may, as the
+        // HTTP routes decide.
+        let authorize = |auth: &Arc<auth::Auth>, prefix: &'static str| {
+            let auth = Arc::clone(auth);
             Authorize::new(move |request| {
-                request.access == Access::Play
-                    && auth.allows(
-                        &auth::from_credentials(&request.credentials),
-                        auth::Right::Play,
-                        &request.path,
-                    )
+                let right = match request.access {
+                    Access::Play => auth::Right::Play,
+                    Access::Publish => auth::Right::Publish,
+                };
+                let channel = request.path.strip_prefix(prefix).unwrap_or(&request.path);
+                auth.allows(
+                    &auth::from_credentials(&request.credentials),
+                    right,
+                    channel,
+                )
             })
-        });
+        };
+        let rtsp_authorize = auth.as_ref().map(|auth| authorize(auth, ""));
+        let rtmp_authorize = auth.as_ref().map(|auth| authorize(auth, channel::RTMP_APP));
         let (rtsp, rtsp_handle) = RtspServer::bind(
             "rtsp",
             config.rtsp.listen,
@@ -106,15 +115,27 @@ impl Server {
         let (webrtc, webrtc_handle) =
             WebRtcServer::bind("webrtc", config.webrtc.listen, webrtc_options)
                 .map_err(|error| listen("webrtc.listen")(error.into()))?;
+        let (rtmp, rtmp_handle) = RtmpServer::bind(
+            "rtmp",
+            config.rtmp.listen,
+            RtmpServerOptions {
+                authorize: rtmp_authorize,
+                ..RtmpServerOptions::default()
+            },
+        )
+        .map_err(|error| listen("rtmp.listen")(error.into()))?;
         let listeners = Listeners {
             rtsp: rtsp_handle,
             webrtc: webrtc_handle,
+            rtmp: rtmp_handle,
         };
 
         let rtsp = DriverRunner::new(rtsp);
         rtsp.run().map_err(listen("rtsp"))?;
         let webrtc = DriverRunner::new(webrtc);
         webrtc.run().map_err(listen("webrtc"))?;
+        let rtmp = DriverRunner::new(rtmp);
+        rtmp.run().map_err(listen("rtmp"))?;
 
         // The API, WHEP, and every channel's source task: what waits, not
         // what carries media, which runs on threads of its own.
@@ -165,6 +186,7 @@ impl Server {
         tracing::info!(
             rtsp = %listeners.rtsp.local_addr(),
             webrtc = %listeners.webrtc.local_addr(),
+            rtmp = %listeners.rtmp.local_addr(),
             http = %http_addr,
             "listening"
         );
@@ -173,6 +195,7 @@ impl Server {
             listeners,
             rtsp,
             webrtc,
+            rtmp,
             http_addr,
             runtime: Some(runtime),
             http_stop: Some(http_stop),
@@ -187,6 +210,11 @@ impl Server {
     /// Where WebRTC media goes.
     pub fn webrtc_addr(&self) -> SocketAddr {
         self.listeners.webrtc.local_addr()
+    }
+
+    /// Where RTMP publishers connect.
+    pub fn rtmp_addr(&self) -> SocketAddr {
+        self.listeners.rtmp.local_addr()
     }
 
     /// Where the API and WHEP are.
@@ -241,6 +269,7 @@ impl Server {
             // let go of, which ends within a camera's timeout by itself.
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
         }
+        self.rtmp.stop();
         self.webrtc.stop();
         self.rtsp.stop();
     }

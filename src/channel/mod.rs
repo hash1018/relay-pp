@@ -31,7 +31,8 @@ pub(crate) use hub::Refusal;
 use sink::{ListenerSink, RecordStatus, Unready};
 pub(crate) use sink::{Listeners, Output, Recorder};
 use source::Source;
-pub use source::{Client, SourceState};
+pub use source::{Client, Publish, SourceState};
+pub(crate) use source::{RTMP_APP, whip_path};
 
 /// What a channel is made from: the body of `POST /api/v1/channels`.
 #[derive(Debug, Clone, Deserialize)]
@@ -40,9 +41,14 @@ pub struct ChannelConfig {
     /// What it goes by: `rtsp://host/<name>`, `/<name>/whep`, the API's
     /// `/api/v1/channels/<name>`.
     pub name: String,
-    /// Where the stream comes from: an `rtsp://` or `rtsps://` URL, pulled
-    /// for as long as the channel is there.
-    pub source: String,
+    /// Where the stream is pulled from, for as long as the channel is
+    /// there: an `rtsp://` or `rtsps://` URL. Or else `publish`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The protocol a publisher pushes the stream over — `"rtsp"`, `"rtmp"`
+    /// or `"whip"` — where it is pushed rather than pulled.
+    #[serde(default)]
+    pub publish: Option<Publish>,
     /// How the stream is pulled: over the RTSP connection (`"tcp"`, the
     /// default, which loses nothing) or `"udp"`.
     #[serde(default)]
@@ -75,14 +81,20 @@ impl ChannelConfig {
         if !valid_name(&self.name) {
             return Err(ChannelError::Name(self.name.clone()));
         }
-        let scheme = self.source.split("://").next().unwrap_or_default();
-        if !self.source.contains("://") || !matches!(scheme, "rtsp" | "rtsps") {
-            return Err(ChannelError::Source {
-                channel: self.name.clone(),
-                url: redact(&self.source),
-            });
+        match (&self.source, self.publish) {
+            (Some(source), None) => {
+                let scheme = source.split("://").next().unwrap_or_default();
+                if !source.contains("://") || !matches!(scheme, "rtsp" | "rtsps") {
+                    return Err(ChannelError::Source {
+                        channel: self.name.clone(),
+                        url: redact(source),
+                    });
+                }
+                Ok(())
+            }
+            (None, Some(_)) => Ok(()),
+            _ => Err(ChannelError::Input(self.name.clone())),
         }
-        Ok(())
     }
 }
 
@@ -101,6 +113,19 @@ pub enum ChannelError {
         channel: String,
         /// Its source, with any credentials cut out.
         url: String,
+    },
+    /// It names both a source to pull and a protocol to take a publisher
+    /// over, or neither.
+    #[error("channel {0}: a `source` to pull, or a protocol to `publish` over — one of them")]
+    Input(String),
+    /// Its source could not be made: a server would not take its
+    /// publisher.
+    #[error("channel {channel}: {error}")]
+    Intake {
+        /// The channel.
+        channel: String,
+        /// Why.
+        error: String,
     },
     /// There is a channel of that name already.
     #[error("channel {0} exists")]
@@ -215,17 +240,25 @@ struct Attached {
 
 impl Channel {
     /// Makes a channel of its source alone, and starts pulling it on
-    /// `runtime`.
+    /// `runtime` — or taking its publisher, on the one of `listeners` its
+    /// protocol is served by.
     pub(crate) fn start(
         config: &ChannelConfig,
         record: &RecordConfig,
         convert: ConvertConfig,
+        listeners: &Listeners,
         runtime: &Handle,
     ) -> Result<Self, ChannelError> {
         config.check()?;
         let convert = config.convert.over(convert);
         let hub = Hub::start(&config.name, convert, runtime);
-        let source = Source::new(&config.name, config, hub.publisher());
+        let source =
+            Source::new(&config.name, config, hub.publisher(), listeners).map_err(|error| {
+                ChannelError::Intake {
+                    channel: config.name.clone(),
+                    error,
+                }
+            })?;
         let channel = Self {
             name: config.name.clone(),
             source,
@@ -237,7 +270,7 @@ impl Channel {
             halted: AtomicBool::new(false),
         };
         channel.source.run(runtime);
-        tracing::info!(channel = %config.name, source = %redact(&config.source), "made");
+        tracing::info!(channel = %config.name, source = %channel.source.status().url, "made");
         Ok(channel)
     }
 
@@ -350,6 +383,7 @@ impl Channel {
                 (SourceState::Waiting, Some(error)) => {
                     format!("waiting to connect again: {error}")
                 }
+                (SourceState::AwaitingPublisher, _) => "no publisher publishes into it".to_owned(),
                 _ => "its camera is not live yet".to_owned(),
             },
         })
@@ -480,7 +514,8 @@ mod tests {
     fn config(name: &str, source: &str) -> ChannelConfig {
         ChannelConfig {
             name: name.to_owned(),
-            source: source.to_owned(),
+            source: Some(source.to_owned()),
+            publish: None,
             transport: Transport::Tcp,
             client: Client::Auto,
             convert: ConvertChoice::default(),

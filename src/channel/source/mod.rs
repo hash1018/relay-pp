@@ -1,8 +1,8 @@
 //! A channel's source: what takes its stream in and writes it into the
-//! channel's hub, through its [`Publisher`].
+//! channel's hub, through its [`Publisher`] — a camera pulled
+//! ([`PullSource`]), or a publisher taken ([`publish`]).
 //!
-//! The source here is a camera pulled over RTSP, connected again whenever
-//! it drops. Each connection is made by one of two clients: `retina`'s, a
+//! A camera is pulled over RTSP, connected again whenever it drops. Each connection is made by one of two clients: `retina`'s, a
 //! task on the runtime ([`retina`]), where it takes the camera — most do —
 //! and FFmpeg's, media-pp's `RtspSource` in a pipeline of its own
 //! ([`ffmpeg`]), where it does not. Both publish each connection's tracks
@@ -13,6 +13,7 @@
 //! hears a halt — is the source's task, holding no thread while it waits.
 
 mod ffmpeg;
+mod publish;
 mod retina;
 
 use std::collections::hash_map::RandomState;
@@ -27,8 +28,12 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use super::hub::Publisher;
+use super::sink::Listeners;
 use super::task::Task;
 use super::{ChannelConfig, Transport, redact};
+pub use publish::Publish;
+use publish::PublishSource;
+pub(crate) use publish::{RTMP_APP, whip_path};
 
 /// How long a camera has to answer, or to go on sending, before it is taken
 /// to be gone.
@@ -52,6 +57,8 @@ pub enum SourceState {
     Live,
     /// It failed, and is connected again after a wait.
     Waiting,
+    /// No publisher is publishing into it.
+    AwaitingPublisher,
 }
 
 /// Which RTSP client a channel's camera is pulled with — the body of
@@ -99,8 +106,62 @@ pub(in crate::channel) struct SourceStatus {
     pub(in crate::channel) client: Option<&'static str>,
 }
 
+/// A channel's source.
+pub(in crate::channel) enum Source {
+    Pull(PullSource),
+    Publish(PublishSource),
+}
+
+impl Source {
+    /// The source `config` says for the channel called `name`, writing
+    /// through `publisher`: a camera, nothing opened yet, or a publisher,
+    /// its server already taking one.
+    pub(in crate::channel) fn new(
+        name: &str,
+        config: &ChannelConfig,
+        publisher: Publisher,
+        listeners: &Listeners,
+    ) -> Result<Self, String> {
+        match (&config.source, config.publish) {
+            (Some(url), None) => Ok(Source::Pull(PullSource::new(name, url, config, publisher))),
+            (None, Some(protocol)) => {
+                PublishSource::new(name, protocol, publisher, listeners).map(Source::Publish)
+            }
+            _ => Err("a source to pull, or a protocol to take a publisher over".to_owned()),
+        }
+    }
+
+    pub(in crate::channel) fn run(&self, runtime: &Handle) {
+        match self {
+            Source::Pull(source) => source.run(runtime),
+            Source::Publish(source) => source.run(runtime),
+        }
+    }
+
+    pub(in crate::channel) fn status(&self) -> SourceStatus {
+        match self {
+            Source::Pull(source) => source.status(),
+            Source::Publish(source) => source.status(),
+        }
+    }
+
+    pub(in crate::channel) fn halt(&self) {
+        match self {
+            Source::Pull(source) => source.halt(),
+            Source::Publish(source) => source.halt(),
+        }
+    }
+
+    pub(in crate::channel) async fn wait(&self) {
+        match self {
+            Source::Pull(source) => source.wait().await,
+            Source::Publish(source) => source.wait().await,
+        }
+    }
+}
+
 /// A camera pulled by a task, into a hub.
-pub(in crate::channel) struct Source {
+pub(in crate::channel) struct PullSource {
     /// What the source's task shares with it.
     inner: Arc<Inner>,
     task: Task,
@@ -131,18 +192,14 @@ struct State {
     client: Option<Puller>,
 }
 
-impl Source {
-    /// A source for the channel called `name`, writing through `publisher`,
-    /// nothing opened yet.
-    pub(in crate::channel) fn new(
-        name: &str,
-        config: &ChannelConfig,
-        publisher: Publisher,
-    ) -> Self {
+impl PullSource {
+    /// A source for the channel called `name` pulling the camera at `url`,
+    /// writing through `publisher`, nothing opened yet.
+    fn new(name: &str, url: &str, config: &ChannelConfig, publisher: Publisher) -> Self {
         Self {
             inner: Arc::new(Inner {
                 name: name.to_owned(),
-                url: config.source.clone(),
+                url: url.to_owned(),
                 transport: match config.transport {
                     Transport::Tcp => RtspTransport::Tcp,
                     Transport::Udp => RtspTransport::Udp,

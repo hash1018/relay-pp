@@ -40,7 +40,8 @@ has them all with comments.
 | `webrtc.listen` | `0.0.0.0:8189` | the UDP address WebRTC media goes through |
 | `webrtc.candidates` | none | addresses players are told to send to — a router's public address, the machine's own where `listen` is every interface; an IP alone keeps `listen`'s port |
 | `webrtc.threads` | media-pp's default | how many threads WebRTC sessions are spread over, each a UDP port of its own from `listen`'s on |
-| `http.listen` | `0.0.0.0:8888` | the API, WHEP and recordings |
+| `http.listen` | `0.0.0.0:8888` | the API, WHEP, WHIP and recordings |
+| `rtmp.listen` | `0.0.0.0:1935` | where RTMP publishers connect |
 | `record.dir` | `recordings` | where recordings go |
 | `record.segment` | `"4s"` | how long a recorded segment is — what a player seeks to — cut at the next keyframe after it |
 | `record.chunk` | `"1h"` | how long one recording directory runs, at whole multiples of it in UTC |
@@ -50,7 +51,7 @@ has them all with comments.
 | `convert.video` | `"gpu"` | pictures a way out cannot carry: `"gpu"`, converted on a GPU and refused where none takes them; `"any"`, on the processor where no GPU does; `"off"`, that way out refused |
 | `auth.api_token` | none | what the manager presents for the API, 16 characters or more — see "Who may" |
 | `auth.token_secret` | none | what play tokens are signed with, HS256, 32 characters or more |
-| `auth.users` | none | players by `name` and `password`, each with the channels it may `play` live and watch the `recordings` of: names, or patterns with `*` |
+| `auth.users` | none | players by `name` and `password`, each with the channels it may `play` live, watch the `recordings` of and `publish` into: names, or patterns with `*` |
 
 Durations are a number and `ms`, `s`, `m`, `h` or `d`; sizes a number of
 bytes, or one with `KB` … `TB` (1000-based) or `KiB` … `TiB` (1024-based).
@@ -69,6 +70,7 @@ it starts. With it:
 | The API: make, remove, list channels; record | the manager | `Authorization: Bearer <api_token>` |
 | Play a channel live — over RTSP, or WebRTC through WHEP, and ask for its RTSP URL | a user whose `play` names it, or a play token whose `play` does | RTSP: `rtsp://user:password@…` (Digest, or Basic), or `rtsp://…/cam1?token=…`; WHEP and the API: `Bearer <token>` or `Basic` |
 | Watch a channel's recordings — list them, `/playback`, `/recordings/` | a user or a token whose `recordings` names it | `Bearer`, `Basic`, or `?token=` |
+| Publish into a channel — over RTSP, RTMP or WHIP | a user or a token whose `publish` names it | RTSP: as a player does; RTMP: `?token=` or `?user=&pass=` after the stream key; WHIP: `Bearer` |
 
 The API token lets its holder do anything, playing included. Anything else
 is answered `401`, saying what is taken.
@@ -110,20 +112,23 @@ and not `api`, `playback` or `recordings`.
 
 ```json
 { "name": "cam1", "source": "rtsp://user:pass@10.0.0.21/stream1", "transport": "tcp" }
+{ "name": "studio", "publish": "rtmp" }
 ```
 
 | Field | | |
 |---|---|---|
 | `name` | required | what it goes by: in the API, `rtsp://host:8554/<name>`, `/<name>/whep` |
-| `source` | required | an `rtsp://` or `rtsps://` URL |
+| `source` | this or `publish` | a camera to pull: an `rtsp://` or `rtsps://` URL |
+| `publish` | this or `source` | the protocol a publisher pushes the stream over: `"rtmp"`, `"rtsp"` or `"whip"` — see "A channel's publisher" |
 | `transport` | `"tcp"` | how the camera is pulled: `"tcp"`, RTP on the RTSP connection, which loses nothing; or `"udp"` |
 | `client` | `"auto"` | which RTSP client pulls it: `"auto"`, `retina`'s where it takes the camera and FFmpeg's where it does not (below); or `"ffmpeg"`, FFmpeg's always — for a camera `retina` takes but takes wrongly |
 | `convert` | the server's `[convert]` | its own say over it: `{"sound": "off", "video": "any"}`, each left out the server's |
 
 `201` with its status, `Location` its URL; `400` for a name or source that
-cannot be used, a field missing or unknown, or not JSON; `409` for a name
-taken. It answers at once; the camera is opened afterwards, and pulled from
-then on, played or not.
+cannot be used, both `source` and `publish` or neither, a field missing or
+unknown, or not JSON; `409` for a name taken. It answers at once; the camera
+is opened afterwards, and pulled from then on, played or not — or a
+publisher taken from then on.
 
 ### `DELETE /api/v1/channels/{name}` — remove one
 
@@ -157,6 +162,31 @@ there. Each is:
 | `convert` | what may be converted for it, its own say over the server's: `{"sound": "auto", "video": "gpu"}` |
 
 Credentials never reach an answer or a log line.
+
+## A channel's publisher
+
+A channel made with `publish` takes a publisher over that one protocol,
+from when it is made until it is removed:
+
+| `publish` | The publisher pushes to | As |
+|---|---|---|
+| `"rtmp"` | `rtmp://<host>:1935/live/<name>` — OBS's server `rtmp://<host>:1935/live` and stream key `<name>` | OBS, FFmpeg, an encoder |
+| `"rtsp"` | `rtsp://<host>:8554/<name>`, `ANNOUNCE` and `RECORD` — the URL its players play | an encoder, FFmpeg |
+| `"whip"` | `POST http://<host>:8888/<name>/whip`, an SDP offer; `DELETE` the `Location` it answers to leave | a browser, OBS's WHIP output |
+
+- One publisher at a time: another is refused while one publishes — `409`
+  over WHIP — and so is one over another protocol than the channel's.
+- Its status is `awaiting_publisher` until one publishes, `live` while it
+  does, and `awaiting_publisher` again once it leaves; `connections` counts
+  its publishers, and `client` names the protocol. Players stay connected
+  across a publisher leaving and the next arriving, as across a camera
+  dropping.
+- What it pushes is played and recorded as a camera's is, converted for
+  each way out that cannot carry it: OBS's AAC reaches WebRTC players as
+  Opus, a browser's Opus is recorded as AAC.
+- The server taking the publisher writes what it sends into a broadcast of
+  the channel's source's own, which the source reads into the channel as it
+  would a camera's connection: the channel has one source either way.
 
 ## A channel's camera
 
@@ -393,14 +423,14 @@ playing a recording, and a recording of hours.
 |---|---|
 | A player page, HLS live | 3 |
 | Hooks, metrics, a manager asked over HTTP who may play | 4 |
-| Published sources (RTSP, RTMP, WHIP), on-demand sources, forwarding, event recording | 5 |
+| On-demand sources, forwarding, event recording | 5 |
 | Packaging, a soak of a hundred cameras | 6 |
 
 Also not here: HTTPS — a token and a Basic password cross the network as
 they are, so put relay-pp behind a proxy that terminates TLS where the
 network is not trusted — changing a channel in place, taking a channel off a
-players' listener without removing it, any source other than an RTSP
-camera. A camera that comes back with other tracks than it had — another
+players' listener without removing it, a pulled source other than an
+RTSP camera, SRT. A camera that comes back with other tracks than it had — another
 codec, sound added or gone — ends its RTSP players' sessions, whose
 description no longer holds. One that changes its picture size partway
 through a connection is carried on to its players; its recording, which

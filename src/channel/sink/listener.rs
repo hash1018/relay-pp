@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use media_pp::elements::{
-    Broadcast, RtspPathMode, RtspServerHandle, WebRtcPathMode, WebRtcServerHandle,
+    Broadcast, RtmpServerHandle, RtspPathMode, RtspServerHandle, WebRtcPathMode, WebRtcServerHandle,
 };
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -22,11 +22,13 @@ use super::Output;
 use crate::channel::hub::{Fed, Hub, Refusal, Subscription};
 use crate::channel::task::Task;
 
-/// The listeners every channel's sinks are registered on.
+/// The listeners every channel shares: its players' — RTSP's and
+/// WebRTC's — and its publisher's, RTSP's, RTMP's or WebRTC's.
 #[derive(Clone)]
 pub(crate) struct Listeners {
     pub(crate) rtsp: RtspServerHandle,
     pub(crate) webrtc: WebRtcServerHandle,
+    pub(crate) rtmp: RtmpServerHandle,
 }
 
 /// Why players cannot reach a channel over a listener yet.

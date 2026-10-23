@@ -160,9 +160,41 @@ and all.
   and NVENC's buffers. Ten 1080p conversions at once took 69% of the one
   NVENC — about fourteen in all — and the driver opened every session asked
   for: where it stops, a conversion asked for after is refused (`"gpu"`).
-  What the processor spends beside the GPU's work has not been profiled.
 - Neither runs without a WebRTC player: a channel nobody watches over WebRTC
   converts nothing.
+
+### Where converting pictures spends the processor
+
+A program of its own (not in this repository) played the H.265 file into
+eight pipelines at its own pace, each decoding by D3D11VA and, but in the
+first row, encoding again by NVENC — on a D3D11 device of each pipeline's
+own, or one they all shared:
+
+| Eight 1080p pipelines | CPU | Memory | Threads |
+|---|---|---|---|
+| decode, one device shared | 54 | 392 MB | 32 |
+| decode and encode, one device shared | 65 | 886 MB | 33 |
+| decode and encode, a device each | 131 | 1,117 MB | 110 |
+
+NVENC itself costs the processor little — 1.4% of a core a stream — and a
+device of each conversion's own half of all it cost: every D3D11 device
+brings ten or so of its driver's threads and their work. Every pipeline
+kept its 25 pictures a second on one shared device. relay-pp now opens
+one device for the process, which every conversion shares;
+`watch N` again, the H.265 camera:
+
+| Channels | CPU, a device each → one shared | Memory | Threads |
+|---|---|---|---|
+| 1 | 21 → 19 | 201 → 202 MB | 31 → 31 |
+| 4 | 93 → 59 | 629 → 511 MB | 72 → 39 |
+| 8 | 152 → 128 | 1,174 → 925 MB | 128 → 51 |
+| 10 | 204 → 131 | 1,448 → 1,110 MB | 156 → 57 |
+
+Every player again played to the end, nothing lost; the camera took 30%
+in the run of eight against 5 to 20 in the others, which is that row's
+noise. What is left, about 8% of a core and 100 MB a conversion, is most of
+it decoding — reading and pacing the file and D3D11VA's work came to 54
+of the 65 above — and NVENC's and the decoder's own buffers.
 
 ## What it says for relay-pp
 

@@ -8,6 +8,8 @@ use media_pp::elements::{
     AudioCodec, DecodeTarget, EncodeInput, StreamInfo, SwAudioEncoder, SwAudioEncoderOptions,
     SwDecoder, VideoDecodeBin, VideoEncodeBin, VideoEncodeOptions,
 };
+use std::sync::Mutex;
+
 use media_pp::ffmpeg::Rational;
 
 use super::Refusal;
@@ -126,37 +128,52 @@ pub(super) fn pictures(
     })
 }
 
-/// Where pictures may be decoded to for conversion, the GPU first: each
-/// conversion a device of its own, so one's work does not wait on
-/// another's lock of a shared one.
+/// Where pictures may be decoded to for conversion, the GPU first.
 fn decode_targets(video: VideoConversion) -> Vec<DecodeTarget> {
-    let mut targets = Vec::new();
-    #[cfg(windows)]
-    if let Ok(gpu) = media_pp::elements::D3d11Gpu::new() {
-        targets.push(DecodeTarget::D3d11 {
-            gpu,
-            downstream_hw_frames: DOWNSTREAM_FRAMES,
-        });
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(device) = media_pp::elements::CudaDevice::new() {
-            targets.push(DecodeTarget::Cuda {
-                device,
-                downstream_hw_frames: DOWNSTREAM_FRAMES,
-            });
-        }
-        if let Ok(device) = media_pp::elements::VulkanDevice::new() {
-            targets.push(DecodeTarget::Vulkan {
-                device,
-                downstream_hw_frames: DOWNSTREAM_FRAMES,
-            });
-        }
-    }
+    let mut targets = gpus();
     if video == VideoConversion::Any {
         targets.push(DecodeTarget::System);
     }
     targets
+}
+
+/// The GPU devices pictures are converted on, opened once for the process
+/// and shared by every conversion. A device of each conversion's own cost
+/// twice the processor time, a quarter more memory and three times the
+/// threads — each brings ten or so of its driver's — for eight 1080p
+/// conversions on an RTX 3050 (`docs/benchmarks.md`), and sharing one held
+/// every one of them at its rate.
+fn gpus() -> Vec<DecodeTarget> {
+    static GPUS: Mutex<Option<Vec<DecodeTarget>>> = Mutex::new(None);
+    GPUS.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(|| {
+            let mut targets = Vec::new();
+            #[cfg(windows)]
+            if let Ok(gpu) = media_pp::elements::D3d11Gpu::new() {
+                targets.push(DecodeTarget::D3d11 {
+                    gpu,
+                    downstream_hw_frames: DOWNSTREAM_FRAMES,
+                });
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(device) = media_pp::elements::CudaDevice::new() {
+                    targets.push(DecodeTarget::Cuda {
+                        device,
+                        downstream_hw_frames: DOWNSTREAM_FRAMES,
+                    });
+                }
+                if let Ok(device) = media_pp::elements::VulkanDevice::new() {
+                    targets.push(DecodeTarget::Vulkan {
+                        device,
+                        downstream_hw_frames: DOWNSTREAM_FRAMES,
+                    });
+                }
+            }
+            targets
+        })
+        .clone()
 }
 
 /// What a converted stream of `width`×`height` at `per_second` pictures

@@ -93,24 +93,38 @@ relay-pp at 8ae7ef0 and after pulls every camera with media-pp's
 and no `retina`. Measured on the stream above, sound and all, on Windows,
 with media-pp at b0e91ec9 and 7607fede: the first, its sources parking on
 a bell rather than waiting in crossbeam, and its RTSP reading made cheap;
-the second, recording Opus as it came.
+the second, recording Opus as it came; the pull again with media-pp at
+4c6d2eae, whose broadcast keeps nothing while nobody reads it.
 
 ### Pulling cameras, nothing reading
 
+With media-pp at 4c6d2eae, both servers measured in one sitting, each
+figure of 100 twice:
+
 | Channels | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | relay-pp threads | MediaMTX threads |
 |---|---|---|---|---|---|---|
-| 50 | 53 | 75 | 113 MB | 89 MB | 114 | 21 |
-| 100 | 58 | 122 | 187 MB | 101 MB | 214 | 21 |
-| 200 | 75 | 135 | 340 MB | 142 MB | 414 | 20 |
+| 50 | 61–63 | 118 | 56 MB | 87 MB | 114 | 20 |
+| 100 | 90–99 | 198–209 | 72 MB | 102–103 MB | 214 | 20–22 |
+| 200 | 102 | 253 | 110 MB | 136 MB | 414 | 21 |
 
-Half of MediaMTX's processor, and under twice its memory: each camera is
-a pipeline of two threads, the session read on one and handed on by the
-other, and its broadcast keeps a second of it. Before b0e91ec9 the same
-pull took 294 at 100: two thirds of it was waiting — a crossbeam `Select`
-spins and yields before every park, and a camera's source waits seventy
-times a second — and the rest the heap, a second of pictures in blocks of
-every size. The `retina` figures below are of the pictures alone, a
-picture a packet where this stream is a picture and two sounds.
+With 7607fede, a sitting before, when the machine was less busy — MediaMTX
+took 122 at 100 then, against 200 here:
+
+| Channels | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory |
+|---|---|---|---|---|
+| 50 | 53 | 75 | 113 MB | 89 MB |
+| 100 | 58 | 122 | 187 MB | 101 MB |
+| 200 | 75 | 135 | 340 MB | 142 MB |
+
+Half of MediaMTX's processor in either sitting, each camera a pipeline of
+two threads, the session read on one and handed on by the other. The
+memory was the second each broadcast kept for a reader to start at; kept
+only while somebody reads, it is now under MediaMTX's. Before b0e91ec9 the
+same pull took 294 at 100: two thirds of it was waiting — a crossbeam
+`Select` spins and yields before every park, and a camera's source waits
+seventy times a second — and the rest the heap, a second of pictures in
+blocks of every size. The `retina` figures below are of the pictures
+alone, a picture a packet where this stream is a picture and two sounds.
 
 ### Recording every camera
 
@@ -118,6 +132,9 @@ picture a packet where this stream is a picture and two sounds.
 |---|---|---|---|---|---|---|
 | 100 | pictures and Opus | 207 | 250 | 444 MB | 281 MB | 411 / 414 Mbit/s |
 | 100 | pictures alone | 184 | 204 | 426 MB | 265 MB | 404 / 399 Mbit/s |
+| 100 | pictures and Opus, 4c6d2eae, the busier sitting | 238 | 317 | 400 MB | 280 MB | 412 / 413 Mbit/s |
+
+A recording reads its broadcast, so the second is kept for it still.
 
 Both record the stream as it came, Opus included, in fMP4: a track is
 converted for a recording only where fMP4 cannot hold it. Converting the

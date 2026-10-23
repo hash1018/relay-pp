@@ -285,6 +285,10 @@ impl Inner {
                         "retina does not take this camera ({why}); FFmpeg's client pulls it"
                     );
                     self.ffmpeg_only.store(true, Ordering::Release);
+                    // What retina may have had live has ended: nothing waits
+                    // on it while FFmpeg's client opens the camera.
+                    self.runs.send_replace(None);
+                    self.set(SourceState::Connecting, None);
                 }
             }
         }

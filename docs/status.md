@@ -182,7 +182,7 @@ from when it is made until it is removed:
   dropping.
 - What it pushes is played and recorded as a camera's is, converted for
   each way out that cannot carry it: OBS's AAC reaches WebRTC players as
-  Opus, a browser's Opus is recorded as AAC.
+  Opus; a browser's Opus is recorded as it came.
 - The server taking the publisher writes what it sends into a broadcast of
   the channel's source's own, which the source reads into the channel as it
   would a camera's connection: the channel has one source either way.
@@ -274,7 +274,9 @@ What is written:
   begun again 5 seconds later.
 - Each recording is a media-pp pipeline on a thread of its own, so a disk
   slow to take a write holds up that camera's recording and no other.
-- Sound in a codec other than AAC is recorded converted to AAC — see
+- A track is recorded as it came wherever fMP4 holds it — Opus, VP9 and
+  AV1 among them — and converted where it does not: VP8 to H.264, G.711
+  to AAC (Safari's own player plays no Opus; hls.js does) — see
   "Conversions" below.
 
 ### `GET /api/v1/recordings/{name}`
@@ -314,7 +316,7 @@ play.
 |---|---|---|
 | RTSP | what RTP carries: H.264, H.265, VP8, VP9, MJPEG, MPEG-4; AAC, Opus, G.711, MP3 and more — not AV1 nor AC-3 | H.264; AAC |
 | WebRTC | H.264 without B-frames, VP8, VP9, AV1; Opus, G.711 | H.264; Opus |
-| Recording | H.264, H.265; AAC | H.264; AAC |
+| Recording | what fMP4 holds: H.264, H.265, VP9, AV1, MJPEG; AAC, Opus, MP3 — not VP8 nor G.711 | H.264; AAC |
 
 A camera over RTSP sends nothing RTSP cannot carry; what is converted for
 RTSP players is for a source of another kind, which relay-pp has none of
@@ -387,7 +389,7 @@ name; a removal of a camera being opened answering at once and holding up
 no add; a stop with ten cameras opening waiting for none of them. Played
 and followed alike pulled over TCP and over UDP; a camera of two tracks
 relayed with both; and one sending B-frames relayed, said to reorder. A camera's AAC played
-over WebRTC as Opus and over RTSP as it came; its Opus recorded as AAC in
+over WebRTC as Opus and over RTSP as it came; its Opus recorded as it came, in
 time with its pictures; a conversion stopping once no WebRTC player has
 played it for a while, and made again for the next; what WebRTC players
 read moved back to the channel's own broadcast when its camera came back

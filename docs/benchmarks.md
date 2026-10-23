@@ -2,8 +2,8 @@
 
 Measured 2026-10-23 on one Windows 11 machine — Intel i5-12400F (6 cores,
 12 threads), 32 GB — over the loopback, with [`bench/`](../bench/README.md):
-relay-pp at 55ce8bb on media-pp e4a39241 (and again on f96bb6ae, and at
-6aa8188 with `retina`'s client, below),
+relay-pp at 55ce8bb on media-pp e4a39241 (and again on f96bb6ae, at
+6aa8188 with `retina`'s client, and on media-pp's own client, below),
 MediaMTX v1.20.1. One run of each,
 30 seconds measured.
 
@@ -85,6 +85,43 @@ processor time at 100, with half its memory, and no player of it lost a
 picture. MediaMTX's median spread is the lower — about 40 ms to
 relay-pp's 70 — but at 25 and 100 players some of its players lost a
 picture and waited over a second for the next.
+
+## Pulling with media-pp's own RTSP client
+
+relay-pp at 8ae7ef0 and after pulls every camera with media-pp's
+`RtspSource`, an RTSP client of media-pp's own since dbc47b08: no FFmpeg,
+and no `retina`. Measured on the stream above, sound and all, on Windows,
+with media-pp at b0e91ec9 and 7607fede: the first, its sources parking on
+a bell rather than waiting in crossbeam, and its RTSP reading made cheap;
+the second, recording Opus as it came.
+
+### Pulling cameras, nothing reading
+
+| Channels | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | relay-pp threads | MediaMTX threads |
+|---|---|---|---|---|---|---|
+| 50 | 53 | 75 | 113 MB | 89 MB | 114 | 21 |
+| 100 | 58 | 122 | 187 MB | 101 MB | 214 | 21 |
+| 200 | 75 | 135 | 340 MB | 142 MB | 414 | 20 |
+
+Half of MediaMTX's processor, and under twice its memory: each camera is
+a pipeline of two threads, the session read on one and handed on by the
+other, and its broadcast keeps a second of it. Before b0e91ec9 the same
+pull took 294 at 100: two thirds of it was waiting — a crossbeam `Select`
+spins and yields before every park, and a camera's source waits seventy
+times a second — and the rest the heap, a second of pictures in blocks of
+every size. The `retina` figures below are of the pictures alone, a
+picture a packet where this stream is a picture and two sounds.
+
+### Recording every camera
+
+| Channels | Stream | relay-pp CPU | MediaMTX CPU | relay-pp memory | MediaMTX memory | written, relay-pp / MediaMTX |
+|---|---|---|---|---|---|---|
+| 100 | pictures and Opus | 207 | 250 | 444 MB | 281 MB | 411 / 414 Mbit/s |
+| 100 | pictures alone | 184 | 204 | 426 MB | 265 MB | 404 / 399 Mbit/s |
+
+Both record the stream as it came, Opus included, in fMP4: a track is
+converted for a recording only where fMP4 cannot hold it. Converting the
+Opus to AAC, as relay-pp did before, took 501 at 100.
 
 ## Pulling with `retina`'s client
 

@@ -91,11 +91,13 @@ fn webrtc_carries(track: &StreamInfo) -> bool {
     played && WebRtcServer::carries(track)
 }
 
-/// What HLS of fMP4 holds and an HLS player plays: H.264 or H.265
-/// pictures, AAC sound.
+/// What HLS of fMP4 holds: a track is recorded as it came wherever it
+/// can be — Opus, VP9 and AV1 among them — and converted only where it
+/// cannot: VP8, G.711. That a player plays what is recorded is the
+/// player's: Safari's own does not play Opus, hls.js in a browser that
+/// does, does.
 fn record_carries(track: &StreamInfo) -> bool {
-    matches!(track.parameters().id(), Id::H264 | Id::HEVC | Id::AAC)
-        && HlsMuxer::carries(track, HlsSegmentFormat::Fmp4)
+    HlsMuxer::carries(track, HlsSegmentFormat::Fmp4)
 }
 
 #[cfg(test)]
@@ -174,11 +176,13 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_carries_what_an_hls_player_plays() {
+    fn a_recording_carries_what_fmp4_holds() {
         for track in [
             video(Id::H264),
             video(Id::HEVC),
+            video(Id::VP9),
             audio(Id::AAC),
+            audio(Id::OPUS),
             reordering(),
         ] {
             assert!(
@@ -187,7 +191,7 @@ mod tests {
                 track.parameters().id()
             );
         }
-        for track in [audio(Id::OPUS), audio(Id::PCM_MULAW), video(Id::VP8)] {
+        for track in [audio(Id::PCM_MULAW), video(Id::VP8)] {
             assert!(
                 !carried(Output::Record, &track),
                 "{:?}",

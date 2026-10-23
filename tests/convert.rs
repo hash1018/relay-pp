@@ -68,7 +68,7 @@ fn aac_reaches_webrtc_players_as_opus_and_rtsp_players_as_it_is() {
 }
 
 #[test]
-fn opus_is_recorded_as_aac_in_time_with_the_pictures() {
+fn opus_is_recorded_as_it_came_in_time_with_the_pictures() {
     let Some(camera) = Camera::with_opus("127.0.0.1:0".parse().unwrap()) else {
         eprintln!("skipping: no libopus in this FFmpeg");
         return;
@@ -90,12 +90,12 @@ fn opus_is_recorded_as_aac_in_time_with_the_pictures() {
     );
     assert_eq!(status, 201);
     wait_for("a recording", || server.status()[0].recording.is_some());
-    assert_eq!(conversions(&server), ["1:aac"]);
+    assert!(conversions(&server).is_empty(), "fMP4 holds Opus");
     std::thread::sleep(Duration::from_secs(3));
 
     let media = find(&root, "media.m4s").expect("a recording's media file");
     let (codecs, starts) = first_of_each(&media);
-    assert_eq!(codecs, [Id::H264, Id::AAC]);
+    assert_eq!(codecs, [Id::H264, Id::OPUS]);
     let apart = (starts[0] - starts[1]).abs();
     assert!(
         apart < 0.5,

@@ -35,7 +35,7 @@ use media_pp::bus::BusEvent;
 use media_pp::elements::{Broadcast, BroadcastOptions, BroadcastSink, BroadcastStats, StreamInfo};
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 use super::task::Task;
 use crate::config::ConvertConfig;
@@ -70,6 +70,23 @@ pub(crate) enum Fed {
     Idle,
     Live(Feed),
     /// What the sink needs cannot be made, or is not to be: why.
+    Failed(Refusal),
+}
+
+/// Why what a sink needs is not made.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Refusal {
+    /// Its pictures are in a codec it does not carry, on a channel that
+    /// converts none: so for as long as the channel is.
+    #[error("its pictures, in {codec}, are not carried by {sink} and are not to be converted")]
+    NotConverted { sink: &'static str, codec: String },
+    /// No GPU encoder opened for pictures a channel converts on the GPU
+    /// alone — none there, or each of its sessions taken: one may be free
+    /// later.
+    #[error("no GPU encoder is free to convert its pictures: {0}")]
+    NoGpu(String),
+    /// A conversion could not be made.
+    #[error("cannot convert: {0}")]
     Failed(String),
 }
 
@@ -108,6 +125,9 @@ struct Shared {
     /// What the pipeline converts now, as the status names it.
     converting: Mutex<Vec<String>>,
     next_subscription: AtomicU64,
+    /// Rung where a sink cannot go on with the run live — see
+    /// [`Subscription::renew`].
+    renew: Notify,
 }
 
 /// A channel's hub, run by a task of its own.
@@ -127,7 +147,7 @@ pub(crate) struct Publisher {
 pub(crate) struct Subscription {
     id: u64,
     profile: &'static str,
-    commands: mpsc::UnboundedSender<Command>,
+    shared: Arc<Shared>,
     fed: watch::Receiver<Fed>,
 }
 
@@ -145,6 +165,7 @@ impl Hub {
             feeds: Mutex::default(),
             converting: Mutex::default(),
             next_subscription: AtomicU64::new(0),
+            renew: Notify::new(),
         });
         let hubbing = Hubbing {
             shared: Arc::clone(&shared),
@@ -200,7 +221,7 @@ impl Hub {
         Subscription {
             id,
             profile: profile.name,
-            commands: self.shared.commands.clone(),
+            shared: Arc::clone(&self.shared),
             fed,
         }
     }
@@ -240,6 +261,12 @@ impl Publisher {
     pub(crate) fn ended(&self) {
         self.shared.runs.send_replace(None);
     }
+
+    /// Waits for a sink to say it cannot go on with the run live: what the
+    /// source sends is to be described anew, and a run begun of it.
+    pub(crate) async fn renewal(&self) {
+        self.shared.renew.notified().await;
+    }
 }
 
 impl Subscription {
@@ -251,13 +278,21 @@ impl Subscription {
     /// A player is coming: what is made for it is started again where it
     /// had stopped, and tried again where it could not be made.
     pub(crate) fn wake(&self) {
-        let _ = self.commands.send(Command::Wake(self.profile));
+        let _ = self.shared.commands.send(Command::Wake(self.profile));
+    }
+
+    /// It cannot go on with the run live — a recording refused pictures
+    /// that changed size partway, which the run's description no longer
+    /// holds for — and the source is to begin another, described anew.
+    /// Nothing where the source is not listening for it.
+    pub(crate) fn renew(&self) {
+        self.shared.renew.notify_waiters();
     }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Unsubscribe(self.id));
+        let _ = self.shared.commands.send(Command::Unsubscribe(self.id));
     }
 }
 
@@ -491,7 +526,7 @@ impl Hubbing {
 
     /// Has the broadcast of `read`'s tracks written, by the pipeline — made
     /// first, where none runs — unless it is already.
-    fn write(&mut self, read: &[TrackFrom], infos: &[StreamInfo], run: u64) -> Result<(), String> {
+    fn write(&mut self, read: &[TrackFrom], infos: &[StreamInfo], run: u64) -> Result<(), Refusal> {
         if self
             .running
             .as_ref()
@@ -534,7 +569,7 @@ impl Hubbing {
         });
         let sinks = broadcast
             .publish(&tracks)
-            .map_err(|error| format!("cannot publish: {error}"))?;
+            .map_err(|error| Refusal::Failed(format!("cannot publish: {error}")))?;
         *published += 1;
         running.write(read, sinks)?;
         tracing::info!(channel = %name, broadcast = %broadcast.name(), run, "converting");

@@ -27,7 +27,8 @@ use tokio::runtime::Handle;
 
 use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
 use hub::Hub;
-use sink::{ListenerSink, RecordStatus};
+pub(crate) use hub::Refusal;
+use sink::{ListenerSink, RecordStatus, Unready};
 pub(crate) use sink::{Listeners, Output, Recorder};
 use source::Source;
 pub use source::{Client, SourceState};
@@ -126,6 +127,26 @@ pub enum AttachError {
         /// Why.
         error: String,
     },
+}
+
+/// Why players cannot play a channel yet, or at all.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PlayError {
+    /// There is no channel of that name — or it is being removed.
+    #[error("no channel {0}")]
+    NoChannel(String),
+    /// Its camera is not live: connecting, or waiting to connect again.
+    #[error("channel {channel}: {reason}")]
+    NotLive { channel: String, reason: String },
+    /// Its camera is live, and what the players read is not made yet.
+    #[error("channel {channel}: not ready yet")]
+    NotReady { channel: String },
+    /// What the players read is not made, and why.
+    #[error("channel {channel}: {refusal}")]
+    Refused { channel: String, refusal: Refusal },
+    /// The players' listener would not take the channel.
+    #[error("channel {channel}: {error}")]
+    Listener { channel: String, error: String },
 }
 
 /// A channel's status, as the API gives it.
@@ -272,11 +293,12 @@ impl Channel {
         output: Output,
         listeners: &Listeners,
         within: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), PlayError> {
+        let channel = || self.name.clone();
         let sink = {
             let mut attached = self
                 .attached_unless_halted()
-                .map_err(|error| error.to_string())?;
+                .map_err(|_| PlayError::NoChannel(channel()))?;
             match attached.listened.get(&output) {
                 Some(sink) => Arc::clone(sink),
                 None => {
@@ -287,21 +309,32 @@ impl Channel {
                         listeners,
                         &self.runtime,
                     )
-                    .ok_or_else(|| format!("no listener serves {}", output.name()))?;
+                    .ok_or_else(|| PlayError::Listener {
+                        channel: channel(),
+                        error: format!("no listener serves {}", output.name()),
+                    })?;
                     let sink = Arc::new(sink);
                     attached.listened.insert(output, Arc::clone(&sink));
                     sink
                 }
             }
         };
-        sink.ready(within)
-            .await
-            .map_err(|reason| format!("channel {}: {reason}", self.name))
+        sink.ready(within).await.map_err(|unready| match unready {
+            Unready::NotYet => PlayError::NotReady { channel: channel() },
+            Unready::Refused(refusal) => PlayError::Refused {
+                channel: channel(),
+                refusal,
+            },
+            Unready::Listener(error) => PlayError::Listener {
+                channel: channel(),
+                error,
+            },
+        })
     }
 
     /// Waits, up to `within`, for its source to be live — at once where it
     /// is — or says what it is doing instead.
-    pub(crate) async fn live(&self, within: Duration) -> Result<(), String> {
+    pub(crate) async fn live(&self, within: Duration) -> Result<(), PlayError> {
         let mut runs = self.hub.runs();
         let live = tokio::time::timeout(within, async {
             runs.wait_for(Option::is_some).await.is_ok()
@@ -311,11 +344,14 @@ impl Channel {
             return Ok(());
         }
         let status = self.source.status();
-        Err(match (status.state, status.error) {
-            (SourceState::Waiting, Some(error)) => {
-                format!("channel {}: waiting to connect again: {error}", self.name)
-            }
-            _ => format!("channel {}: its camera is not live yet", self.name),
+        Err(PlayError::NotLive {
+            channel: self.name.clone(),
+            reason: match (status.state, status.error) {
+                (SourceState::Waiting, Some(error)) => {
+                    format!("waiting to connect again: {error}")
+                }
+                _ => "its camera is not live yet".to_owned(),
+            },
         })
     }
 
@@ -330,7 +366,6 @@ impl Channel {
             &self.name,
             self.hub
                 .subscribe(Output::Record.profile(), Output::Record.demand()),
-            self.source.reconnect(),
             &self.record,
             &self.runtime,
         ));

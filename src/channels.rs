@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 
-use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, Listeners, Output};
+use crate::channel::{
+    AttachError, Channel, ChannelConfig, ChannelError, Listeners, Output, PlayError,
+};
 use crate::config::{ConvertConfig, RecordConfig};
 
 pub(crate) struct Channels {
@@ -98,7 +100,7 @@ impl Channels {
         channel: &Channel,
         output: Output,
         within: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), PlayError> {
         channel.ready(output, &self.listeners, within).await
     }
 

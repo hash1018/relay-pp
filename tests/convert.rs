@@ -314,7 +314,10 @@ fn a_channel_pictures_are_not_converted_for_refuses_webrtc_saying_why() {
     settled(&server);
 
     let (status, answer) = offered(&server);
-    assert_eq!(status, 503, "{answer}");
+    assert_eq!(
+        status, 409,
+        "refused for as long as the channel is: {answer}"
+    );
     assert!(answer.contains("not to be converted"), "{answer}");
     assert!(conversions(&server).is_empty());
     let url = play_rtsp(server.http_addr(), "cam1");

@@ -12,6 +12,7 @@ use media_pp::elements::{Broadcast, BroadcastSource, StreamInfo, TeeHandle};
 use media_pp::graph::BranchId;
 use media_pp::pipeline::Pipeline;
 
+use super::Refusal;
 use super::media::{self, FromKeyframe};
 use super::plan::{Plan, Target, TrackFrom};
 use crate::config::VideoConversion;
@@ -42,9 +43,9 @@ pub(super) struct Conversion {
 impl Running {
     /// A pipeline reading `original`, each of its tracks into a `Tee` of
     /// its own with nothing after it yet.
-    pub(super) fn start(name: &str, original: &Broadcast) -> Result<Self, String> {
+    pub(super) fn start(name: &str, original: &Broadcast) -> Result<Self, Refusal> {
         let (source, tracks) = BroadcastSource::new(format!("{name}-convert"), original)
-            .map_err(|error| format!("cannot read the source: {error}"))?;
+            .map_err(|error| Refusal::Failed(format!("cannot read the source: {error}")))?;
         let (pipeline, (context, inputs)) =
             Pipeline::new(format!("{name}-convert"), source, |source, ctx| {
                 let mut inputs = Vec::new();
@@ -57,10 +58,10 @@ impl Running {
                 }
                 Ok((Arc::clone(ctx), inputs))
             })
-            .map_err(|error| format!("cannot wire the conversions: {error}"))?;
+            .map_err(|error| Refusal::Failed(format!("cannot wire the conversions: {error}")))?;
         pipeline
             .run()
-            .map_err(|error| format!("cannot start the conversions: {error}"))?;
+            .map_err(|error| Refusal::Failed(format!("cannot start the conversions: {error}")))?;
         Ok(Self {
             pipeline,
             context,
@@ -79,7 +80,7 @@ impl Running {
         target: Target,
         info: &StreamInfo,
         video: VideoConversion,
-    ) -> Result<(), String> {
+    ) -> Result<(), Refusal> {
         if self.conversions.contains_key(&(index, target)) {
             return Ok(());
         }
@@ -88,11 +89,11 @@ impl Running {
             .context
             .tee(format!("converted-{label}"))
             .build_dynamic()
-            .map_err(|error| format!("cannot wire a conversion: {error}"))?;
+            .map_err(|error| Refusal::Failed(format!("cannot wire a conversion: {error}")))?;
         let input = &self.inputs[index];
         let chain = input
             .branch()
-            .map_err(|error| format!("cannot wire a conversion: {error}"))?
+            .map_err(|error| Refusal::Failed(format!("cannot wire a conversion: {error}")))?
             .queue(format!("convert-{label}"), CONVERT_QUEUE);
         let (built, converted) = match target {
             Target::Opus | Target::Aac => {
@@ -117,7 +118,7 @@ impl Running {
         };
         let branch = built
             .and_then(|branch| input.attach(branch))
-            .map_err(|error| format!("cannot wire a conversion: {error}"))?;
+            .map_err(|error| Refusal::Failed(format!("cannot wire a conversion: {error}")))?;
         self.conversions.insert(
             (index, target),
             Conversion {
@@ -135,7 +136,7 @@ impl Running {
         &mut self,
         read: &[TrackFrom],
         sinks: Vec<media_pp::elements::BroadcastSink>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Refusal> {
         let mut branches = Vec::new();
         for (track, sink) in read.iter().zip(sinks) {
             let tee = match *track {
@@ -146,7 +147,7 @@ impl Running {
                 .branch()
                 .and_then(|chain| chain.to(sink))
                 .and_then(|branch| tee.attach(branch))
-                .map_err(|error| format!("cannot wire the broadcast: {error}"))?;
+                .map_err(|error| Refusal::Failed(format!("cannot wire the broadcast: {error}")))?;
             branches.push((tee.clone(), branch));
         }
         self.written.insert(read.to_vec(), branches);

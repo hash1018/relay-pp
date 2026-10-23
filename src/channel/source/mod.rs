@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use media_pp::elements::RtspTransport;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use super::hub::Publisher;
 use super::task::Task;
@@ -121,9 +121,6 @@ struct Inner {
     /// another where a camera changes its pictures partway.
     publisher: Publisher,
     state: Mutex<State>,
-    /// Rung to end the live connection and open the camera again at once —
-    /// see [`Source::reconnect`].
-    reconnect: Arc<Notify>,
 }
 
 struct State {
@@ -160,19 +157,9 @@ impl Source {
                     connections: 0,
                     client: None,
                 }),
-                reconnect: Arc::new(Notify::new()),
             }),
             task: Task::new(),
         }
-    }
-
-    /// What ends the live connection and opens the camera again at once,
-    /// without a wait: for a reader that cannot go on with what the
-    /// connection began as — a recording of a camera that changed its
-    /// picture size, which a new connection describes anew. Nothing where
-    /// no connection is live.
-    pub(in crate::channel) fn reconnect(&self) -> Arc<Notify> {
-        Arc::clone(&self.inner.reconnect)
     }
 
     /// Starts pulling the camera on `runtime`, connecting again whenever it

@@ -186,7 +186,7 @@ impl Connection<'_> {
     }
 
     /// The next item, or how the connection ended: a camera silent for its
-    /// timeout, a halt, a reconnection asked for.
+    /// timeout, a halt, a sink asking for a run described anew.
     async fn next(
         &self,
         demuxed: &mut Demuxed,
@@ -203,7 +203,7 @@ impl Connection<'_> {
                 ))),
             },
             () = halted(halt) => Err(Ended::Halted),
-            () = self.inner.reconnect.notified() => Err(Ended::Reconnect),
+            () = self.inner.publisher.renewal() => Err(Ended::Reconnect),
         }
     }
 

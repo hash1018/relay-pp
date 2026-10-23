@@ -43,7 +43,9 @@ pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -
     let ended = tokio::select! {
         reason = watch_bus(&pipeline) => Ended::Failed(reason),
         () = halted(halt) => Ended::Halted,
-        () = inner.reconnect.notified() => Ended::Reconnect,
+        // A sink cannot go on with this run: a new connection describes
+        // the camera anew.
+        () = inner.publisher.renewal() => Ended::Reconnect,
     };
     // Stopping joins the pipeline's thread, which a camera gone silent
     // holds up to its timeout: not on the runtime's own threads.

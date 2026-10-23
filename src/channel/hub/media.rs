@@ -10,6 +10,7 @@ use media_pp::elements::{
 };
 use media_pp::ffmpeg::Rational;
 
+use super::Refusal;
 use super::plan::Target;
 use crate::config::VideoConversion;
 
@@ -24,9 +25,9 @@ pub(super) fn sound(
     label: &str,
     target: Target,
     info: &StreamInfo,
-) -> Result<(SwDecoder, SwAudioEncoder), String> {
+) -> Result<(SwDecoder, SwAudioEncoder), Refusal> {
     let decoder = SwDecoder::new(format!("{name}-decode-{label}"), info.parameters().clone())
-        .map_err(|error| format!("cannot decode {label}: {error}"))?;
+        .map_err(|error| Refusal::Failed(format!("cannot decode {label}: {error}")))?;
     let codec = match target {
         Target::Opus => AudioCodec::Opus,
         Target::Aac | Target::H264 => AudioCodec::Aac,
@@ -41,7 +42,7 @@ pub(super) fn sound(
             bit_rate: 64_000 * usize::from(channels),
         },
     )
-    .map_err(|error| format!("cannot encode {}: {error}", target.name()))?;
+    .map_err(|error| Refusal::Failed(format!("cannot encode {}: {error}", target.name())))?;
     Ok((decoder, encoder))
 }
 
@@ -54,10 +55,10 @@ pub(super) fn pictures(
     label: &str,
     info: &StreamInfo,
     video: VideoConversion,
-) -> Result<(VideoDecodeBin, VideoEncodeBin, StreamInfo), String> {
+) -> Result<(VideoDecodeBin, VideoEncodeBin, StreamInfo), Refusal> {
     let (width, height) = info
         .size()
-        .ok_or_else(|| format!("{label}: its pictures' size is not known"))?;
+        .ok_or_else(|| Refusal::Failed(format!("{label}: its pictures' size is not known")))?;
     let rate = info
         .frame_rate()
         .filter(|rate| rate.numerator() > 0 && rate.denominator() > 0)
@@ -75,9 +76,7 @@ pub(super) fn pictures(
     };
     let targets = decode_targets(video);
     if targets.is_empty() {
-        return Err(format!(
-            "cannot convert {label}'s pictures: no GPU device opened, and they are converted on the GPU alone"
-        ));
+        return Err(Refusal::NoGpu("no GPU device opened".to_owned()));
     }
     let mut refused = Vec::new();
     for target in targets {
@@ -117,10 +116,14 @@ pub(super) fn pictures(
             Err(error) => refused.push(error.to_string()),
         }
     }
-    Err(format!(
-        "cannot convert {label}'s pictures: {}",
-        refused.join("; ")
-    ))
+    let refused = refused.join("; ");
+    Err(match video {
+        // Only a GPU that may come free would have done.
+        VideoConversion::Gpu => Refusal::NoGpu(refused),
+        VideoConversion::Any | VideoConversion::Off => {
+            Refusal::Failed(format!("{label}'s pictures: {refused}"))
+        }
+    })
 }
 
 /// Where pictures may be decoded to for conversion, the GPU first: each

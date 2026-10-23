@@ -19,7 +19,7 @@ use media_pp::elements::{
 };
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::channel::hub::{Fed, Feed, Subscription};
@@ -42,8 +42,6 @@ pub(crate) struct RecordStatus {
 pub(crate) struct Recorder {
     status: Arc<Mutex<RecordStatus>>,
     task: Task,
-    /// What it records, held for as long as it does.
-    _subscription: Subscription,
 }
 
 /// What the recorder's task works with.
@@ -55,9 +53,9 @@ struct Recording {
     segment: Duration,
     chunk: Duration,
     status: Arc<Mutex<RecordStatus>>,
-    /// Rung to have the channel's source connect again — see
-    /// [`Stopped::PictureChanged`].
-    reconnect: Arc<Notify>,
+    /// What it records, held for as long as it does; asked for a run
+    /// described anew — see [`Stopped::PictureChanged`].
+    subscription: Subscription,
 }
 
 /// A recording being written.
@@ -75,7 +73,6 @@ impl Recorder {
     pub(crate) fn start(
         name: &str,
         subscription: Subscription,
-        reconnect: Arc<Notify>,
         config: &RecordConfig,
         runtime: &Handle,
     ) -> Self {
@@ -87,16 +84,12 @@ impl Recorder {
             segment: config.segment,
             chunk: config.chunk,
             status: Arc::clone(&status),
-            reconnect,
+            subscription,
         });
         let task = Task::new();
-        let fed = subscription.fed();
+        let fed = recording.subscription.fed();
         task.spawn(runtime, |halt| recording.run(fed, halt));
-        Self {
-            status,
-            task,
-            _subscription: subscription,
-        }
+        Self { status, task }
     }
 
     pub(crate) fn status(&self) -> RecordStatus {
@@ -125,7 +118,8 @@ impl Recording {
         match fed {
             Fed::Live(feed) => Some(feed.clone()),
             Fed::Failed(reason) => {
-                self.status.lock().unwrap_or_else(|p| p.into_inner()).error = Some(reason.clone());
+                self.status.lock().unwrap_or_else(|p| p.into_inner()).error =
+                    Some(reason.to_string());
                 None
             }
             Fed::Idle => None,
@@ -173,11 +167,11 @@ impl Recording {
                     self.status.lock().unwrap_or_else(|p| p.into_inner()).error = Some(reason);
                     self.end(writing.take()).await;
                     match stopped {
-                        // Begun again on this connection, it would be given
-                        // the picture it began as and refuse the same way:
-                        // the next connection describes it anew, and the
-                        // recording begins with it.
-                        Stopped::PictureChanged(_) => self.reconnect.notify_waiters(),
+                        // Begun again on this run, it would be given the
+                        // picture it began as and refuse the same way: the
+                        // next run describes it anew, and the recording
+                        // begins with it.
+                        Stopped::PictureChanged(_) => self.subscription.renew(),
                         Stopped::Failed(_) => again = Some(Instant::now() + AGAIN_AFTER),
                     }
                 }

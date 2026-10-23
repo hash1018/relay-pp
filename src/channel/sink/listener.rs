@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use super::Output;
-use crate::channel::hub::{Fed, Hub, Subscription};
+use crate::channel::hub::{Fed, Hub, Refusal, Subscription};
 use crate::channel::task::Task;
 
 /// The listeners every channel's sinks are registered on.
@@ -27,6 +27,21 @@ use crate::channel::task::Task;
 pub(crate) struct Listeners {
     pub(crate) rtsp: RtspServerHandle,
     pub(crate) webrtc: WebRtcServerHandle,
+}
+
+/// Why players cannot reach a channel over a listener yet.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Unready {
+    /// What they read is not made yet: the source just gone live, or a
+    /// conversion still beginning.
+    #[error("not ready yet")]
+    NotYet,
+    /// What they read is not made, and why.
+    #[error(transparent)]
+    Refused(Refusal),
+    /// The listener would not take the channel.
+    #[error("the listener would not take it: {0}")]
+    Listener(String),
 }
 
 /// A channel on one listener.
@@ -94,7 +109,7 @@ impl ListenerSink {
     /// it is — and for the channel to be registered reading it; or says why
     /// it cannot be. What it reads is started again first, where it had
     /// stopped for want of players.
-    pub(crate) async fn ready(&self, within: Duration) -> Result<(), String> {
+    pub(crate) async fn ready(&self, within: Duration) -> Result<(), Unready> {
         self.subscription.wake();
         let mut fed = self.subscription.fed();
         let made = tokio::time::timeout(within, fed.wait_for(|fed| *fed != Fed::Idle))
@@ -103,9 +118,9 @@ impl ListenerSink {
             .and_then(Result::ok)
             .map(|fed| fed.clone());
         match made {
-            Some(fed @ Fed::Live(_)) => self.registration.follow(&fed),
-            Some(Fed::Failed(reason)) => Err(reason),
-            _ => Err("not ready yet".to_owned()),
+            Some(fed @ Fed::Live(_)) => self.registration.follow(&fed).map_err(Unready::Listener),
+            Some(Fed::Failed(refusal)) => Err(Unready::Refused(refusal)),
+            _ => Err(Unready::NotYet),
         }
     }
 

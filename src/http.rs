@@ -20,7 +20,9 @@ use media_pp::elements::{SessionId, WebRtcServerError, WebRtcServerHandle};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
 
-use crate::channel::{AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, Output};
+use crate::channel::{
+    AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, Output, PlayError, Refusal,
+};
 use crate::channels::Channels;
 use crate::{clock, recordings};
 
@@ -179,8 +181,8 @@ async fn play(
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };
-    if let Err(reason) = playable(&state, &channel, Output::Rtsp).await {
-        return reason.into_response();
+    if let Err(error) = playable(&state, &channel, Output::Rtsp).await {
+        return unplayable(&error);
     }
     let url = match &state.rtsp_public_url {
         Some(public) => format!("{}/{name}", public.trim_end_matches('/')),
@@ -213,20 +215,47 @@ fn found(state: &AppState, name: &str) -> Result<Arc<Channel>, (StatusCode, Stri
 
 /// Waits for `channel`'s camera to be live and what players over `output`
 /// read to be made — or the answer saying why it is not.
-async fn playable(
-    state: &AppState,
-    channel: &Channel,
-    output: Output,
-) -> Result<(), (StatusCode, String)> {
-    channel
-        .live(LIVE_WITHIN)
-        .await
-        .map_err(|reason| (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")))?;
-    state
-        .channels
-        .ready(channel, output, LIVE_WITHIN)
-        .await
-        .map_err(|reason| (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")))
+async fn playable(state: &AppState, channel: &Channel, output: Output) -> Result<(), PlayError> {
+    channel.live(LIVE_WITHIN).await?;
+    state.channels.ready(channel, output, LIVE_WITHIN).await
+}
+
+/// The answer to a player `error` says cannot play.
+fn unplayable(error: &PlayError) -> Response {
+    let (status, retry) = answer_to(error);
+    let mut response = (
+        status,
+        format!(
+            "{error}
+"
+        ),
+    )
+        .into_response();
+    if let Some(seconds) = retry {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
+    response
+}
+
+/// The status a player who cannot play is answered with, and after how many
+/// seconds to ask again where asking again may help: soon for a camera not
+/// live yet, later for a GPU encoder none of which is free; never for a
+/// channel that converts nothing it would need, nor a failure.
+fn answer_to(error: &PlayError) -> (StatusCode, Option<u32>) {
+    match error {
+        PlayError::NoChannel(_) => (StatusCode::NOT_FOUND, None),
+        PlayError::NotLive { .. } | PlayError::NotReady { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, Some(5))
+        }
+        PlayError::Refused { refusal, .. } => match refusal {
+            Refusal::NotConverted { .. } => (StatusCode::CONFLICT, None),
+            Refusal::NoGpu(_) => (StatusCode::SERVICE_UNAVAILABLE, Some(30)),
+            Refusal::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+        },
+        PlayError::Listener { .. } => (StatusCode::INTERNAL_SERVER_ERROR, None),
+    }
 }
 
 /// `POST /api/v1/channels/{name}/record`: the channel recorded from now —
@@ -358,8 +387,8 @@ async fn whep_offer(
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };
-    if let Err(reason) = playable(&state, &channel, Output::WebRtc).await {
-        return reason.into_response();
+    if let Err(error) = playable(&state, &channel, Output::WebRtc).await {
+        return unplayable(&error);
     }
     let webrtc = state.webrtc.clone();
     let played = {
@@ -436,5 +465,54 @@ mod tests {
         assert_eq!(with("cctv.example.com"), "cctv.example.com");
         assert_eq!(with("[::1]:8888"), "[::1]");
         assert_eq!(super::host(&HeaderMap::new()), "localhost");
+    }
+
+    /// Asking again helps where a camera is not live yet, or no GPU is
+    /// free; not where a channel converts nothing it would need, nor where
+    /// something failed.
+    #[test]
+    fn a_player_who_cannot_play_is_told_whether_to_ask_again() {
+        let channel = || "cam1".to_owned();
+        let refused = |refusal| PlayError::Refused {
+            channel: channel(),
+            refusal,
+        };
+        let cases = [
+            (PlayError::NoChannel(channel()), StatusCode::NOT_FOUND, None),
+            (
+                PlayError::NotLive {
+                    channel: channel(),
+                    reason: "its camera is not live yet".to_owned(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(5),
+            ),
+            (
+                PlayError::NotReady { channel: channel() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(5),
+            ),
+            (
+                refused(Refusal::NoGpu("every session taken".to_owned())),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(30),
+            ),
+            (
+                refused(Refusal::NotConverted {
+                    sink: "webrtc",
+                    codec: "HEVC".to_owned(),
+                }),
+                StatusCode::CONFLICT,
+                None,
+            ),
+            (
+                refused(Refusal::Failed("no decoder".to_owned())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+            ),
+        ];
+        for (error, status, retry) in cases {
+            assert_eq!(answer_to(&error), (status, retry), "{error}");
+        }
     }
 }

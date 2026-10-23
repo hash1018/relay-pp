@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use media_pp::elements::StreamInfo;
 use media_pp::ffmpeg::media;
 
+use super::Refusal;
 use crate::config::{ConvertConfig, SoundConversion, VideoConversion};
 
 /// What a kind of sink carries, and what it is given in place of a track it
@@ -66,7 +67,7 @@ pub(crate) struct Plan {
     /// the source's own broadcast.
     pub(crate) broadcasts: BTreeMap<Vec<TrackFrom>, BTreeSet<&'static str>>,
     /// Each profile that reads nothing, and why.
-    pub(crate) refused: BTreeMap<&'static str, String>,
+    pub(crate) refused: BTreeMap<&'static str, Refusal>,
 }
 
 impl Plan {
@@ -93,11 +94,10 @@ impl Plan {
                     if convert.video == VideoConversion::Off {
                         plan.refused.insert(
                             profile.name,
-                            format!(
-                                "its pictures, in {:?}, are not carried by {} and are not to be converted",
-                                track.parameters().id(),
-                                profile.name
-                            ),
+                            Refusal::NotConverted {
+                                sink: profile.name,
+                                codec: format!("{:?}", track.parameters().id()),
+                            },
                         );
                         continue 'profiles;
                     }
@@ -291,7 +291,13 @@ mod tests {
             plan.conversions.is_empty(),
             "nor its sound for it: {plan:?}"
         );
-        assert!(plan.refused["browser"].contains("not to be converted"));
+        assert_eq!(
+            plan.refused["browser"],
+            Refusal::NotConverted {
+                sink: "browser",
+                codec: "HEVC".to_owned()
+            }
+        );
         assert_eq!(
             plan.broadcasts,
             BTreeMap::from([(

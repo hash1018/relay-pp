@@ -16,7 +16,7 @@ use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 
 use super::hub::{Demand, Profile, Target};
-pub(crate) use listener::{ListenerSink, Listeners};
+pub(crate) use listener::{ListenerSink, Listeners, Unready};
 pub(crate) use record::{RecordStatus, Recorder};
 
 /// A kind of sink.

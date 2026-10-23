@@ -67,7 +67,7 @@ and not `api`, `playback` or `recordings`.
 | `GET /api/v1/channels` | every channel's status | `200` |
 | `GET /api/v1/channels/{name}` | one channel's status | `200`; `404` |
 | `DELETE /api/v1/channels/{name}` | remove it | `204`; `404` |
-| `POST /api/v1/channels/{name}/play` | where an RTSP player plays it | `200`; `400`, `404`, `503` |
+| `POST /api/v1/channels/{name}/play` | where an RTSP player plays it | `200`; `400`, `404`, `409`, `503` |
 | `POST /api/v1/channels/{name}/record` | begin recording it | `201`; `404`, `409` |
 | `DELETE /api/v1/channels/{name}/record` | end recording it | `204`; `404` |
 | `GET /api/v1/recordings/{name}` | its recordings | `200` |
@@ -168,10 +168,16 @@ way.
   carry is converted to Opus for it — see "Conversions" below.
 
 Either waits up to 10 seconds for the camera to be live — a channel just
-made, or a camera connecting again — and answers `503` saying why where it
-is not; `404` for no such channel. A WebRTC player also waits for what is
-converted for it to begin, and is answered `503` saying why where it cannot
-be.
+made, or a camera connecting again — and for what is converted for its
+players to begin, and answers saying why where it cannot play:
+
+| Status | Why | |
+|---|---|---|
+| `404` | no such channel | |
+| `503`, `Retry-After: 5` | the camera not live yet, or a conversion still beginning | ask again soon |
+| `503`, `Retry-After: 30` | pictures to convert on the GPU alone, and no GPU encoder free | ask again later |
+| `409` | pictures its players cannot carry, on a channel that converts none | asking again does not help |
+| `500` | a conversion or a listener failed | see the log |
 
 A player starts at a keyframe of the last second the channel holds, or
 waits for the next one: up to the camera's keyframe interval before its
@@ -287,9 +293,8 @@ yet.
   it out of a way out that cannot carry it. Pictures are converted on a GPU
   unless it says `"any"`, which converts them on the processor where no GPU
   takes them — a core or two a camera — or `"off"`, which converts none.
-- Where a conversion cannot be made or is not to be, a WebRTC player is
-  answered `503` saying why, and a recording says so in `record_error`;
-  RTSP goes on as it came.
+- Where a conversion cannot be made or is not to be, a player is answered
+  saying why (see "Players"), and a recording says so in `record_error`.
 
 ## Stopping
 

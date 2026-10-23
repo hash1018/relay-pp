@@ -112,11 +112,12 @@ there. Each is:
 | `error` | why it last failed, while it is not live |
 | `connections` | how many times it has gone live |
 | `client` | which client pulled it, live or last: `"retina"` or `"ffmpeg"`; none before it first goes live |
-| `readers` | players and recordings reading it now |
+| `readers` | players and recordings reading its stream as it came now; what reads a conversion of it counts as one, the conversion |
 | `bytes` | what it has been sent, over every connection |
 | `sinks` | what reads it: `"rtsp"` and `"webrtc"` once a player has asked for it so, `"record"` while it is recorded |
 | `recording` | the playlist of the recording being written, while one is |
 | `record_error` | why its last recording failed, until one is written again |
+| `conversions` | each track converted now, and to what: `"1:opus"` — see "Conversions" |
 
 Credentials never reach an answer or a log line.
 
@@ -159,13 +160,14 @@ way.
   client (a page in relay-pp comes in phase 3): `POST` an `application/sdp`
   offer, `201` with the answer and `Location: /<name>/whep/<session>`;
   `DELETE` that to leave; `OPTIONS` says what it takes. The offer is the
-  asking: there is nothing to call first. A track in a codec WebRTC does not
-  carry is left out — a camera's AAC sound — and WebRTC carries H.264, H.265,
-  VP8, VP9, AV1, Opus and G.711; a browser plays H.264 without B-frames.
+  asking: there is nothing to call first. Sound in a codec WebRTC does not
+  carry is converted to Opus for it — see "Conversions" below.
 
 Either waits up to 10 seconds for the camera to be live — a channel just
 made, or a camera connecting again — and answers `503` saying why where it
-is not; `404` for no such channel.
+is not; `404` for no such channel. A WebRTC player also waits for what is
+converted for it to begin, and is answered `503` saying why where it cannot
+be.
 
 A player starts at a keyframe of the last second the channel holds, or
 waits for the next one: up to the camera's keyframe interval before its
@@ -204,6 +206,8 @@ What is written:
   begun again 5 seconds later.
 - Each recording is a media-pp pipeline on a thread of its own, so a disk
   slow to take a write holds up that camera's recording and no other.
+- Sound in a codec other than AAC is recorded converted to AAC — see
+  "Conversions" below.
 
 ### `GET /api/v1/recordings/{name}`
 
@@ -230,6 +234,32 @@ and every minute after: those last written longer ago than `keep` go, then
 the oldest until all together fit in `max_size`, and the directories left
 empty. A recording being written is never taken, whatever it costs.
 
+## Conversions
+
+Each way out carries some codecs and not others, and a channel's stream
+goes out each way whatever its camera sends: a track one cannot carry is
+converted for it, and what it can carry goes as it came.
+
+| Out | Carries | Converted to |
+|---|---|---|
+| RTSP | whatever came in | — |
+| WebRTC | H.264 without B-frames, VP8, VP9, AV1; Opus, G.711 | H.264; Opus |
+| Recording | H.264, H.265; AAC | H.264; AAC |
+
+- A track is converted once however many ways out need it, beside what goes
+  on unconverted, on the same timeline: a camera's pictures and its sound
+  converted stay in time.
+- What is converted for WebRTC is converted while players play it, and
+  stops once none has for 30 seconds; a player asking again starts it again.
+  What is converted for a recording, for as long as the channel is recorded.
+  A channel whose ways out carry what its camera sends costs nothing here.
+- `conversions` in a channel's status says what is converted now: `"1:opus"`
+  is track 1 converted to Opus.
+- Sound is decoded and encoded on the processor, 48 kHz, one or two
+  channels. Pictures are not converted yet: a WebRTC player of pictures it
+  cannot carry — H.265, B-frames, MJPEG — is answered `503`, and a recording
+  of them says so in `record_error`.
+
 ## Stopping
 
 A stop takes no more requests, finishes every recording, lets go of every
@@ -244,7 +274,9 @@ threads, reading its connection and writing what it reads into the
 channel's broadcast. One pulled by FFmpeg's is a media-pp pipeline on a
 thread of its own, the camera's data; its open, which blocks, borrows a
 thread of the runtime's blocking pool while it runs. Each recording is a
-pipeline of its own. Everything else that waits — the API, WHEP, each
+pipeline of its own, and so is what a channel converts, while it does: a
+thread reading the channel's stream, and one for each track converted.
+Everything else that waits — the API, WHEP, each
 channel's watcher, which waits on its connection and before connecting
 again, and each recorder's — is a task on the same runtime. The RTSP and WebRTC listeners have
 threads of their own, shared by every channel.
@@ -260,7 +292,10 @@ name; a removal of a camera being opened answering at once and holding up
 no add; a stop with ten cameras opening waiting for none of them. Played
 and followed alike pulled by either client — `retina`'s by default, FFmpeg's
 when asked — and a camera of two tracks with no `rtptime` pulled by
-FFmpeg's without being asked, both tracks relayed. Recorded
+FFmpeg's without being asked, both tracks relayed. A camera's AAC played
+over WebRTC as Opus and over RTSP as it came; its Opus recorded as AAC in
+time with its pictures; a conversion stopping once no WebRTC player has
+played it for a while, and made again for the next. Recorded
 in four-second chunks of one-second segments, each one media file read by
 byte range; listed; a stretch across chunks played back as one playlist and
 read back by FFmpeg through the server; a recording ended and begun again as

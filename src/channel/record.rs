@@ -15,13 +15,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use media_pp::bus::BusEvent;
 use media_pp::elements::{
-    Broadcast, BroadcastSource, HlsMode, HlsMuxer, HlsOptions, HlsSegmentFormat, MuxerTrackError,
+    BroadcastSource, HlsMode, HlsMuxer, HlsOptions, HlsSegmentFormat, MuxerTrackError,
 };
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
+use super::convert::{Fed, Feed};
 use super::task::Task;
 use crate::config::RecordConfig;
 use crate::recordings::{self, Chunk};
@@ -51,7 +52,6 @@ struct Recording {
     root: PathBuf,
     segment: Duration,
     chunk: Duration,
-    broadcast: Broadcast,
     status: Arc<Mutex<RecordStatus>>,
     /// Rung to have the channel's source connect again — see
     /// [`Stopped::PictureChanged`].
@@ -68,12 +68,11 @@ struct Writing {
 }
 
 impl Recorder {
-    /// Starts recording `broadcast` on `runtime` whenever `runs` says a
-    /// connection is live.
+    /// Starts recording on `runtime` what `fed` says to, whenever it says
+    /// a run of it is live — the channel's broadcast, or one made for it.
     pub(super) fn start(
         name: &str,
-        broadcast: &Broadcast,
-        runs: watch::Receiver<Option<u64>>,
+        fed: watch::Receiver<Fed>,
         reconnect: Arc<Notify>,
         config: &RecordConfig,
         runtime: &Handle,
@@ -85,12 +84,11 @@ impl Recorder {
             root: config.dir.clone(),
             segment: config.segment,
             chunk: config.chunk,
-            broadcast: broadcast.clone(),
             status: Arc::clone(&status),
             reconnect,
         });
         let task = Task::new();
-        task.spawn(runtime, |halt| recording.run(runs, halt));
+        task.spawn(runtime, |halt| recording.run(fed, halt));
         Self { status, task }
     }
 
@@ -114,41 +112,50 @@ impl Recorder {
 }
 
 impl Recording {
-    async fn run(
-        self: Arc<Self>,
-        mut runs: watch::Receiver<Option<u64>>,
-        mut halt: watch::Receiver<bool>,
-    ) {
-        let mut live = *runs.borrow_and_update();
+    /// The run to record, where `fed` says one is live; where it says what
+    /// is to be recorded cannot be made, why, in the status.
+    fn live_of(&self, fed: &Fed) -> Option<Feed> {
+        match fed {
+            Fed::Live(feed) => Some(feed.clone()),
+            Fed::Failed(reason) => {
+                self.status.lock().unwrap_or_else(|p| p.into_inner()).error = Some(reason.clone());
+                None
+            }
+            Fed::Idle => None,
+        }
+    }
+
+    async fn run(self: Arc<Self>, mut fed: watch::Receiver<Fed>, mut halt: watch::Receiver<bool>) {
+        let mut live = self.live_of(&fed.borrow_and_update());
         let mut writing = None;
         // When to try again after a recording failed.
         let mut again: Option<Instant> = None;
-        if live.is_some() {
-            writing = self.begin(&mut again).await;
+        if let Some(feed) = &live {
+            writing = self.begin(feed, &mut again).await;
         }
         loop {
             let watched = writing.as_ref().map(|w: &Writing| Arc::clone(&w.pipeline));
             let ends = writing.as_ref().map(|w| w.ends);
             tokio::select! {
                 () = halted(&mut halt) => break,
-                changed = runs.changed() => {
+                changed = fed.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    let now = *runs.borrow_and_update();
+                    let now = self.live_of(&fed.borrow_and_update());
                     if now != live {
                         live = now;
                         self.end(writing.take()).await;
                         again = None;
-                        if live.is_some() {
-                            writing = self.begin(&mut again).await;
+                        if let Some(feed) = &live {
+                            writing = self.begin(feed, &mut again).await;
                         }
                     }
                 }
                 () = sleep_until(ends) => {
                     self.end(writing.take()).await;
-                    if live.is_some() {
-                        writing = self.begin(&mut again).await;
+                    if let Some(feed) = &live {
+                        writing = self.begin(feed, &mut again).await;
                     }
                 }
                 stopped = watch_bus(watched) => {
@@ -169,8 +176,8 @@ impl Recording {
                 }
                 () = sleep_until(again.filter(|_| writing.is_none())) => {
                     again = None;
-                    if live.is_some() {
-                        writing = self.begin(&mut again).await;
+                    if let Some(feed) = &live {
+                        writing = self.begin(feed, &mut again).await;
                     }
                 }
             }
@@ -179,9 +186,10 @@ impl Recording {
     }
 
     /// Begins a recording, or says why it cannot and when to try again.
-    async fn begin(self: &Arc<Self>, again: &mut Option<Instant>) -> Option<Writing> {
+    async fn begin(self: &Arc<Self>, feed: &Feed, again: &mut Option<Instant>) -> Option<Writing> {
         let recording = Arc::clone(self);
-        let begun = tokio::task::spawn_blocking(move || recording.begin_now()).await;
+        let feed = feed.clone();
+        let begun = tokio::task::spawn_blocking(move || recording.begin_now(&feed)).await;
         let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
         match begun {
             Ok(Ok(writing)) => {
@@ -205,7 +213,7 @@ impl Recording {
     }
 
     /// The directory, the muxer and the pipeline of a new recording.
-    fn begin_now(&self) -> Result<Writing, String> {
+    fn begin_now(&self, feed: &Feed) -> Result<Writing, String> {
         let now = SystemTime::now();
         let chunk = recordings::new_chunk(&self.root, &self.channel, now).map_err(|error| {
             format!(
@@ -213,16 +221,16 @@ impl Recording {
                 self.root.display()
             )
         })?;
-        let made = self.writing_into(&chunk, now);
+        let made = self.writing_into(feed, &chunk, now);
         if made.is_err() {
             let _ = std::fs::remove_dir_all(&chunk.path);
         }
         made
     }
 
-    fn writing_into(&self, chunk: &Chunk, now: SystemTime) -> Result<Writing, String> {
+    fn writing_into(&self, feed: &Feed, chunk: &Chunk, now: SystemTime) -> Result<Writing, String> {
         let (source, tracks) =
-            BroadcastSource::new(format!("{}-record", self.name), &self.broadcast)
+            BroadcastSource::new(format!("{}-record", self.name), &feed.broadcast)
                 .map_err(|error| error.to_string())?;
         let mut options = HlsOptions::new(
             chunk.path.join(recordings::PLAYLIST),

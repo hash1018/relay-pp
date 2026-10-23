@@ -1,5 +1,7 @@
 //! A channel: one [`Source`](source::Source) writing a stream into a
-//! `Broadcast`, and what reads it — see `docs/design.md`, "The model".
+//! `Broadcast`, what reads it — see `docs/design.md`, "The model" — and
+//! what it converts for an output that cannot carry what the source sends
+//! ([`Converter`](convert::Converter)).
 //!
 //! A channel is made with its source alone, which it pulls from then on.
 //! What reads it is attached and detached while it runs: streaming — the
@@ -11,6 +13,8 @@
 //! source is whatever takes a stream in, over as many media-pp pipelines as
 //! its input takes connections; a sink is whatever reads the broadcast.
 
+mod convert;
+mod plan;
 mod record;
 mod sink;
 mod source;
@@ -24,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use crate::config::RecordConfig;
+use convert::{Converter, Fed};
+use plan::Output;
 use record::RecordStatus;
 pub(crate) use record::Recorder;
 use sink::Sink;
@@ -150,12 +156,17 @@ pub struct ChannelStatus {
     pub recording: Option<String>,
     /// Why its last recording failed, until one is written again.
     pub record_error: Option<String>,
+    /// Each track converted, and to what, while it is: `"1:opus"`, track 1
+    /// converted to Opus for WebRTC players.
+    pub conversions: Vec<String>,
 }
 
 /// A channel being served.
 pub struct Channel {
     name: String,
     source: Source,
+    /// What it converts for WebRTC players and its recording.
+    converter: Converter,
     /// What it is attached to, behind one lock — so nothing is attached to
     /// a channel once it is halted.
     attached: Mutex<Attached>,
@@ -186,9 +197,12 @@ impl Channel {
         runtime: &Handle,
     ) -> Result<Self, ChannelError> {
         config.check()?;
+        let source = Source::new(&config.name, config);
+        let converter = Converter::start(&config.name, source.broadcast(), source.runs(), runtime);
         let channel = Self {
             name: config.name.clone(),
-            source: Source::new(&config.name, config),
+            source,
+            converter,
             attached: Mutex::default(),
             record: record.clone(),
             runtime: runtime.clone(),
@@ -235,18 +249,25 @@ impl Channel {
             sinks,
             recording: record.recording,
             record_error: record.error,
+            conversions: self.converter.conversions(),
         }
     }
 
     /// Registers it on `protocol`'s listener, unless it is already: from
     /// then on players open it there, from the newest keyframe it holds,
-    /// until the channel goes.
+    /// until the channel goes. WebRTC is only asked for here, what it reads
+    /// being made, perhaps, once the source is live: [`Self::webrtc`]
+    /// registers it.
     pub(crate) fn stream(
         &self,
         protocol: Protocol,
         listeners: &Listeners,
     ) -> Result<(), AttachError> {
         let mut attached = self.attached_unless_halted()?;
+        if protocol == Protocol::WebRtc {
+            self.converter.want(Output::WebRtc);
+            return Ok(());
+        }
         if attached
             .stream
             .iter()
@@ -262,6 +283,50 @@ impl Channel {
         )?;
         attached.stream.push(sink);
         tracing::info!(channel = %self.name, protocol = protocol.name(), "streamed");
+        Ok(())
+    }
+
+    /// Waits, up to `within`, for what WebRTC players read to be made — the
+    /// source's own broadcast where WebRTC carries it, one converted for it
+    /// where not — and registers the channel on the WebRTC listener reading
+    /// it, or moves it there from another; or says why it cannot be made.
+    /// After [`Self::live`].
+    pub(crate) async fn webrtc(
+        &self,
+        listeners: &Listeners,
+        within: Duration,
+    ) -> Result<(), String> {
+        self.converter.want(Output::WebRtc);
+        let mut fed = self.converter.webrtc();
+        let made = tokio::time::timeout(within, fed.wait_for(|fed| *fed != Fed::Idle))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|fed| fed.clone());
+        let feed = match made {
+            Some(Fed::Live(feed)) => feed,
+            Some(Fed::Failed(reason)) => {
+                return Err(format!("channel {}: {reason}", self.name));
+            }
+            _ => return Err(format!("channel {}: not ready for WebRTC yet", self.name)),
+        };
+        let mut attached = self
+            .attached_unless_halted()
+            .map_err(|error| error.to_string())?;
+        let at = attached
+            .stream
+            .iter()
+            .position(|sink| sink.protocol() == Protocol::WebRtc);
+        if let Some(at) = at {
+            if attached.stream[at].reads(&feed.broadcast) {
+                return Ok(());
+            }
+            attached.stream.remove(at).detach(&self.name);
+        }
+        let sink = Sink::attach(Protocol::WebRtc, &self.name, &feed.broadcast, listeners)
+            .map_err(|error| format!("channel {}: {error}", self.name))?;
+        attached.stream.push(sink);
+        tracing::info!(channel = %self.name, broadcast = %feed.broadcast.name(), "streamed over WebRTC");
         Ok(())
     }
 
@@ -292,10 +357,10 @@ impl Channel {
         if attached.recorder.is_some() {
             return Err(AttachError::Attached(self.name.clone()));
         }
+        self.converter.want(Output::Hls);
         attached.recorder = Some(Recorder::start(
             &self.name,
-            self.source.broadcast(),
-            self.source.runs(),
+            self.converter.hls(),
             self.source.reconnect(),
             &self.record,
             &self.runtime,
@@ -313,6 +378,7 @@ impl Channel {
             .take()
             .ok_or_else(|| AttachError::NotAttached(self.name.clone()))?;
         recorder.halt();
+        self.converter.unwant(Output::Hls);
         tracing::info!(channel = %self.name, "no longer recorded");
         Ok(recorder)
     }
@@ -333,6 +399,7 @@ impl Channel {
             recorder.halt();
         }
         drop(attached);
+        self.converter.halt();
         self.source.halt();
         tracing::info!(channel = %self.name, "removed");
     }
@@ -346,6 +413,7 @@ impl Channel {
         if let Some(recorder) = recorder {
             recorder.wait().await;
         }
+        self.converter.wait().await;
         self.source.wait().await;
     }
 

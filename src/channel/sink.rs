@@ -1,7 +1,11 @@
 //! A channel's player sinks: the channel registered on one of the server's
 //! listeners, which every channel shares — one port each, the channel
 //! picked by the name in the URL. Registered when a player first asks for
-//! the channel by that protocol, and kept until the channel goes.
+//! the channel by that protocol, and kept until the channel goes; a WebRTC
+//! registration moves to another broadcast where what WebRTC players read
+//! changes — see `super::convert`.
+
+use std::sync::Arc;
 
 use media_pp::elements::{
     Broadcast, RtspPathMode, RtspServerHandle, WebRtcPathMode, WebRtcServerHandle,
@@ -30,8 +34,14 @@ impl Protocol {
     }
 }
 
-/// A channel registered on one listener.
-pub(super) enum Sink {
+/// A channel registered on one listener, reading one broadcast.
+pub(super) struct Sink {
+    listener: Listener,
+    /// The name of the broadcast it reads.
+    reads: Arc<str>,
+}
+
+enum Listener {
     Rtsp(RtspServerHandle),
     WebRtc(WebRtcServerHandle),
 }
@@ -45,35 +55,44 @@ impl Sink {
         broadcast: &Broadcast,
         listeners: &Listeners,
     ) -> Result<Sink, String> {
-        match protocol {
+        let listener = match protocol {
             Protocol::Rtsp => listeners
                 .rtsp
                 .add_path(name, broadcast, RtspPathMode::Play)
-                .map(|()| Sink::Rtsp(listeners.rtsp.clone()))
+                .map(|()| Listener::Rtsp(listeners.rtsp.clone()))
                 .map_err(|error| error.to_string()),
             Protocol::WebRtc => listeners
                 .webrtc
                 .add_path(name, broadcast, WebRtcPathMode::Play)
-                .map(|()| Sink::WebRtc(listeners.webrtc.clone()))
+                .map(|()| Listener::WebRtc(listeners.webrtc.clone()))
                 .map_err(|error| error.to_string()),
-        }
+        }?;
+        Ok(Sink {
+            listener,
+            reads: broadcast.name(),
+        })
     }
 
     pub(super) fn protocol(&self) -> Protocol {
-        match self {
-            Sink::Rtsp(_) => Protocol::Rtsp,
-            Sink::WebRtc(_) => Protocol::WebRtc,
+        match self.listener {
+            Listener::Rtsp(_) => Protocol::Rtsp,
+            Listener::WebRtc(_) => Protocol::WebRtc,
         }
+    }
+
+    /// Whether it reads `broadcast`.
+    pub(super) fn reads(&self, broadcast: &Broadcast) -> bool {
+        self.reads == broadcast.name()
     }
 
     /// Takes the channel off the listener: no player opens it from here.
     /// Those playing it go on until its broadcast closes.
     pub(super) fn detach(&self, name: &str) {
-        match self {
-            Sink::Rtsp(listener) => {
+        match &self.listener {
+            Listener::Rtsp(listener) => {
                 listener.remove_path(name);
             }
-            Sink::WebRtc(listener) => {
+            Listener::WebRtc(listener) => {
                 listener.remove_path(name);
             }
         }

@@ -348,6 +348,9 @@ async fn whep_offer(
     if let Err(reason) = channel.live(LIVE_WITHIN).await {
         return (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")).into_response();
     }
+    if let Err(reason) = state.channels.webrtc(&channel, LIVE_WITHIN).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")).into_response();
+    }
     let webrtc = state.webrtc.clone();
     let played = {
         let name = name.clone();

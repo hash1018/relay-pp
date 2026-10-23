@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use tokio::runtime::Handle;
 
@@ -84,6 +85,12 @@ impl Channels {
             .ok_or_else(|| AttachError::NoChannel(name.to_owned()))?;
         channel.stream(protocol, &self.listeners)?;
         Ok(channel)
+    }
+
+    /// Has `channel` registered on the WebRTC listener reading what WebRTC
+    /// players read of it — see [`Channel::webrtc`].
+    pub(crate) async fn webrtc(&self, channel: &Channel, within: Duration) -> Result<(), String> {
+        channel.webrtc(&self.listeners, within).await
     }
 
     /// Begins recording the channel called `name`.

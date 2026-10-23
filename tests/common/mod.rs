@@ -31,22 +31,27 @@ pub struct Camera {
 
 impl Camera {
     pub fn start(addr: SocketAddr) -> Self {
-        Self::started(addr, false, false).expect("OpenH264 is always there")
+        Self::started(addr, None, false).expect("OpenH264 is always there")
     }
 
     /// One with sound as well — AAC — and so two tracks, which this
     /// camera, media-pp's RTSP server, describes with no `rtptime`.
     pub fn with_sound(addr: SocketAddr) -> Self {
-        Self::started(addr, true, false).expect("OpenH264 is always there")
+        Self::started(addr, Some(AudioCodec::Aac), false).expect("OpenH264 is always there")
     }
 
     /// One whose pictures have B-frames — sent out of the order they are
     /// shown in — by `libx264`: `None` where this FFmpeg has none.
     pub fn with_b_frames(addr: SocketAddr) -> Option<Self> {
-        Self::started(addr, false, true)
+        Self::started(addr, None, true)
     }
 
-    fn started(addr: SocketAddr, sound: bool, b_frames: bool) -> Option<Self> {
+    /// One with Opus sound, by `libopus`: `None` where this FFmpeg has none.
+    pub fn with_opus(addr: SocketAddr) -> Option<Self> {
+        Self::started(addr, Some(AudioCodec::Opus), false)
+    }
+
+    fn started(addr: SocketAddr, sound: Option<AudioCodec>, b_frames: bool) -> Option<Self> {
         let (server, handle) = RtspServer::bind("camera", addr, RtspServerOptions::default())
             .expect("bind the camera");
         let broadcast = Broadcast::new("cam", BroadcastOptions::default());
@@ -73,24 +78,27 @@ impl Camera {
             },
         )
         .ok()?;
-        let sound_encoder = sound.then(|| {
-            SwAudioEncoder::new(
-                "sound-encoder",
-                SwAudioEncoderOptions {
-                    codec: AudioCodec::Aac,
-                    sample_rate: 48_000,
-                    channels: 1,
-                    bit_rate: 64_000,
-                },
-            )
-            .expect("AAC is always there")
-        });
+        let sound_encoder = match sound {
+            Some(codec) => Some(
+                SwAudioEncoder::new(
+                    "sound-encoder",
+                    SwAudioEncoderOptions {
+                        codec,
+                        sample_rate: 48_000,
+                        channels: 1,
+                        bit_rate: 64_000,
+                    },
+                )
+                .ok()?,
+            ),
+            None => None,
+        };
         let mut tracks = vec![StreamInfo::from(&encoder)];
         if let Some(sound_encoder) = &sound_encoder {
             tracks.push(StreamInfo::from(sound_encoder));
         }
         let mut sinks = broadcast.publish(&tracks).unwrap();
-        let sound_sink = sound.then(|| sinks.remove(1));
+        let sound_sink = sound.map(|_| sinks.remove(1));
         let sink = sinks.remove(0);
         let pictures = TestVideoSource::new(
             "pictures",
@@ -330,4 +338,44 @@ pub fn rtsp_opens(url: &str) -> bool {
         },
     )
     .is_ok()
+}
+
+/// A WHEP player offering pictures and sound: each track it was given, by
+/// codec, and how many packets of it have come.
+pub fn whep_tracks(url: &str) -> (Arc<Pipeline>, Vec<(ffmpeg::codec::Id, CounterHandle)>) {
+    let (source, streams) = WhepSource::open("player", url, WhepOptions::default())
+        .unwrap_or_else(|error| panic!("{url} opens: {error}"));
+    let mut tracks = Vec::new();
+    let mut counters = Vec::new();
+    for stream in &streams {
+        let (counter, counted) = PacketCounter::new(format!("packets-{}", stream.index()));
+        tracks.push((stream.parameters().id(), counted));
+        counters.push((stream.index(), counter));
+    }
+    let (pipeline, ()) = Pipeline::new("whep-player", source, |source, ctx| {
+        for (index, counter) in counters {
+            ctx.attach(source, index, ctx.branch().to(counter)?)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    pipeline.run().unwrap();
+    (pipeline, tracks)
+}
+
+/// The codecs of what an RTSP player of `url` is described.
+pub fn rtsp_codecs(url: &str) -> Vec<ffmpeg::codec::Id> {
+    let (_, streams) = RtspSource::open(
+        "probe",
+        url,
+        RtspOptions {
+            transport: RtspTransport::Tcp,
+            timeout: Duration::from_secs(5),
+        },
+    )
+    .unwrap_or_else(|error| panic!("{url} opens: {error}"));
+    streams
+        .iter()
+        .map(|stream| stream.parameters().id())
+        .collect()
 }

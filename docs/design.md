@@ -1,6 +1,6 @@
 # relay-pp — design
 
-Status: agreed scope, 2026-10-23. Phases 1 and 2 are built — what they do is in
+Status: agreed scope, 2026-10-23. Phases 1 to 3 are built — what they do is in
 [status.md](status.md).
 
 relay-pp takes streams in by whatever protocol they come, hands each out by

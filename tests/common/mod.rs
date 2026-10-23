@@ -295,6 +295,30 @@ pub fn scratch(label: &str) -> std::path::PathBuf {
     dir
 }
 
+/// `GET path` on `addr` for a body that may be anything but text — a
+/// segment: the status, the headers, and the body.
+pub fn http_bytes(addr: SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(response.len(), |at| at + 4);
+    let head = String::from_utf8_lossy(&response[..split]).into_owned();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, head, response[split..].to_vec())
+}
+
 /// `GET path` on `addr` with a `Range` header: the status and the body's
 /// length.
 pub fn http_range(addr: SocketAddr, path: &str, range: &str) -> (u16, usize) {

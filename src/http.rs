@@ -1,5 +1,5 @@
-//! The one HTTP port: the API, WHEP for WebRTC players, and recordings — see
-//! `docs/design.md`, "HTTP".
+//! The one HTTP port: the API, WHEP for WebRTC players, HLS live, the
+//! player page, and recordings — see `docs/design.md`, "HTTP".
 //!
 //! WHEP is answered here over `WebRtcServerHandle::play` and `close` rather
 //! than by `WebRtcServer::serve_http`'s listener of its own, so there is one
@@ -23,8 +23,8 @@ use tower_http::services::ServeDir;
 
 use crate::auth::{self, Auth, FromHeader, Presented, Right};
 use crate::channel::{
-    AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, Output, PlayError, Refusal,
-    whip_path,
+    AttachError, Channel, ChannelConfig, ChannelError, ChannelStatus, HLS_PLAYLIST, Output,
+    PlayError, Refusal, is_media_file, whip_path,
 };
 use crate::channels::Channels;
 use crate::{clock, recordings};
@@ -33,6 +33,15 @@ use crate::{clock, recordings};
 /// one just made, or connecting again — before it is answered that it is
 /// not.
 const LIVE_WITHIN: Duration = Duration::from_secs(10);
+
+/// The page that plays a channel in a browser: WebRTC, HLS where WebRTC
+/// does not get through, and its recordings.
+const PLAYER_PAGE: &str = include_str!("../assets/player.html");
+
+/// hls.js 1.7.3, its light build, as released (`assets/hls.js/LICENSE`):
+/// the page plays HLS with it in a browser that plays none itself, on a
+/// network that reaches no CDN.
+const HLS_JS: &[u8] = include_bytes!("../assets/hls.js/hls.light.min.js");
 
 /// What the routes reach.
 #[derive(Clone)]
@@ -65,6 +74,8 @@ pub(crate) fn router(state: AppState) -> Router {
     let players = Router::new()
         .route("/api/v1/channels/{name}/play", post(play))
         .route("/{name}/whep", post(whep_offer).options(whep_options))
+        .route("/{name}/index.m3u8", get(hls_playlist))
+        .route("/{name}/{file}", get(hls_file))
         .route_layer(middleware::from_fn_with_state(
             (state.clone(), Right::Play),
             who_may,
@@ -99,6 +110,10 @@ pub(crate) fn router(state: AppState) -> Router {
         // The session's own URL is the secret that ends it.
         .route("/{name}/whep/{session}", axum::routing::delete(whep_end))
         .route("/{name}/whip/{session}", axum::routing::delete(whep_end))
+        // The page and what it runs carry nothing of a channel: what it
+        // plays, it asks for with the token it was opened with.
+        .route("/{name}", get(player_page))
+        .route("/assets/hls.light.min.js", get(hls_js))
         .with_state(state)
 }
 
@@ -411,6 +426,8 @@ fn answer_to(error: &PlayError) -> (StatusCode, Option<u32>) {
             Refusal::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
         },
         PlayError::Listener { .. } => (StatusCode::INTERNAL_SERVER_ERROR, None),
+        // Begun again in a moment.
+        PlayError::Hls { .. } => (StatusCode::SERVICE_UNAVAILABLE, Some(2)),
     }
 }
 
@@ -527,15 +544,26 @@ fn with_token(playlist: &str, token: &str) -> String {
     let query: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("token", token)
         .finish();
+    let carrying = |uri: &str| {
+        let joint = if uri.contains('?') { '&' } else { '?' };
+        format!("{uri}{joint}{query}")
+    };
     playlist
         .lines()
         .map(|line| {
-            if line.starts_with(recordings::URL_ROOT) {
-                format!("{line}?{query}")
-            } else if let Some(at) = line.find(&format!("URI=\"{}", recordings::URL_ROOT)) {
-                let closing = line[at + 5..].find('"').map(|end| at + 5 + end);
-                match closing {
-                    Some(end) => format!("{}?{query}{}", &line[..end], &line[end..]),
+            if line.is_empty() {
+                line.to_owned()
+            } else if !line.starts_with('#') {
+                carrying(line)
+            } else if let Some(at) = line.find("URI=\"") {
+                let start = at + 5;
+                match line[start..].find('"').map(|end| start + end) {
+                    Some(end) => format!(
+                        "{}{}{}",
+                        &line[..start],
+                        carrying(&line[start..end]),
+                        &line[end..]
+                    ),
                     None => line.to_owned(),
                 }
             } else {
@@ -545,6 +573,91 @@ fn with_token(playlist: &str, token: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
+}
+
+/// `GET /{name}/index.m3u8`: the channel's live HLS playlist — its HLS
+/// written from the first such request, its camera and first segment
+/// waited for, and written on while a player goes on asking.
+async fn hls_playlist(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let channel = match found(&state, &name) {
+        Ok(channel) => channel,
+        Err(refused) => return refused.into_response(),
+    };
+    if let Err(error) = channel.live(LIVE_WITHIN).await {
+        return unplayable(&error);
+    }
+    let dir = match channel.hls(LIVE_WITHIN).await {
+        Ok(dir) => dir,
+        Err(error) => return unplayable(&error),
+    };
+    let Ok(playlist) = tokio::fs::read_to_string(dir.join(HLS_PLAYLIST)).await else {
+        // Gone between the look and the read: the camera dropped.
+        return unplayable(&PlayError::NotReady { channel: name });
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        match (&state.auth, query.get("token")) {
+            (Some(_), Some(token)) => with_token(&playlist, token),
+            _ => playlist,
+        },
+    )
+        .into_response()
+}
+
+/// `GET /{name}/{file}`: a segment, or an initialization section, of the
+/// channel's live HLS, while it is written.
+async fn hls_file(
+    State(state): State<AppState>,
+    Path((name, file)): Path<(String, String)>,
+) -> Response {
+    let dir = state
+        .channels
+        .get(&name)
+        .and_then(|channel| channel.hls_files());
+    let (Some(dir), true) = (dir, is_media_file(&file)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = if file.ends_with(".m4s") {
+        "video/iso.segment"
+    } else {
+        "video/mp4"
+    };
+    match tokio::fs::read(dir.join(&file)).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, content_type)], bytes).into_response(),
+        // Left the playlist, and deleted.
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `GET /{name}`: the page that plays a channel.
+async fn player_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        PLAYER_PAGE,
+    )
+        .into_response()
+}
+
+/// `GET /assets/hls.light.min.js`.
+async fn hls_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        HLS_JS,
+    )
+        .into_response()
 }
 
 /// `POST /{name}/whep` with an SDP offer: the channel registered on the
@@ -761,6 +874,28 @@ mod tests {
         for (error, status, retry) in cases {
             assert_eq!(answer_to(&error), (status, retry), "{error}");
         }
+    }
+
+    /// A live playlist names its files as FFmpeg wrote them, beside it.
+    #[test]
+    fn a_live_playlist_carries_the_token_on_its_relative_names() {
+        let playlist = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA-SEQUENCE:4\n",
+            r#"#EXT-X-MAP:URI="0-init.mp4""#,
+            "\n#EXTINF:1.0,\n",
+            "0-00004.m4s\n",
+        );
+        assert_eq!(
+            with_token(playlist, "t"),
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-MEDIA-SEQUENCE:4\n",
+                r#"#EXT-X-MAP:URI="0-init.mp4?token=t""#,
+                "\n#EXTINF:1.0,\n",
+                "0-00004.m4s?token=t\n",
+            )
+        );
     }
 
     /// A playlist asked for with a token in its URL names each file with

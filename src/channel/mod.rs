@@ -5,8 +5,9 @@
 //! A channel is made with its source alone, which it pulls from then on.
 //! Its sinks are attached and detached while it runs: RTSP and WebRTC
 //! players, through the listeners every channel shares, as a player first
-//! asks for the channel ([`ListenerSink`](sink::ListenerSink)), and a
-//! recording ([`Recorder`](sink::Recorder)). Each sink says what it
+//! asks for the channel ([`ListenerSink`](sink::ListenerSink)), a
+//! recording ([`Recorder`](sink::Recorder)), and a live HLS playlist while
+//! players ask for it ([`HlsLive`](sink::HlsLive)). Each sink says what it
 //! carries, and the hub gives it that — the source's own broadcast, or one
 //! converted for it — so that neither source nor sink knows the other.
 //!
@@ -18,6 +19,7 @@ mod source;
 mod task;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -28,8 +30,8 @@ use tokio::runtime::Handle;
 use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
 use hub::Hub;
 pub(crate) use hub::Refusal;
-use sink::{ListenerSink, RecordStatus, Unready};
-pub(crate) use sink::{Listeners, Output, Recorder};
+pub(crate) use sink::{HLS_PLAYLIST, Listeners, Output, Recorder, is_media_file};
+use sink::{HlsLive, ListenerSink, NotWritten, RecordStatus, Unready};
 use source::Source;
 pub use source::{Publish, SourceState};
 pub(crate) use source::{RTMP_APP, whip_path};
@@ -99,7 +101,7 @@ impl ChannelConfig {
 pub enum ChannelError {
     /// Its name is not one a URL carries as one part of its path.
     #[error(
-        "channel {0:?}: a name is letters, digits, `-`, `_`, `.` and `~`, and not `api`, `playback` or `recordings`"
+        "channel {0:?}: a name is letters, digits, `-`, `_`, `.` and `~`, and not `api`, `assets`, `playback` or `recordings`"
     )]
     Name(String),
     /// Its source is not one relay-pp takes yet.
@@ -168,6 +170,9 @@ pub(crate) enum PlayError {
     /// The players' listener would not take the channel.
     #[error("channel {channel}: {error}")]
     Listener { channel: String, error: String },
+    /// Its HLS could not be written, and is begun again shortly.
+    #[error("channel {channel}: {error}")]
+    Hls { channel: String, error: String },
 }
 
 /// A channel's status, as the API gives it.
@@ -193,7 +198,8 @@ pub struct ChannelStatus {
     /// What its broadcast has been written, over every connection.
     pub bytes: u64,
     /// What reads it: `"rtsp"` and `"webrtc"` once a player has asked for
-    /// it by that protocol, `"record"` while it is recorded.
+    /// it by that protocol, `"record"` while it is recorded, `"hls"` while
+    /// its HLS is written.
     pub sinks: Vec<&'static str>,
     /// The playlist of the recording being written, while one is.
     pub recording: Option<String>,
@@ -219,6 +225,8 @@ pub struct Channel {
     attached: Mutex<Attached>,
     /// How a recorder of it records, and where its tasks run.
     record: RecordConfig,
+    /// How long its HLS is written unasked for.
+    hls_idle: Duration,
     runtime: Handle,
     /// Set by the first [`Channel::halt`], under `attached`'s lock. Its
     /// listener sinks are detached by name, so a second detach would take
@@ -233,6 +241,9 @@ struct Attached {
     listened: BTreeMap<Output, Arc<ListenerSink>>,
     /// Its recorder, while it is recorded.
     recorder: Option<Recorder>,
+    /// Its HLS, from a player first asking for it — which may have ended
+    /// since, unasked for.
+    hls: Option<Arc<HlsLive>>,
 }
 
 impl Channel {
@@ -242,6 +253,7 @@ impl Channel {
     pub(crate) fn start(
         config: &ChannelConfig,
         record: &RecordConfig,
+        hls_idle: Duration,
         convert: ConvertConfig,
         listeners: &Listeners,
         runtime: &Handle,
@@ -263,6 +275,7 @@ impl Channel {
             convert,
             attached: Mutex::default(),
             record: record.clone(),
+            hls_idle,
             runtime: runtime.clone(),
             halted: AtomicBool::new(false),
         };
@@ -289,6 +302,9 @@ impl Channel {
                 }
                 None => RecordStatus::default(),
             };
+            if attached.hls.as_ref().is_some_and(|hls| !hls.is_over()) {
+                sinks.push("hls");
+            }
             (sinks, record)
         };
         ChannelStatus {
@@ -362,6 +378,55 @@ impl Channel {
         })
     }
 
+    /// Has its HLS written, where it was not, and waits up to `within` for
+    /// its playlist — at once where it is written already — or says why it
+    /// cannot be. Where its files are. After [`Self::live`].
+    pub(crate) async fn hls(&self, within: Duration) -> Result<PathBuf, PlayError> {
+        let channel = || self.name.clone();
+        let hls = {
+            let mut attached = self
+                .attached_unless_halted()
+                .map_err(|_| PlayError::NoChannel(channel()))?;
+            match &attached.hls {
+                Some(hls) if !hls.is_over() => Arc::clone(hls),
+                _ => {
+                    let hls = Arc::new(HlsLive::start(
+                        &self.name,
+                        self.hub
+                            .subscribe(Output::Hls.profile(), Output::Hls.demand()),
+                        self.hls_idle,
+                        &self.runtime,
+                    ));
+                    attached.hls = Some(Arc::clone(&hls));
+                    hls
+                }
+            }
+        };
+        let dir = hls.asked().to_owned();
+        hls.ready(within)
+            .await
+            .map_err(|unwritten| match unwritten {
+                NotWritten::NotYet => PlayError::NotReady { channel: channel() },
+                NotWritten::Refused(refusal) => PlayError::Refused {
+                    channel: channel(),
+                    refusal,
+                },
+                NotWritten::Failed(error) => PlayError::Hls {
+                    channel: channel(),
+                    error,
+                },
+            })?;
+        Ok(dir)
+    }
+
+    /// Where its HLS files are, while it is written — being asked for one
+    /// of them counted as its being asked for.
+    pub(crate) fn hls_files(&self) -> Option<PathBuf> {
+        let attached = self.attached();
+        let hls = attached.hls.as_ref().filter(|hls| !hls.is_over())?;
+        Some(hls.asked().to_owned())
+    }
+
     /// Waits, up to `within`, for its source to be live — at once where it
     /// is — or says what it is doing instead.
     pub(crate) async fn live(&self, within: Duration) -> Result<(), PlayError> {
@@ -432,6 +497,9 @@ impl Channel {
         if let Some(recorder) = &attached.recorder {
             recorder.halt();
         }
+        if let Some(hls) = &attached.hls {
+            hls.halt();
+        }
         drop(attached);
         self.source.halt();
         self.hub.halt();
@@ -443,9 +511,15 @@ impl Channel {
     /// to stop.
     pub(crate) async fn stop(&self) {
         self.halt();
-        let recorder = self.attached().recorder.take();
+        let (recorder, hls) = {
+            let mut attached = self.attached();
+            (attached.recorder.take(), attached.hls.take())
+        };
         if let Some(recorder) = recorder {
             recorder.wait().await;
+        }
+        if let Some(hls) = hls {
+            hls.wait().await;
         }
         self.source.wait().await;
         self.hub.wait().await;
@@ -476,7 +550,7 @@ impl Drop for Channel {
 
 /// The first parts of the HTTP port's own paths, which a channel's
 /// `/<name>/whep` would be taken for.
-const RESERVED: [&str; 3] = ["api", "playback", "recordings"];
+const RESERVED: [&str; 4] = ["api", "assets", "playback", "recordings"];
 
 /// Whether `name` goes into a URL as one part of its path — letters,
 /// digits, `-`, `_`, `.` and `~`, and not `.` or `..` alone — and is no

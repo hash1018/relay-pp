@@ -46,6 +46,12 @@ candidates = ["192.168.0.10"]
 # keep = "30d"
 # max_size = "500GB"
 
+[hls]
+# How long a channel's HLS — http://<host>:8888/<name>/index.m3u8, written
+# from the first request for it — goes on being written after the last
+# request for its playlist or a segment.
+# idle = "30s"
+
 [convert]
 # What is converted for a way out that cannot carry what a camera sends —
 # WebRTC players, a recording — where a channel says nothing of it; a

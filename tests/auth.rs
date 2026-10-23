@@ -1,7 +1,7 @@
 //! Who may do what, against real clients: the API by the manager's token,
 //! RTSP players — FFmpeg's, answering a Digest challenge — as users or with
-//! a play token, WebRTC players with a token, and a recording watched with
-//! one carried in its URL.
+//! a play token, WebRTC players with a token, HLS players and a recording
+//! watched with one carried in their URLs.
 
 mod common;
 
@@ -153,6 +153,50 @@ fn webrtc_players_present_a_token() {
         "other channels"
     );
     assert!(open(Some(token(r#""play":["cam1"]"#))).is_ok(), "{url}");
+    server.stop();
+    camera.stop();
+}
+
+/// An HLS player sets no header: its token comes in the playlist's URL,
+/// and goes on in each segment's the playlist names. The page that plays a
+/// channel is anybody's; what it plays is not.
+#[test]
+fn hls_players_carry_a_token_in_their_urls() {
+    let camera = Camera::start("127.0.0.1:0".parse().unwrap());
+    let server = server_with(&auth(""));
+    made(&server, camera.addr);
+    let api = server.http_addr();
+
+    assert_eq!(http(api, "GET", "/cam1/index.m3u8", None).0, 401);
+    let elsewhere = token(r#""play":["door*"]"#);
+    let path = format!("/cam1/index.m3u8?token={elsewhere}");
+    assert_eq!(http(api, "GET", &path, None).0, 401, "a token for others");
+
+    let play = token(r#""play":["cam1"]"#);
+    let (status, _, playlist) = http(api, "GET", &format!("/cam1/index.m3u8?token={play}"), None);
+    assert_eq!(status, 200, "{playlist}");
+    let segment = playlist
+        .lines()
+        .find(|line| line.contains(".m4s"))
+        .expect("a segment")
+        .to_owned();
+    assert!(segment.ends_with(&format!("?token={play}")), "{segment}");
+    let bare = segment.split('?').next().unwrap();
+    assert_eq!(http_bytes(api, &format!("/cam1/{bare}")).0, 401);
+    assert_eq!(http_bytes(api, &format!("/cam1/{segment}")).0, 200);
+
+    // FFmpeg follows it, segment by segment.
+    let url = format!("http://{api}/cam1/index.m3u8?token={play}");
+    let mut input = media_pp::ffmpeg::format::input(&url).expect("the playlist opens");
+    let mut packet = media_pp::ffmpeg::Packet::empty();
+    let mut packets = 0;
+    while packets < 30 && packet.read(&mut input).is_ok() {
+        packets += 1;
+    }
+    assert_eq!(packets, 30);
+    drop(input);
+
+    assert_eq!(http(api, "GET", "/cam1", None).0, 200, "the page");
     server.stop();
     camera.stop();
 }

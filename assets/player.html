@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relay-pp</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #ddd; font: 14px system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; }
+  h1 { font-size: 16px; margin: 0 8px 0 0; }
+  button { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  button[aria-pressed="true"] { background: #2d4a6b; border-color: #4a7ab0; }
+  video { display: block; width: 100%; max-height: calc(100vh - 120px); background: #000; }
+  #state { padding: 6px 12px; color: #aaa; min-height: 1.4em; }
+  #recordings { padding: 0 12px 12px; }
+  #recordings form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  #recordings input { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 6px; font: inherit; }
+  #list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="name"></h1>
+  <button data-mode="webrtc">WebRTC</button>
+  <button data-mode="hls">HLS</button>
+  <button data-mode="recordings">Recordings</button>
+</header>
+<video id="video" controls autoplay muted playsinline></video>
+<div id="state"></div>
+<section id="recordings" hidden>
+  <form id="range">
+    <label>From <input type="datetime-local" id="from" step="1" required></label>
+    <label>To <input type="datetime-local" id="to" step="1"></label>
+    <button type="submit">Play</button>
+  </form>
+  <ul id="list"></ul>
+</section>
+<script src="/assets/hls.light.min.js"></script>
+<script>
+"use strict";
+// The channel is the page's own path, /<name>; a token the page was opened
+// with, ?token=, goes with every request it makes.
+const name = decodeURIComponent(location.pathname.split("/").filter(Boolean)[0] || "");
+const token = new URLSearchParams(location.search).get("token");
+const video = document.getElementById("video");
+const state = document.getElementById("state");
+const recordings = document.getElementById("recordings");
+const channelPath = "/" + encodeURIComponent(name);
+
+document.getElementById("name").textContent = name;
+document.title = name + " · relay-pp";
+
+const say = (text) => { state.textContent = text; };
+const withToken = (url) =>
+  token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url;
+const authorization = () => (token ? { Authorization: "Bearer " + token } : {});
+
+// What ends what plays now.
+let stopCurrent = async () => {};
+// Counts each start, so that one superseded while it waits gives up.
+let generation = 0;
+
+async function stop() {
+  const stopping = stopCurrent;
+  stopCurrent = async () => {};
+  await stopping();
+  video.srcObject = null;
+  video.removeAttribute("src");
+  video.load();
+}
+
+function gathered(pc, ms) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    const done = () => { if (pc.iceGatheringState === "complete") resolve(); };
+    pc.addEventListener("icegatheringstatechange", done);
+    setTimeout(resolve, ms);
+  });
+}
+
+function connected(pc, ms) {
+  return new Promise((resolve, reject) => {
+    const look = () => {
+      if (pc.connectionState === "connected") resolve();
+      else if (pc.connectionState === "failed") reject(new Error("the connection failed"));
+    };
+    pc.addEventListener("connectionstatechange", look);
+    look();
+    setTimeout(() => reject(new Error("no connection within " + ms / 1000 + " s")), ms);
+  });
+}
+
+async function playWebRtc() {
+  const pc = new RTCPeerConnection();
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.addTransceiver("audio", { direction: "recvonly" });
+  const stream = new MediaStream();
+  pc.ontrack = (event) => { stream.addTrack(event.track); video.srcObject = stream; };
+  let session = null;
+  stopCurrent = async () => {
+    pc.close();
+    if (session) {
+      try { await fetch(session, { method: "DELETE", headers: authorization() }); } catch (_) {}
+    }
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  await gathered(pc, 2000);
+  const answer = await fetch(channelPath + "/whep", {
+    method: "POST",
+    headers: { "Content-Type": "application/sdp", ...authorization() },
+    body: pc.localDescription.sdp,
+  });
+  if (!answer.ok) throw new Error(answer.status + ": " + (await answer.text()).trim());
+  session = answer.headers.get("Location");
+  await pc.setRemoteDescription({ type: "answer", sdp: await answer.text() });
+  await connected(pc, 10000);
+}
+
+function playHls(url) {
+  if (window.Hls && Hls.isSupported()) {
+    const retry = { maxNumRetry: 5, retryDelayMs: 1000, maxRetryDelayMs: 5000 };
+    const hls = new Hls({
+      // The first request for a channel's HLS is answered once its first
+      // segment is written: up to ten seconds or so.
+      manifestLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 15000,
+          maxLoadTimeMs: 20000,
+          timeoutRetry: retry,
+          errorRetry: retry,
+        },
+      },
+      liveSyncDurationCount: 2,
+    });
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      if (data.fatal) say("HLS: " + data.details);
+    });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => say(""));
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    stopCurrent = async () => hls.destroy();
+  } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = url;
+  } else {
+    throw new Error("this browser plays no HLS");
+  }
+}
+
+// Each mode: what it plays, given the generation it was started in.
+const modes = {
+  async webrtc(started) {
+    say("connecting over WebRTC…");
+    try {
+      await playWebRtc();
+      if (started === generation) say("");
+    } catch (error) {
+      if (started !== generation) return;
+      say("WebRTC: " + error.message + " — playing HLS instead");
+      await stop();
+      playHls(withToken(channelPath + "/index.m3u8"));
+    }
+  },
+  async hls() {
+    say("loading HLS…");
+    playHls(withToken(channelPath + "/index.m3u8"));
+  },
+  async recordings(started) {
+    recordings.hidden = false;
+    say("");
+    const list = document.getElementById("list");
+    list.replaceChildren();
+    const answer = await fetch(withToken("/api/v1/recordings/" + encodeURIComponent(name)));
+    if (started !== generation) return;
+    if (!answer.ok) {
+      say("recordings: " + answer.status + ": " + (await answer.text()).trim());
+      return;
+    }
+    const { recordings: chunks } = await answer.json();
+    if (!chunks.length) say("nothing recorded");
+    for (const chunk of chunks.reverse()) {
+      const from = new Date(chunk.start);
+      const to = new Date(from.getTime() + chunk.duration_s * 1000);
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.textContent = from.toLocaleString() + " · " + formatDuration(chunk.duration_s) +
+        (chunk.recording ? " · recording" : "");
+      button.onclick = () => playback(from, chunk.recording ? null : to);
+      item.append(button);
+      list.append(item);
+    }
+  },
+};
+
+function formatDuration(seconds) {
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return (h ? h + " h " : "") + m + " min " + (s % 60) + " s";
+}
+
+const utc = (date) => date.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+async function playback(from, to) {
+  await stop();
+  let url = "/playback" + channelPath + "/index.m3u8?from=" + utc(from);
+  if (to) url += "&to=" + utc(to);
+  say("loading the recording…");
+  try { playHls(withToken(url)); } catch (error) { say(error.message); }
+}
+
+document.getElementById("range").onsubmit = (event) => {
+  event.preventDefault();
+  const from = new Date(document.getElementById("from").value);
+  const toText = document.getElementById("to").value;
+  playback(from, toText ? new Date(toText) : null);
+};
+
+async function choose(mode) {
+  const started = ++generation;
+  for (const button of document.querySelectorAll("header button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
+  }
+  recordings.hidden = true;
+  await stop();
+  if (started !== generation) return;
+  try {
+    await modes[mode](started);
+  } catch (error) {
+    if (started === generation) say(error.message);
+  }
+}
+
+for (const button of document.querySelectorAll("header button")) {
+  button.onclick = () => choose(button.dataset.mode);
+}
+window.addEventListener("pagehide", () => { stopCurrent(); });
+choose(new URLSearchParams(location.search).get("mode") || "webrtc");
+</script>
+</body>
+</html>

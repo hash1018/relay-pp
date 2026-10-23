@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use crate::channel::{
     AttachError, Channel, ChannelConfig, ChannelError, Listeners, Output, PlayError,
 };
-use crate::config::{ConvertConfig, RecordConfig};
+use crate::config::{ConvertConfig, HlsConfig, RecordConfig};
 
 pub(crate) struct Channels {
     /// Read on every request, written only as a channel is added or
@@ -27,6 +27,8 @@ pub(crate) struct Channels {
     listeners: Listeners,
     /// How a recorded channel is recorded.
     pub(crate) record: RecordConfig,
+    /// How a channel's HLS is written.
+    hls: HlsConfig,
     /// What a channel converts, where it says nothing of it.
     convert: ConvertConfig,
     /// Where every channel's tasks run.
@@ -37,6 +39,7 @@ impl Channels {
     pub(crate) fn new(
         listeners: Listeners,
         record: RecordConfig,
+        hls: HlsConfig,
         convert: ConvertConfig,
         runtime: Handle,
     ) -> Self {
@@ -45,6 +48,7 @@ impl Channels {
             changing: Mutex::default(),
             listeners,
             record,
+            hls,
             convert,
             runtime,
         }
@@ -77,6 +81,7 @@ impl Channels {
         let channel = Arc::new(Channel::start(
             config,
             &self.record,
+            self.hls.idle,
             self.convert,
             &self.listeners,
             &self.runtime,

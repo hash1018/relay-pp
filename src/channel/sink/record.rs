@@ -295,12 +295,12 @@ fn until_next(now: SystemTime, chunk: Duration) -> Duration {
 
 /// Waits for `halt` to say halted. What `wait_for` gives back holds the
 /// watch's lock, which a `select!` would keep across its other arms' awaits.
-async fn halted(halt: &mut watch::Receiver<bool>) {
+pub(super) async fn halted(halt: &mut watch::Receiver<bool>) {
     let _ = halt.wait_for(|halted| *halted).await;
 }
 
 /// Sleeps until `at`, or for ever where there is none.
-async fn sleep_until(at: Option<Instant>) {
+pub(super) async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
@@ -309,7 +309,7 @@ async fn sleep_until(at: Option<Instant>) {
 
 /// Why a recording's pipeline ended, as its bus says; never, where there is
 /// none.
-async fn watch_bus(pipeline: Option<Arc<Pipeline>>) -> Stopped {
+pub(super) async fn watch_bus(pipeline: Option<Arc<Pipeline>>) -> Stopped {
     let Some(pipeline) = pipeline else {
         return std::future::pending().await;
     };
@@ -332,7 +332,7 @@ async fn watch_bus(pipeline: Option<Arc<Pipeline>>) -> Stopped {
 }
 
 /// Why a recording stopped.
-enum Stopped {
+pub(super) enum Stopped {
     /// It failed — a full disk, say — and is begun again after a while.
     Failed(String),
     /// The camera's pictures changed shape — size, profile — partway

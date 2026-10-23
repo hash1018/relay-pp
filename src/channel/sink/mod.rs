@@ -3,11 +3,13 @@
 //! RTSP and WebRTC players are reached through a listener every channel
 //! shares, the channel registered on it reading the broadcast its hub says
 //! ([`listener`]); a recording is a recorder of the channel's own
-//! ([`record`]). Each says what it carries as a [`Profile`] — what its
+//! ([`record`]); HLS players read a live playlist the channel writes while
+//! they ask for it ([`hls`]). Each says what it carries as a [`Profile`] — what its
 //! media-pp server or muxer sends, narrowed to what its players play — and
 //! reads what the hub gives it for that: none knows what the channel's
 //! source sends, nor whether what it reads is converted.
 
+mod hls;
 mod listener;
 mod record;
 
@@ -16,6 +18,7 @@ use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 
 use super::hub::{Demand, Profile, Target};
+pub(crate) use hls::{HlsLive, NotWritten, PLAYLIST as HLS_PLAYLIST, is_media_file};
 pub(crate) use listener::{ListenerSink, Listeners, Unready};
 pub(crate) use record::{RecordStatus, Recorder};
 
@@ -28,6 +31,8 @@ pub(crate) enum Output {
     WebRtc,
     /// The channel's recording.
     Record,
+    /// HLS players, through the channel's live playlist.
+    Hls,
 }
 
 impl Output {
@@ -36,6 +41,7 @@ impl Output {
             Output::Rtsp => "rtsp",
             Output::WebRtc => "webrtc",
             Output::Record => "record",
+            Output::Hls => "hls",
         }
     }
 
@@ -54,7 +60,12 @@ impl Output {
             },
             Output::Record => Profile {
                 name: "record",
-                carries: record_carries,
+                carries: fmp4_carries,
+                sound: Target::Aac,
+            },
+            Output::Hls => Profile {
+                name: "hls",
+                carries: fmp4_carries,
                 sound: Target::Aac,
             },
         }
@@ -62,11 +73,13 @@ impl Output {
 
     /// For how long what it needs is made: for WebRTC players, who ask over
     /// WHEP before they play, while they play; for RTSP players, who reach
-    /// the listener without asking, and a recording, throughout.
+    /// the listener without asking, and a recording, throughout; for HLS
+    /// players, whose live is held only while they ask for it, as long as
+    /// it is.
     pub(crate) fn demand(self) -> Demand {
         match self {
             Output::WebRtc => Demand::WhileRead,
-            Output::Rtsp | Output::Record => Demand::Always,
+            Output::Rtsp | Output::Record | Output::Hls => Demand::Always,
         }
     }
 }
@@ -91,12 +104,11 @@ fn webrtc_carries(track: &StreamInfo) -> bool {
     played && WebRtcServer::carries(track)
 }
 
-/// What HLS of fMP4 holds: a track is recorded as it came wherever it
-/// can be — Opus, VP9 and AV1 among them — and converted only where it
-/// cannot: VP8, G.711. That a player plays what is recorded is the
-/// player's: Safari's own does not play Opus, hls.js in a browser that
-/// does, does.
-fn record_carries(track: &StreamInfo) -> bool {
+/// What HLS of fMP4 holds, recorded or live: a track goes as it came
+/// wherever it can — Opus, VP9 and AV1 among them — and is converted only
+/// where it cannot: VP8, G.711. That a player plays it is the player's:
+/// Safari's own does not play Opus, hls.js in a browser that does, does.
+fn fmp4_carries(track: &StreamInfo) -> bool {
     HlsMuxer::carries(track, HlsSegmentFormat::Fmp4)
 }
 
@@ -176,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_carries_what_fmp4_holds() {
+    fn a_recording_and_hls_carry_what_fmp4_holds() {
         for track in [
             video(Id::H264),
             video(Id::HEVC),
@@ -194,6 +206,14 @@ mod tests {
         for track in [audio(Id::PCM_MULAW), video(Id::VP8)] {
             assert!(
                 !carried(Output::Record, &track),
+                "{:?}",
+                track.parameters().id()
+            );
+        }
+        for track in [video(Id::HEVC), audio(Id::OPUS), audio(Id::PCM_MULAW)] {
+            assert_eq!(
+                carried(Output::Hls, &track),
+                carried(Output::Record, &track),
                 "{:?}",
                 track.parameters().id()
             );

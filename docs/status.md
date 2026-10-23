@@ -1,6 +1,7 @@
 # What relay-pp does now
 
-Phases 1 and 2 of [the design](design.md), as built. What is planned but
+Phases 1 to 3 of [the design](design.md), as built — and of phases 4 and
+5, authorization and published sources. What is planned but
 not here is listed at the end.
 
 ## In one paragraph
@@ -10,8 +11,10 @@ its own — makes each one over the HTTP API with its source alone, an RTSP
 camera, which relay-pp pulls from then on, connecting again whenever it
 drops. What reads a channel is asked for separately: an RTSP player asks
 the API where to play it and is told a URL; a WebRTC player offers to its
-WHEP URL; a recording is attached and detached over the API, and written
-as HLS a player can follow while it is written and play back afterwards.
+WHEP URL; an HLS player asks for its playlist, written while it asks; a
+browser opens the channel's page, which plays it by either; a recording is
+attached and detached over the API, and written as HLS a player can follow
+while it is written and play back afterwards.
 Nothing is decoded or encoded. Nothing is kept across a restart but the
 recordings: the manager makes the channels again.
 
@@ -40,13 +43,14 @@ has them all with comments.
 | `webrtc.listen` | `0.0.0.0:8189` | the UDP address WebRTC media goes through |
 | `webrtc.candidates` | none | addresses players are told to send to — a router's public address, the machine's own where `listen` is every interface; an IP alone keeps `listen`'s port |
 | `webrtc.threads` | media-pp's default | how many threads WebRTC sessions are spread over, each a UDP port of its own from `listen`'s on |
-| `http.listen` | `0.0.0.0:8888` | the API, WHEP, WHIP and recordings |
+| `http.listen` | `0.0.0.0:8888` | the API, WHEP, WHIP, HLS, the player page and recordings |
 | `rtmp.listen` | `0.0.0.0:1935` | where RTMP publishers connect |
 | `record.dir` | `recordings` | where recordings go |
 | `record.segment` | `"4s"` | how long a recorded segment is — what a player seeks to — cut at the next keyframe after it |
 | `record.chunk` | `"1h"` | how long one recording directory runs, at whole multiples of it in UTC |
 | `record.keep` | none | how long a recording is kept from its last write: `"30d"` |
 | `record.max_size` | none | how much all recordings together may take, the oldest removed first: `"500GB"`, `"2TiB"` |
+| `hls.idle` | `"30s"` | how long a channel's HLS goes on being written after the last request for its playlist or a segment |
 | `convert.sound` | `"auto"` | sound a way out cannot carry: `"auto"`, converted for it; `"off"`, left out of it — see "Conversions" |
 | `convert.video` | `"gpu"` | pictures a way out cannot carry: `"gpu"`, converted on a GPU and refused where none takes them; `"any"`, on the processor where no GPU does; `"off"`, that way out refused |
 | `auth.api_token` | none | what the manager presents for the API, 16 characters or more — see "Who may" |
@@ -94,7 +98,7 @@ No token or password is logged, nor kept beside the configuration.
 
 On the HTTP port. JSON in and out. A channel's name is letters, digits,
 `-`, `_`, `.` and `~` — not `/`, so that it is one part of a URL's path —
-and not `api`, `playback` or `recordings`.
+and not `api`, `assets`, `playback` or `recordings`.
 
 | | | |
 |---|---|---|
@@ -107,6 +111,10 @@ and not `api`, `playback` or `recordings`.
 | `DELETE /api/v1/channels/{name}/record` | end recording it | `204`; `404` |
 | `GET /api/v1/recordings/{name}` | its recordings | `200` |
 | `GET /playback/{name}/index.m3u8` | a stretch of its recordings, as one playlist | `200`; `400`, `404` |
+
+Besides the API, a channel's players' own URLs — `/{name}/whep`,
+`/{name}/index.m3u8` and its segments, and `/{name}`, the page that plays
+it — are under "Players" below.
 
 ### `POST /api/v1/channels` — make one
 
@@ -219,13 +227,30 @@ way.
   first; before, the RTSP listener does not know the channel. RTP over TCP
   or UDP; any codec the camera sends.
 - **WebRTC through WHEP** at `http://<host>:8888/<name>/whep`, by any WHEP
-  client (a page in relay-pp comes in phase 3): `POST` an `application/sdp`
-  offer, `201` with the answer and `Location: /<name>/whep/<session>`;
-  `DELETE` that to leave; `OPTIONS` says what it takes. The offer is the
-  asking: there is nothing to call first. Sound in a codec WebRTC does not
-  carry is converted to Opus for it — see "Conversions" below.
+  client, the page below among them: `POST` an `application/sdp` offer,
+  `201` with the answer and `Location: /<name>/whep/<session>`; `DELETE`
+  that to leave; `OPTIONS` says what it takes. The offer is the asking:
+  there is nothing to call first. Sound in a codec WebRTC does not carry is
+  converted to Opus for it — see "Conversions" below.
+- **HLS** at `http://<host>:8888/<name>/index.m3u8`: fragmented MP4, a
+  sliding window of six segments of a second each, cut at the next
+  keyframe — a player starts two or three of them behind the camera. A
+  channel's HLS is written from the first request for its playlist, which
+  waits for its first segment, and goes on while players ask for the
+  playlist or a segment; `hls.idle` after the last request it stops, and
+  its files, under the system's temporary directory, are removed. What the
+  camera sends goes as it came wherever fMP4 holds it, as a recording does,
+  and is converted where it does not. A player that comes with a
+  `?token=` finds it in the URL of each segment the playlist names.
+- **The page** at `http://<host>:8888/<name>`: plays the channel in a
+  browser over WebRTC, and over HLS where WebRTC does not get through or is
+  chosen; and its recordings, listed or between two times. It carries the
+  `?token=` it was opened with to whatever it asks for. It is served to
+  anybody — what it plays is not — and plays HLS through hls.js 1.7.3,
+  served by relay-pp itself (`/assets/hls.light.min.js`, Apache-2.0), so
+  that it plays on a network that reaches no CDN.
 
-Either waits up to 10 seconds for the camera to be live — a channel just
+Each waits up to 10 seconds for the camera to be live — a channel just
 made, or a camera connecting again — and for what is converted for its
 players to begin, and answers saying why where it cannot play:
 
@@ -235,13 +260,15 @@ players to begin, and answers saying why where it cannot play:
 | `503`, `Retry-After: 5` | the camera not live yet, or a conversion still beginning | ask again soon |
 | `503`, `Retry-After: 30` | pictures to convert on the GPU alone, and no GPU encoder free | ask again later |
 | `409` | pictures its players cannot carry, on a channel that converts none | asking again does not help |
+| `503`, `Retry-After: 2` | HLS failed to be written, and is begun again | ask again soon |
 | `500` | a conversion or a listener failed | see the log |
 
-A player starts at a keyframe of the last second the channel holds, or
-waits for the next one: up to the camera's keyframe interval before its
-first picture. A channel keeps only that second, as room for a player to
-fall behind — about half a megabyte of a 4 Mbit/s camera — and no group of
-pictures.
+A channel keeps the last second of its stream while something reads it, as
+room for a player to fall behind — about half a megabyte of a 4 Mbit/s
+camera — and nothing while nothing does. A player joining one already read
+starts at a keyframe of that second, or waits for the next one; the first
+to join one nobody reads waits for the camera's next keyframe: up to its
+keyframe interval before its first picture.
 
 ## Recording
 
@@ -370,12 +397,14 @@ camera's stream into the channel's broadcast, and one reading the
 connection — and one for each track's UDP socket, pulled over UDP. Its
 open, which blocks, borrows a thread of the runtime's blocking pool while
 it runs. Each recording is a
-pipeline of its own, and so is what a channel converts, while it does: a
-thread reading the channel's stream, and one for each track converted.
+pipeline of its own, and so is each channel's HLS while it is written, and
+what a channel converts, while it does: a thread reading the channel's
+stream, and one for each track converted.
 Everything else that waits — the API, WHEP, each channel's source, which
 waits on its connection and before connecting again, its hub, which decides
 what is converted, each listener registration, which follows what its
-players read, and each recorder — is a task on the same runtime. The RTSP and WebRTC listeners have
+players read, each recorder and each HLS writer — is a task on the same
+runtime. The RTSP and WebRTC listeners have
 threads of their own, shared by every channel.
 
 ## Verified
@@ -402,6 +431,11 @@ byte range; listed; a stretch across chunks played back as one playlist and
 read back by FFmpeg through the server; a recording ended and begun again as
 the camera dropped and came back, taken off and put back on, and ended by a
 stop. Retention, playlist reading and the playback playlist by unit tests.
+Played over HLS live, FFmpeg reading pictures and sound through the server
+as the playlist slides; the HLS let go of once nobody asked, nothing of it
+served after, and written again when asked for; a token in an HLS player's
+URL carried into each segment's, a segment refused without it; the page
+and hls.js served.
 
 By hand, in phase 1: a file served by media-pp's `rtsp_server` example as
 the camera, FFmpeg playing over RTSP (TCP and UDP), two WHEP players through
@@ -410,14 +444,18 @@ minute.
 
 What it costs against MediaMTX on Windows is in [benchmarks.md](benchmarks.md).
 
-Not yet: Ctrl+C on the binary, a real IP camera, a browser through WHEP or
-playing a recording, and a recording of hours.
+By hand, in phase 3: the page in a browser (the Claude desktop app's,
+Chromium) against media-pp's `rtsp_server` serving a 1080p H.264 and Opus
+file: played over WebRTC, over HLS — two seconds behind the camera — and a
+recording played back from its list.
+
+Not yet: Ctrl+C on the binary, a real IP camera, Safari's own HLS, and a
+recording of hours.
 
 ## Not here yet
 
 | | Phase |
 |---|---|
-| A player page, HLS live | 3 |
 | Hooks, metrics, a manager asked over HTTP who may play | 4 |
 | On-demand sources, forwarding, event recording | 5 |
 | Packaging, a soak of a hundred cameras | 6 |

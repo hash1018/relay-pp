@@ -88,7 +88,7 @@ impl ListenerSink {
         let listener = match output {
             Output::Rtsp => Listener::Rtsp(listeners.rtsp.clone()),
             Output::WebRtc => Listener::WebRtc(listeners.webrtc.clone()),
-            Output::Record => return None,
+            Output::Record | Output::Hls => return None,
         };
         let registration = Arc::new(Registration {
             channel: channel.to_owned(),

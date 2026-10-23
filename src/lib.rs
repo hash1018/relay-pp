@@ -151,6 +151,7 @@ impl Server {
         let channels = Arc::new(Channels::new(
             listeners.clone(),
             config.record.clone(),
+            config.hls.clone(),
             config.convert,
             runtime.handle().clone(),
         ));

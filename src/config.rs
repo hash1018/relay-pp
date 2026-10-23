@@ -52,6 +52,9 @@ pub struct Config {
     /// Recording, for the channels made with `"record": true`.
     #[serde(default)]
     pub record: RecordConfig,
+    /// HLS players.
+    #[serde(default)]
+    pub hls: HlsConfig,
     /// What is converted for a way out that cannot carry what a camera
     /// sends, unless a channel says otherwise.
     #[serde(default)]
@@ -206,6 +209,31 @@ impl Default for RecordConfig {
             chunk: Self::default_chunk(),
             keep: None,
             max_size: None,
+        }
+    }
+}
+
+/// `[hls]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlsConfig {
+    /// How long a channel's HLS goes on being written after the last
+    /// request for its playlist or a segment: `"30s"`. A player asks every
+    /// second or so while it plays.
+    #[serde(default = "HlsConfig::default_idle", with = "duration")]
+    pub idle: Duration,
+}
+
+impl HlsConfig {
+    fn default_idle() -> Duration {
+        Duration::from_secs(30)
+    }
+}
+
+impl Default for HlsConfig {
+    fn default() -> Self {
+        Self {
+            idle: Self::default_idle(),
         }
     }
 }
@@ -480,6 +508,15 @@ mod tests {
                 "203.0.113.7:8189".parse().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn how_long_hls_is_written_unasked_for_is_read_with_its_unit() {
+        let config = Config::parse("[hls]\nidle = \"90s\"").unwrap();
+        assert_eq!(config.hls.idle, Duration::from_secs(90));
+        let defaults = Config::parse("").unwrap().hls;
+        assert_eq!(defaults.idle, Duration::from_secs(30));
+        assert!(Config::parse("[hls]\nidle = \"soon\"").is_err());
     }
 
     #[test]

@@ -5,8 +5,9 @@ takes streams in by whatever protocol they come — RTSP cameras, RTSP, RTMP
 and WHIP publishers — hands each out to RTSP, WebRTC and HLS players, and
 records what it is told to.
 
-Phases 1 and 2 are built — channels made over an HTTP API, each an RTSP camera
-pulled, played over RTSP and WebRTC (WHEP) and recorded as HLS.
+Phases 1 to 3 are built — channels made over an HTTP API, each an RTSP camera
+pulled or a publisher taken in, played over RTSP, WebRTC (WHEP) and HLS and
+in a browser by a page of relay-pp's own, and recorded as HLS.
 [docs/status.md](docs/status.md)
 is what it does now, in full, and what it does not yet;
 [docs/benchmarks.md](docs/benchmarks.md) measures it against MediaMTX;
@@ -34,6 +35,8 @@ curl -X POST http://<host>:8888/api/v1/channels \
 curl -X POST http://<host>:8888/api/v1/channels/cam1/play \
      -H 'Content-Type: application/json' -d '{"protocol":"rtsp"}'
 # A WebRTC player needs no question: any WHEP client at http://<host>:8888/cam1/whep
+# Nor an HLS player: http://<host>:8888/cam1/index.m3u8
+# A browser plays it, and its recordings, at http://<host>:8888/cam1
 
 # Recording it, as HLS, until told otherwise.
 curl -X POST   http://<host>:8888/api/v1/channels/cam1/record
@@ -49,8 +52,13 @@ curl -X DELETE http://<host>:8888/api/v1/channels/cam1
 [docs/status.md](docs/status.md) has every request and answer. Ctrl+C stops
 it. relay-pp logs to the terminal and media-pp to `logs/`.
 
-The API has no authentication until phase 4: anyone who reaches the HTTP
-port can make and remove channels, and read every recording.
+Without an `[auth]` section anyone who reaches the HTTP port can make and
+remove channels, play them and read every recording — see "Who may" in
+[docs/status.md](docs/status.md).
+
+The page plays HLS through [hls.js](https://github.com/video-dev/hls.js)
+1.7.3, served by relay-pp itself from `assets/hls.js/`, under the Apache
+License 2.0 (`assets/hls.js/LICENSE`).
 
 Building needs FFmpeg's development libraries, as media-pp does — see its
 [building guide](https://github.com/hash1018/media-pp/tree/main/docs/building).

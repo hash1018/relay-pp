@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::clock::{Utc, rfc3339};
@@ -239,12 +240,10 @@ fn absolute_map(map: &str, url: &str) -> String {
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// The server's retention: a sweep of the recordings at start and every
-/// minute after, on the blocking pool, for as long as the runtime runs.
-/// Nothing where `[record]` keeps everything.
-pub(crate) async fn keep(record: RecordConfig) {
-    if record.keep.is_none() && record.max_size.is_none() {
-        return;
-    }
+/// minute after, on the blocking pool, for as long as the runtime runs —
+/// which, where `[record]` keeps everything, removes nothing. What each
+/// sweep leaves, in bytes, goes in `measured`, for the metrics.
+pub(crate) async fn keep(record: RecordConfig, measured: Arc<Mutex<Option<u64>>>) {
     let retention = Retention {
         keep: record.keep,
         max_size: record.max_size,
@@ -258,10 +257,11 @@ pub(crate) async fn keep(record: RecordConfig) {
         let root = record.dir.clone();
         let swept =
             tokio::task::spawn_blocking(move || sweep(&root, retention, SystemTime::now())).await;
-        if let Ok((removed, left)) = swept
-            && removed > 0
-        {
-            tracing::info!("retention removed {removed} recordings; {left} bytes kept");
+        if let Ok((removed, left)) = swept {
+            if removed > 0 {
+                tracing::info!("retention removed {removed} recordings; {left} bytes kept");
+            }
+            *measured.lock().unwrap_or_else(|p| p.into_inner()) = Some(left);
         }
     }
 }

@@ -1,12 +1,12 @@
 //! The one HTTP port: the API, WHEP for WebRTC players, HLS live, the
-//! player page, and recordings — see `docs/design.md`, "HTTP".
+//! player page, recordings, and metrics — see `docs/design.md`, "HTTP".
 //!
 //! WHEP is answered here over `WebRtcServerHandle::play` and `close` rather
 //! than by `WebRtcServer::serve_http`'s listener of its own, so there is one
 //! port to open and one place that decides who may play.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use media_pp::elements::{SessionId, WebRtcServerError, WebRtcServerHandle};
+use media_pp::elements::{RtspServerHandle, SessionId, WebRtcServerError, WebRtcServerHandle};
 use serde::Deserialize;
 use tower_http::services::ServeDir;
 
@@ -27,7 +27,7 @@ use crate::channel::{
     PlayError, Refusal, is_media_file, whip_path,
 };
 use crate::channels::Channels;
-use crate::{clock, recordings};
+use crate::{clock, metrics, recordings};
 
 /// How long a player's request waits for a channel's camera to be live —
 /// one just made, or connecting again — before it is answered that it is
@@ -48,6 +48,8 @@ const HLS_JS: &[u8] = include_bytes!("../assets/hls.js/hls.light.min.js");
 pub(crate) struct AppState {
     pub(crate) channels: Arc<Channels>,
     pub(crate) webrtc: WebRtcServerHandle,
+    /// The RTSP listener, for how many play.
+    pub(crate) rtsp: RtspServerHandle,
     /// The port RTSP players connect to.
     pub(crate) rtsp_port: u16,
     /// What RTSP URLs begin with in place of the host a request came to
@@ -55,6 +57,9 @@ pub(crate) struct AppState {
     pub(crate) rtsp_public_url: Option<String>,
     /// Who may do what; anybody anything, where `None`.
     pub(crate) auth: Option<Arc<Auth>>,
+    /// What the recordings take on disk, as the retention sweep last
+    /// measured it.
+    pub(crate) recorded_bytes: Arc<Mutex<Option<u64>>>,
 }
 
 /// Every route: the manager's, a player's of a channel live, and a
@@ -70,6 +75,7 @@ pub(crate) fn router(state: AppState) -> Router {
             "/api/v1/channels/{name}/record",
             post(record).delete(unrecord),
         )
+        .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), manager_only));
     let players = Router::new()
         .route("/api/v1/channels/{name}/play", post(play))
@@ -243,6 +249,32 @@ async fn list_channels(State(state): State<AppState>) -> Response {
         .map(|channel| channel.status())
         .collect();
     axum::Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
+/// `GET /metrics`: see [`metrics`].
+async fn metrics(State(state): State<AppState>) -> Response {
+    let readings = metrics::Readings {
+        channels: state
+            .channels
+            .list()
+            .iter()
+            .map(|channel| channel.status())
+            .collect(),
+        rtsp_players: state.rtsp.players(),
+        webrtc_sessions: state.webrtc.session_stats(),
+        recorded_bytes: *state
+            .recorded_bytes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    };
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics::text(&readings),
+    )
+        .into_response()
 }
 
 async fn one_channel(State(state): State<AppState>, Path(name): Path<String>) -> Response {

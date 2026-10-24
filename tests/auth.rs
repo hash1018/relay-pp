@@ -88,6 +88,16 @@ fn the_api_takes_the_managers_token_alone() {
     let (status, _, listed) = http_as(api, "GET", "/api/v1/channels", None, manager());
     assert_eq!(status, 200);
     assert!(listed.contains(r#""name":"cam1""#), "{listed}");
+
+    // The metrics are the manager's too: they name every channel.
+    assert_eq!(http(api, "GET", "/metrics", None).0, 401);
+    assert_eq!(http_as(api, "GET", "/metrics", None, Some(&player)).0, 401);
+    let (status, _, metrics) = http_as(api, "GET", "/metrics", None, manager());
+    assert_eq!(status, 200);
+    assert!(
+        metrics.contains(r#"relay_pp_channel_up{channel="cam1"}"#),
+        "{metrics}"
+    );
     server.stop();
 }
 

@@ -124,6 +124,9 @@ struct Shared {
     feeds: Mutex<BTreeMap<&'static str, watch::Sender<Fed>>>,
     /// What the pipeline converts now, as the status names it.
     converting: Mutex<Vec<String>>,
+    /// How many times pictures to convert were refused for want of a free
+    /// GPU encoder.
+    gpu_refused: AtomicU64,
     next_subscription: AtomicU64,
     /// Rung where a sink cannot go on with the run live — see
     /// [`Subscription::renew`].
@@ -164,6 +167,7 @@ impl Hub {
             commands,
             feeds: Mutex::default(),
             converting: Mutex::default(),
+            gpu_refused: AtomicU64::new(0),
             next_subscription: AtomicU64::new(0),
             renew: Notify::new(),
         });
@@ -224,6 +228,12 @@ impl Hub {
             shared: Arc::clone(&self.shared),
             fed,
         }
+    }
+
+    /// How many times pictures to convert were refused for want of a free
+    /// GPU encoder, since it started.
+    pub(crate) fn gpu_refused(&self) -> u64 {
+        self.shared.gpu_refused.load(Ordering::Relaxed)
     }
 
     /// Each track converted now, and to what: `"1:opus"`.
@@ -470,6 +480,9 @@ impl Hubbing {
                 continue;
             }
             if let Err(reason) = self.write(read, &infos, run) {
+                if matches!(reason, Refusal::NoGpu(_)) {
+                    self.shared.gpu_refused.fetch_add(1, Ordering::Relaxed);
+                }
                 tracing::warn!(
                     channel = %self.shared.name,
                     "cannot convert for {}: {reason}",

@@ -1,7 +1,7 @@
 # What relay-pp does now
 
 Phases 1 to 3 of [the design](design.md), as built — and of phases 4 and
-5, authorization and published sources. What is planned but
+5, authorization, metrics and published sources. What is planned but
 not here is listed at the end.
 
 ## In one paragraph
@@ -110,6 +110,7 @@ and not `api`, `assets`, `playback` or `recordings`.
 | `POST /api/v1/channels/{name}/record` | begin recording it | `201`; `404`, `409` |
 | `DELETE /api/v1/channels/{name}/record` | end recording it | `204`; `404` |
 | `GET /api/v1/recordings/{name}` | its recordings | `200` |
+| `GET /metrics` | what runs, for Prometheus — see "Metrics" | `200` |
 | `GET /playback/{name}/index.m3u8` | a stretch of its recordings, as one playlist | `200`; `400`, `404` |
 
 Besides the API, a channel's players' own URLs — `/{name}/whep`,
@@ -166,6 +167,7 @@ there. Each is:
 | `recording` | the playlist of the recording being written, while one is |
 | `record_error` | why its last recording failed, until one is written again |
 | `conversions` | each track converted now, and to what: `"1:opus"` — see "Conversions" |
+| `gpu_refused` | times its pictures were refused a conversion for want of a free GPU encoder |
 | `convert` | what may be converted for it, its own say over the server's: `{"sound": "auto", "video": "gpu"}` |
 
 Credentials never reach an answer or a log line.
@@ -383,6 +385,32 @@ yet.
 - Where a conversion cannot be made or is not to be, a player is answered
   saying why (see "Players"), and a recording says so in `record_error`.
 
+## Metrics
+
+`GET /metrics` answers in Prometheus's text format, the manager's alone
+where there is `[auth]` (`Authorization: Bearer <api_token>`, which
+Prometheus sends as `authorization: {credentials: …}`). Each is read when
+it is asked for, from what the channels and listeners count already.
+
+| Series | Type | What |
+|---|---|---|
+| `relay_pp_channel_up{channel}` | gauge | 1 while the channel's stream comes in |
+| `relay_pp_channel_state{channel,state}` | gauge | 1 for the state its source is in: `connecting`, `live`, `waiting`, `awaiting_publisher` |
+| `relay_pp_channel_connections_total{channel}` | counter | times its source has gone live |
+| `relay_pp_channel_received_bytes_total{channel}` | counter | what its source has written, over every connection |
+| `relay_pp_channel_readers{channel}` | gauge | readers of its stream: players, its recording, its HLS, its conversions |
+| `relay_pp_channel_webrtc_players{channel}` | gauge | its WebRTC players |
+| `relay_pp_channel_recording{channel}` | gauge | 1 while a recording of it is written |
+| `relay_pp_channel_record_failed{channel}` | gauge | 1 from its recording failing until one is written again |
+| `relay_pp_channel_hls{channel}` | gauge | 1 while its HLS is written |
+| `relay_pp_channel_conversions{channel}` | gauge | its tracks converted now |
+| `relay_pp_channel_gpu_refused_total{channel}` | counter | times its pictures were refused a conversion for want of a free GPU encoder |
+| `relay_pp_rtsp_players` | gauge | RTSP players, every channel together — the listener counts no finer |
+| `relay_pp_recordings_bytes` | gauge | what every recording takes on disk, measured by the retention sweep once a minute; absent before its first |
+
+A channel's status (`GET /api/v1/channels/{name}`) has the same
+`gpu_refused`. What is free on the disk is the machine's own exporter's.
+
 ## Stopping
 
 A stop takes no more requests, finishes every recording, lets go of every
@@ -435,7 +463,8 @@ Played over HLS live, FFmpeg reading pictures and sound through the server
 as the playlist slides; the HLS let go of once nobody asked, nothing of it
 served after, and written again when asked for; a token in an HLS player's
 URL carried into each segment's, a segment refused without it; the page
-and hls.js served.
+and hls.js served. The metrics read out a camera pulled, recorded and played
+over RTSP and WebRTC; the manager's alone under `[auth]`.
 
 By hand, in phase 1: a file served by media-pp's `rtsp_server` example as
 the camera, FFmpeg playing over RTSP (TCP and UDP), two WHEP players through
@@ -456,7 +485,7 @@ recording of hours.
 
 | | Phase |
 |---|---|
-| Hooks, metrics, a manager asked over HTTP who may play | 4 |
+| Hooks, a manager asked over HTTP who may play | 4 |
 | On-demand sources, forwarding, event recording | 5 |
 | Packaging, a soak of a hundred cameras | 6 |
 

@@ -46,6 +46,7 @@ curl http://<host>:8888/api/v1/recordings/cam1
 curl 'http://<host>:8888/playback/cam1/index.m3u8?from=2026-10-23T14:00:00Z&to=2026-10-23T15:00:00Z'
 
 curl http://<host>:8888/api/v1/channels            # what each is doing
+curl http://<host>:8888/metrics                     # the same, for Prometheus
 curl -X DELETE http://<host>:8888/api/v1/channels/cam1
 ```
 

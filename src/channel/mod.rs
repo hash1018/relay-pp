@@ -210,6 +210,9 @@ pub struct ChannelStatus {
     /// Each track converted, and to what, while it is: `"1:opus"`, track 1
     /// converted to Opus for WebRTC players.
     pub conversions: Vec<String>,
+    /// How many times its pictures were refused a conversion for want of a
+    /// free GPU encoder.
+    pub gpu_refused: u64,
 }
 
 /// A channel being served.
@@ -325,6 +328,7 @@ impl Channel {
             record_error: record.error,
             convert: self.convert,
             conversions: self.hub.conversions(),
+            gpu_refused: self.hub.gpu_refused(),
         }
     }
 

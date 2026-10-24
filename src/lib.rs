@@ -11,6 +11,7 @@ mod channels;
 mod clock;
 pub mod config;
 mod http;
+mod metrics;
 mod recordings;
 
 use std::net::SocketAddr;
@@ -155,7 +156,11 @@ impl Server {
             config.convert,
             runtime.handle().clone(),
         ));
-        runtime.spawn(recordings::keep(config.record.clone()));
+        let recorded_bytes = Arc::new(std::sync::Mutex::new(None));
+        runtime.spawn(recordings::keep(
+            config.record.clone(),
+            Arc::clone(&recorded_bytes),
+        ));
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind(config.http.listen))
             .map_err(|error| StartError::Listen {
@@ -169,9 +174,11 @@ impl Server {
         let router = http::router(http::AppState {
             channels: Arc::clone(&channels),
             webrtc: listeners.webrtc.clone(),
+            rtsp: listeners.rtsp.clone(),
             rtsp_port: listeners.rtsp.local_addr().port(),
             rtsp_public_url: config.rtsp.public_url.clone(),
             auth,
+            recorded_bytes,
         });
         let (http_stop, stopped) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn(async move {

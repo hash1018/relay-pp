@@ -140,6 +140,42 @@ Both record the stream as it came, Opus included, in fMP4: a track is
 converted for a recording only where fMP4 cannot hold it. Converting the
 Opus to AAC, as relay-pp did before, took 501 at 100.
 
+### Three and a half hours of a hundred cameras
+
+relay-pp at 50582a3 (media-pp 6b19a68c), on Windows, on the loopback:
+
+- **Setup.**
+  - 100 channels pulled one camera, media-pp's `rtsp_server` looping the stream above, a 60 s file of H.264 and Opus, 210 times over.
+  - 20 channels were recorded in two-minute chunks under `max_size = "15GB"`.
+- **Load.** Every five minutes, 42 rounds in all:
+  - 5 RTSP and 5 WebRTC players for two minutes, each round on other channels;
+  - three channels played over HLS for two minutes;
+  - one channel removed and made again.
+
+| | |
+|---|---|
+| Channels live | 100 throughout |
+| Recordings | 20 throughout, none failed; 263 chunks, the size sweep holding them at 13.9 GB |
+| RTSP players | 210 played, no packet lost |
+| WebRTC players | 205 played, no picture after a gap; 5 refused `404`, offered in the 90 ms their channel was being made again |
+| Warnings logged | none past the start; media-pp's log empty |
+| Processor | 128 % on average |
+| Private memory, after the first half hour | 178 MB on average, 118–217 MB, +2.0 MB an hour (standard error 1.7): no trend |
+| Threads | 247–259, no trend |
+| Handles | 819 at the start, 863 at the end |
+
+Handles rose by about 45 over the run, rising more slowly as it went on:
++24 in its first 100 minutes, +9 in the next 110. A straight line fits
++9 an hour.
+
+Each thing a round does, repeated on its own, left none behind:
+- a channel made and removed, 40 times;
+- an RTSP, a WebRTC and an HLS player, 40 times each;
+- a recording beginning a new chunk, 150 times, with the sweep removing them;
+- 40 channels, each played for the first time over RTSP, WebRTC and HLS.
+
+What rose is not found yet. A longer run would say whether it levels off.
+
 ## Pulling with `retina`'s client
 
 relay-pp at 6aa8188 pulls a camera with `retina`'s RTSP client, a task on

@@ -21,7 +21,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::record::{Stopped, halted, sleep_until, watch_bus};
+use super::follow::{halted, sleep_until, watch_bus};
 use crate::channel::hub::{Fed, Feed, Refusal, Subscription};
 use crate::channel::task::Task;
 
@@ -200,16 +200,11 @@ impl Shared {
                     }
                 }
                 stopped = watch_bus(watched) => {
-                    let reason = match &stopped {
-                        Stopped::Failed(reason) | Stopped::PictureChanged(reason) => reason.clone(),
-                    };
+                    let reason = stopped.reason();
                     tracing::warn!(channel = %self.name, "HLS ended: {reason}");
-                    *lock(&self.error) = Some(reason);
+                    *lock(&self.error) = Some(reason.to_owned());
                     self.end(writing.take()).await;
-                    match stopped {
-                        Stopped::PictureChanged(_) => self.subscription.renew(),
-                        Stopped::Failed(_) => again = Some(Instant::now() + AGAIN_AFTER),
-                    }
+                    again = stopped.follow_up(&self.subscription, AGAIN_AFTER);
                 }
                 () = sleep_until(again.filter(|_| writing.is_none())) => {
                     again = None;

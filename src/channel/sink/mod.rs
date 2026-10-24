@@ -9,6 +9,7 @@
 //! reads what the hub gives it for that: none knows what the channel's
 //! source sends, nor whether what it reads is converted.
 
+mod follow;
 mod hls;
 mod listener;
 mod record;

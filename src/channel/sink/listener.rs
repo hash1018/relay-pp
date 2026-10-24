@@ -33,6 +33,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use super::Output;
+use super::follow::{halted, wait_or_halted};
 use crate::channel::hub::{Fed, Hub, Refusal, Subscription};
 use crate::channel::task::Task;
 
@@ -281,7 +282,7 @@ impl Registration {
                         break;
                     }
                 }
-                _ = halt.wait_for(|halted| *halted) => break,
+                () = halted(&mut halt) => break,
             }
         }
     }
@@ -395,7 +396,7 @@ async fn forward(
         if described {
             tokio::select! {
                 _ = path.players_change(0) => {}
-                _ = halt.wait_for(|halted| *halted) => return,
+                () = halted(&mut halt) => return,
             }
         }
         let (source, streams) = match BroadcastSource::new(name.clone(), &broadcast) {
@@ -458,15 +459,7 @@ async fn forward(
         tokio::select! {
             () = finished => {}
             () = unplayed => {}
-            _ = halt.wait_for(|halted| *halted) => return,
+            () = halted(&mut halt) => return,
         }
-    }
-}
-
-/// Waits `wait`, or until halted: whether it was.
-async fn wait_or_halted(wait: Duration, halt: &mut watch::Receiver<bool>) -> bool {
-    tokio::select! {
-        () = tokio::time::sleep(wait) => false,
-        _ = halt.wait_for(|halted| *halted) => true,
     }
 }

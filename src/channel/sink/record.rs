@@ -13,15 +13,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use media_pp::bus::BusEvent;
-use media_pp::elements::{
-    BroadcastSource, HlsMode, HlsMuxer, HlsOptions, HlsSegmentFormat, MuxerTrackError,
-};
+use media_pp::elements::{BroadcastSource, HlsMode, HlsMuxer, HlsOptions, HlsSegmentFormat};
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::follow::{halted, sleep_until, watch_bus};
 use crate::channel::hub::{Fed, Feed, Subscription};
 use crate::channel::task::Task;
 use crate::config::RecordConfig;
@@ -54,7 +52,7 @@ struct Recording {
     chunk: Duration,
     status: Arc<Mutex<RecordStatus>>,
     /// What it records, held for as long as it does; asked for a run
-    /// described anew — see [`Stopped::PictureChanged`].
+    /// described anew — see [`Stopped::follow_up`](super::follow::Stopped::follow_up).
     subscription: Subscription,
 }
 
@@ -160,20 +158,12 @@ impl Recording {
                     }
                 }
                 stopped = watch_bus(watched) => {
-                    let reason = match &stopped {
-                        Stopped::Failed(reason) | Stopped::PictureChanged(reason) => reason.clone(),
-                    };
+                    let reason = stopped.reason();
                     tracing::warn!(channel = %self.name, "recording ended: {reason}");
-                    self.status.lock().unwrap_or_else(|p| p.into_inner()).error = Some(reason);
+                    self.status.lock().unwrap_or_else(|p| p.into_inner()).error =
+                        Some(reason.to_owned());
                     self.end(writing.take()).await;
-                    match stopped {
-                        // Begun again on this run, it would be given the
-                        // picture it began as and refuse the same way: the
-                        // next run describes it anew, and the recording
-                        // begins with it.
-                        Stopped::PictureChanged(_) => self.subscription.renew(),
-                        Stopped::Failed(_) => again = Some(Instant::now() + AGAIN_AFTER),
-                    }
+                    again = stopped.follow_up(&self.subscription, AGAIN_AFTER);
                 }
                 () = sleep_until(again.filter(|_| writing.is_none())) => {
                     again = None;
@@ -294,63 +284,6 @@ fn until_next(now: SystemTime, chunk: Duration) -> Duration {
     Duration::from_millis((chunk - since % chunk) as u64)
 }
 
-/// Waits for `halt` to say halted. What `wait_for` gives back holds the
-/// watch's lock, which a `select!` would keep across its other arms' awaits.
-pub(super) async fn halted(halt: &mut watch::Receiver<bool>) {
-    let _ = halt.wait_for(|halted| *halted).await;
-}
-
-/// Sleeps until `at`, or for ever where there is none.
-pub(super) async fn sleep_until(at: Option<Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Why a recording's pipeline ended, as its bus says; never, where there is
-/// none.
-pub(super) async fn watch_bus(pipeline: Option<Arc<Pipeline>>) -> Stopped {
-    let Some(pipeline) = pipeline else {
-        return std::future::pending().await;
-    };
-    loop {
-        match pipeline.bus().recv_async().await {
-            Some(BusEvent::Error { error, .. }) if picture_changed(&error) => {
-                return Stopped::PictureChanged(format!(
-                    "{error}; the camera is connected again to record what it sends now"
-                ));
-            }
-            Some(BusEvent::Error { error, .. }) => return Stopped::Failed(error.to_string()),
-            // The broadcast was closed, or published again with tracks it
-            // could not go on with.
-            Some(BusEvent::Finished) | None => {
-                return Stopped::Failed("its broadcast ended".to_owned());
-            }
-            Some(_) => {}
-        }
-    }
-}
-
-/// Why a recording stopped.
-pub(super) enum Stopped {
-    /// It failed — a full disk, say — and is begun again after a while.
-    Failed(String),
-    /// The camera's pictures changed shape — size, profile — partway
-    /// through its connection, which the recording, begun as the connection
-    /// began, refuses.
-    PictureChanged(String),
-}
-
-/// Whether `error` is a muxer refusing pictures that changed shape.
-fn picture_changed(error: &media_pp::Error) -> bool {
-    match error {
-        media_pp::Error::Traced(traced) => picture_changed(&traced.source),
-        media_pp::Error::MuxerTrackError(MuxerTrackError::FormatChanged { .. }) => true,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,24 +304,5 @@ mod tests {
             ),
             Duration::from_millis(2500)
         );
-    }
-
-    /// A muxer refusing changed pictures is told apart, however many
-    /// elements traced it on its way to the bus, from any other failure.
-    #[test]
-    fn a_picture_that_changed_is_told_from_other_failures() {
-        let changed = || {
-            media_pp::Error::from(MuxerTrackError::FormatChanged {
-                track: "track0".into(),
-                was: "320x240".into(),
-                now: "640x480".into(),
-            })
-        };
-        assert!(picture_changed(&changed()));
-        let traced = changed().traced_at(media_pp::element::ElementType::Other, "muxer".into());
-        assert!(picture_changed(&traced));
-        assert!(!picture_changed(&media_pp::Error::Other(
-            "disk full".into()
-        )));
     }
 }

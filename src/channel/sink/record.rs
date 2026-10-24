@@ -267,17 +267,18 @@ impl Recording {
     }
 
     /// Finishes a recording: what it has read is written, and its playlist
-    /// ended.
+    /// ended — and only then is it said to be no longer written, so that
+    /// whoever sees it so finds its playlist ended.
     async fn end(&self, writing: Option<Writing>) {
         let Some(writing) = writing else {
             return;
         };
+        let pipeline = writing.pipeline;
+        let _ = tokio::task::spawn_blocking(move || pipeline.finish()).await;
         self.status
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .recording = None;
-        let pipeline = writing.pipeline;
-        let _ = tokio::task::spawn_blocking(move || pipeline.finish()).await;
         tracing::info!(channel = %self.name, chunk = %writing.chunk.url, "recorded");
     }
 }

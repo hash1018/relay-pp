@@ -18,10 +18,27 @@ use media_pp::elements::{HlsMuxer, HlsSegmentFormat, RtspServer, StreamInfo, Web
 use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 
-use super::hub::{Demand, Profile, Target};
-pub(crate) use hls::{HlsLive, NotWritten, PLAYLIST as HLS_PLAYLIST, is_media_file};
-pub(crate) use listener::{ListenerSink, Listeners, Unready};
+use super::hub::{Demand, Profile, Refusal, Target};
+pub(crate) use hls::{HlsLive, PLAYLIST as HLS_PLAYLIST, is_media_file};
+pub(crate) use listener::{ListenerSink, Listeners};
 pub(crate) use record::{RecordStatus, Recorder};
+
+/// Why players cannot read what a sink gives them yet, or at all: a
+/// listener's path, or HLS's playlist.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Unready {
+    /// Not yet: the source just gone live, a conversion still beginning,
+    /// the first segment not written.
+    #[error("not ready yet")]
+    NotYet,
+    /// What they read is not made, and why.
+    #[error(transparent)]
+    Refused(Refusal),
+    /// The sink failed: the listener would not take the channel, or its
+    /// HLS pipeline failed, and is begun again shortly.
+    #[error("{0}")]
+    Failed(String),
+}
 
 /// A kind of sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

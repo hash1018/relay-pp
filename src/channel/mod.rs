@@ -31,7 +31,7 @@ use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
 use hub::Hub;
 pub(crate) use hub::Refusal;
 pub(crate) use sink::{HLS_PLAYLIST, Listeners, Output, Recorder, is_media_file};
-use sink::{HlsLive, ListenerSink, NotWritten, RecordStatus, Unready};
+use sink::{HlsLive, ListenerSink, RecordStatus, Unready};
 use source::Source;
 pub use source::{Publish, SourceState};
 pub(crate) use source::{RTMP_APP, whip_path};
@@ -173,6 +173,22 @@ pub(crate) enum PlayError {
     /// Its HLS could not be written, and is begun again shortly.
     #[error("channel {channel}: {error}")]
     Hls { channel: String, error: String },
+}
+
+impl Unready {
+    /// What a player of `channel` is told: `failed` says how the sink
+    /// failed, which is answered as its kind is.
+    fn into_play_error(
+        self,
+        channel: String,
+        failed: impl FnOnce(String, String) -> PlayError,
+    ) -> PlayError {
+        match self {
+            Unready::NotYet => PlayError::NotReady { channel },
+            Unready::Refused(refusal) => PlayError::Refused { channel, refusal },
+            Unready::Failed(error) => failed(channel, error),
+        }
+    }
 }
 
 /// A channel's status, as the API gives it.
@@ -383,16 +399,11 @@ impl Channel {
                 }
             }
         };
-        sink.ready(within).await.map_err(|unready| match unready {
-            Unready::NotYet => PlayError::NotReady { channel: channel() },
-            Unready::Refused(refusal) => PlayError::Refused {
-                channel: channel(),
-                refusal,
-            },
-            Unready::Listener(error) => PlayError::Listener {
-                channel: channel(),
+        sink.ready(within).await.map_err(|unready| {
+            unready.into_play_error(channel(), |channel, error| PlayError::Listener {
+                channel,
                 error,
-            },
+            })
         })
     }
 
@@ -421,19 +432,12 @@ impl Channel {
             }
         };
         let dir = hls.asked().to_owned();
-        hls.ready(within)
-            .await
-            .map_err(|unwritten| match unwritten {
-                NotWritten::NotYet => PlayError::NotReady { channel: channel() },
-                NotWritten::Refused(refusal) => PlayError::Refused {
-                    channel: channel(),
-                    refusal,
-                },
-                NotWritten::Failed(error) => PlayError::Hls {
-                    channel: channel(),
-                    error,
-                },
-            })?;
+        hls.ready(within).await.map_err(|unready| {
+            unready.into_play_error(channel(), |channel, error| PlayError::Hls {
+                channel,
+                error,
+            })
+        })?;
         Ok(dir)
     }
 
@@ -510,7 +514,7 @@ impl Channel {
             return;
         }
         for sink in std::mem::take(&mut attached.listened).into_values() {
-            sink.detach();
+            sink.halt();
         }
         if let Some(recorder) = &attached.recorder {
             recorder.halt();

@@ -21,8 +21,9 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::Unready;
 use super::follow::{halted, sleep_until, watch_bus};
-use crate::channel::hub::{Fed, Feed, Refusal, Subscription};
+use crate::channel::hub::{Fed, Feed, Subscription};
 use crate::channel::task::Task;
 
 /// The playlist's name in its directory, and in its URL.
@@ -43,21 +44,6 @@ const IDLE_CHECK: Duration = Duration::from_millis(500);
 
 /// Numbers the directories of every HLS live in this process.
 static NEXT: AtomicU64 = AtomicU64::new(0);
-
-/// Why players cannot read a channel's HLS yet, or at all.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum NotWritten {
-    /// No playlist yet: the camera's next keyframe, and a segment after
-    /// it, not come yet.
-    #[error("not ready yet")]
-    NotYet,
-    /// What it reads is not made, and why.
-    #[error(transparent)]
-    Refused(Refusal),
-    /// Its pipeline failed, and is begun again shortly.
-    #[error("{0}")]
-    Failed(String),
-}
 
 pub(crate) struct HlsLive {
     shared: Arc<Shared>,
@@ -126,7 +112,7 @@ impl HlsLive {
 
     /// Waits, up to `within`, for its playlist to be written — at once
     /// where it is — or says why it is not.
-    pub(crate) async fn ready(&self, within: Duration) -> Result<(), NotWritten> {
+    pub(crate) async fn ready(&self, within: Duration) -> Result<(), Unready> {
         let deadline = Instant::now() + within;
         let playlist = self.shared.dir.join(PLAYLIST);
         let mut fed = self.shared.subscription.fed();
@@ -135,12 +121,12 @@ impl HlsLive {
                 return Ok(());
             }
             if let Fed::Failed(refusal) = &*fed.borrow_and_update() {
-                return Err(NotWritten::Refused(refusal.clone()));
+                return Err(Unready::Refused(refusal.clone()));
             }
             if Instant::now() >= deadline {
                 return Err(match lock(&self.shared.error).clone() {
-                    Some(error) => NotWritten::Failed(error),
-                    None => NotWritten::NotYet,
+                    Some(error) => Unready::Failed(error),
+                    None => Unready::NotYet,
                 });
             }
             *lock(&self.shared.asked) = Instant::now();

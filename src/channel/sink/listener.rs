@@ -32,9 +32,9 @@ use media_pp::pipeline::{Driven, DrivenPipeline};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
-use super::Output;
 use super::follow::{halted, wait_or_halted};
-use crate::channel::hub::{Fed, Hub, Refusal, Subscription};
+use super::{Output, Unready};
+use crate::channel::hub::{Fed, Hub, Subscription};
 use crate::channel::task::Task;
 
 /// How long a forwarder waits before it looks again for what it reads to
@@ -48,21 +48,6 @@ pub(crate) struct Listeners {
     pub(crate) rtsp: RtspServerHandle,
     pub(crate) webrtc: WebRtcServerHandle,
     pub(crate) rtmp: RtmpServerHandle,
-}
-
-/// Why players cannot reach a channel over a listener yet.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Unready {
-    /// What they read is not made yet: the source just gone live, or a
-    /// conversion still beginning.
-    #[error("not ready yet")]
-    NotYet,
-    /// What they read is not made, and why.
-    #[error(transparent)]
-    Refused(Refusal),
-    /// The listener would not take the channel.
-    #[error("the listener would not take it: {0}")]
-    Listener(String),
 }
 
 /// A channel on one listener.
@@ -233,7 +218,7 @@ impl ListenerSink {
             Some(Fed::Live(feed)) => {
                 self.registration
                     .follow(&Fed::Live(feed.clone()))
-                    .map_err(Unready::Listener)?;
+                    .map_err(Unready::Failed)?;
                 feed.broadcast.name()
             }
             Some(Fed::Failed(refusal)) => return Err(Unready::Refused(refusal)),
@@ -258,7 +243,7 @@ impl ListenerSink {
 
     /// Takes the channel off the listener for good: no player opens it from
     /// here, and those playing it end.
-    pub(crate) fn detach(&self) {
+    pub(crate) fn halt(&self) {
         self.task.halt();
         self.registration.detach();
     }

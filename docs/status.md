@@ -161,7 +161,9 @@ there. Each is:
 | `error` | why it last failed, while it is not live |
 | `connections` | how many times it has gone live |
 | `client` | how its stream comes in: `"rtsp"` for a camera pulled, the publisher's protocol for one pushed; none before it first goes live |
-| `readers` | players and recordings reading its stream as it came now; what reads a conversion of it counts as one, the conversion |
+| `readers` | what reads its stream as it came now: a forwarder for each listener that serves it as it is, its recording, its HLS; what reads a conversion of it counts as one, the conversion |
+| `rtsp_players` | its RTSP players |
+| `webrtc_players` | its WebRTC players |
 | `bytes` | what it has been sent, over every connection |
 | `sinks` | what reads it: `"rtsp"` and `"webrtc"` once a player has asked for it so, `"record"` while it is recorded |
 | `recording` | the playlist of the recording being written, while one is |
@@ -217,10 +219,12 @@ from when it is made until it is removed:
 
 ## Players
 
-A channel is registered on a players' listener when a player first asks for
-it by that protocol, and stays registered until the channel goes. Being
-registered costs nothing while nobody plays; the camera is pulled either
-way.
+A channel is served on a players' listener when a player first asks for it
+by that protocol, and stays served until the channel goes: the listener's
+path of the channel, which a forwarder of the channel's own writes what its
+hub gives it into — a reader of the hub's broadcast into the path's muxer,
+polled on the runtime with no thread of its own. Being served costs little
+while nobody plays; the camera is pulled either way.
 
 - **RTSP.** `POST /api/v1/channels/{name}/play` with `{"protocol":"rtsp"}`
   answers `{"url": "rtsp://<host>:8554/<name>"}`, the host the request came
@@ -398,14 +402,15 @@ it is asked for, from what the channels and listeners count already.
 | `relay_pp_channel_state{channel,state}` | gauge | 1 for the state its source is in: `connecting`, `live`, `waiting`, `awaiting_publisher` |
 | `relay_pp_channel_connections_total{channel}` | counter | times its source has gone live |
 | `relay_pp_channel_received_bytes_total{channel}` | counter | what its source has written, over every connection |
-| `relay_pp_channel_readers{channel}` | gauge | readers of its stream: players, its recording, its HLS, its conversions |
+| `relay_pp_channel_readers{channel}` | gauge | readers of its stream: its listeners' forwarders, its recording, its HLS, its conversions |
 | `relay_pp_channel_webrtc_players{channel}` | gauge | its WebRTC players |
+| `relay_pp_channel_rtsp_players{channel}` | gauge | its RTSP players |
 | `relay_pp_channel_recording{channel}` | gauge | 1 while a recording of it is written |
 | `relay_pp_channel_record_failed{channel}` | gauge | 1 from its recording failing until one is written again |
 | `relay_pp_channel_hls{channel}` | gauge | 1 while its HLS is written |
 | `relay_pp_channel_conversions{channel}` | gauge | its tracks converted now |
 | `relay_pp_channel_gpu_refused_total{channel}` | counter | times its pictures were refused a conversion for want of a free GPU encoder |
-| `relay_pp_rtsp_players` | gauge | RTSP players, every channel together — the listener counts no finer |
+| `relay_pp_rtsp_players` | gauge | RTSP players, every channel together |
 | `relay_pp_recordings_bytes` | gauge | what every recording takes on disk, measured by the retention sweep once a minute; absent before its first |
 
 A channel's status (`GET /api/v1/channels/{name}`) has the same
@@ -430,8 +435,8 @@ what a channel converts, while it does: a thread reading the channel's
 stream, and one for each track converted.
 Everything else that waits — the API, WHEP, each channel's source, which
 waits on its connection and before connecting again, its hub, which decides
-what is converted, each listener registration, which follows what its
-players read, each recorder and each HLS writer — is a task on the same
+what is converted, each listener's path of it and the forwarder writing
+into it, which follows what its players read, each recorder and each HLS writer — is a task on the same
 runtime. The RTSP and WebRTC listeners have
 threads of their own, shared by every channel.
 

@@ -1,24 +1,39 @@
-//! A channel's player sinks: the channel registered on one of the server's
+//! A channel's player sinks: the channel served on one of the server's
 //! listeners, which every channel shares — one port each, the channel
-//! picked by the name in the URL — reading the broadcast its hub gives it.
+//! picked by the name in the URL — what its hub gives it written into the
+//! listener's path of the channel.
 //!
-//! Registered when a player first asks for the channel by that protocol,
-//! and kept until the channel goes. Where what it reads changes — a
-//! conversion begins, or is no longer needed — a task of its own moves the
-//! registration to the new broadcast; where it cannot be made, the channel
-//! is taken off the listener until it can. Players already playing go on
-//! with what they had until it ends.
+//! Served when a player first asks for the channel by that protocol, and
+//! kept until the channel goes. What the hub gives it is written into the
+//! path by a forwarder of its own — a pipeline with no thread of its own,
+//! polled on the runtime, of a reader of the broadcast into the path's
+//! muxer — a run of the path each time the broadcast begins anew with
+//! other tracks. Where what it reads changes — a conversion begins, or is
+//! no longer needed — the forwarder is moved to the new broadcast, and its
+//! players go on where the tracks allow; where it cannot be made, the
+//! channel is taken off the listener until it can.
 
+use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
-use media_pp::elements::{Broadcast, RtmpServerHandle, RtspServerHandle, WebRtcServerHandle};
+use media_pp::element::BoxSink;
+use media_pp::elements::{
+    Broadcast, BroadcastError, BroadcastSource, RtmpServerHandle, RtspServer, RtspServerHandle,
+    RtspServerPath, StreamInfo, WebRtcServer, WebRtcServerHandle, WebRtcServerPath,
+};
+use media_pp::pipeline::{Driven, DrivenPipeline};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use super::Output;
 use crate::channel::hub::{Fed, Hub, Refusal, Subscription};
 use crate::channel::task::Task;
+
+/// How long a forwarder waits before it looks again for what it reads to
+/// be published, or tries again to open the path's muxer.
+const RETRY: Duration = Duration::from_millis(50);
 
 /// The listeners every channel shares: its players' — RTSP's and
 /// WebRTC's — and its publisher's, RTSP's, RTMP's or WebRTC's.
@@ -51,25 +66,105 @@ pub(crate) struct ListenerSink {
     task: Task,
 }
 
-/// What the sink and its task share: the listener, and what the channel is
-/// registered on it reading.
+/// What the sink and its task share: the listener, and the channel's path
+/// on it while it is served.
 struct Registration {
     channel: String,
     listener: Listener,
+    runtime: Handle,
     state: Mutex<Registered>,
+    /// The broadcast whose run the path serves now, and each change of it.
+    serving: watch::Sender<Option<Arc<str>>>,
 }
 
 #[derive(Default)]
 struct Registered {
-    /// The name of the broadcast registered, while one is.
-    reads: Option<Arc<str>>,
-    /// Taken off for good: nothing registers it again.
+    served: Option<Served>,
+    /// Taken off for good: nothing serves it again.
     detached: bool,
+}
+
+/// The channel's path on the listener, and what writes into it.
+struct Served {
+    path: Arc<ServedPath>,
+    /// The name of the broadcast its forwarder reads.
+    reads: Arc<str>,
+    forwarder: Task,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.forwarder.halt();
+    }
 }
 
 enum Listener {
     Rtsp(RtspServerHandle),
     WebRtc(WebRtcServerHandle),
+}
+
+/// A listener's path of the channel.
+enum ServedPath {
+    Rtsp(RtspServerPath),
+    WebRtc(WebRtcServerPath),
+}
+
+impl ServedPath {
+    /// How many players play it now.
+    fn players(&self) -> usize {
+        match self {
+            ServedPath::Rtsp(path) => path.players(),
+            ServedPath::WebRtc(path) => path.players(),
+        }
+    }
+
+    /// Opens a run of the path with what of `streams` its listener carries,
+    /// and answers each one's output and sink.
+    fn open(&self, streams: &[StreamInfo]) -> Result<Vec<(usize, BoxSink)>, String> {
+        let opened = match self {
+            ServedPath::Rtsp(path) => {
+                let mut muxer = path.muxer();
+                let carried: Vec<&StreamInfo> = streams
+                    .iter()
+                    .filter(|stream| RtspServer::carries(stream))
+                    .collect();
+                muxed(&carried, |name, stream| muxer.add_stream(name, stream))
+                    .and_then(|tracks| Ok((tracks, muxer.open()?)))
+            }
+            ServedPath::WebRtc(path) => {
+                let mut muxer = path.muxer();
+                let carried: Vec<&StreamInfo> = streams
+                    .iter()
+                    .filter(|stream| WebRtcServer::carries(stream))
+                    .collect();
+                muxed(&carried, |name, stream| muxer.add_stream(name, stream))
+                    .and_then(|tracks| Ok((tracks, muxer.open()?)))
+            }
+        };
+        let (tracks, mut sinks) = opened.map_err(|error| error.to_string())?;
+        tracks
+            .into_iter()
+            .map(|(index, track)| {
+                Ok((index, sinks.take(track).map_err(|error| error.to_string())?))
+            })
+            .collect()
+    }
+}
+
+/// Each of `streams` added by `add`, with its output.
+fn muxed<T>(
+    streams: &[&StreamInfo],
+    mut add: impl FnMut(String, &StreamInfo) -> media_pp::Result<T>,
+) -> media_pp::Result<Vec<(usize, T)>> {
+    streams
+        .iter()
+        .map(|stream| {
+            Ok((
+                stream.index(),
+                add(format!("track-{}", stream.index()), stream)?,
+            ))
+        })
+        .collect()
 }
 
 impl ListenerSink {
@@ -91,9 +186,19 @@ impl ListenerSink {
         let registration = Arc::new(Registration {
             channel: channel.to_owned(),
             listener,
+            runtime: runtime.clone(),
             state: Mutex::default(),
+            serving: watch::Sender::new(None),
         });
         let subscription = hub.subscribe(output.profile(), output.demand());
+        // What it reads is read by the path's players, not by the forwarder
+        // that is always reading it.
+        let players = Arc::downgrade(&registration);
+        subscription.read_by(move || {
+            players
+                .upgrade()
+                .map_or(0, |registration| registration.players())
+        });
         let task = Task::new();
         let following = Arc::clone(&registration);
         let fed = subscription.fed();
@@ -106,26 +211,47 @@ impl ListenerSink {
     }
 
     /// Waits, up to `within`, for what it reads to be made — at once where
-    /// it is — and for the channel to be registered reading it; or says why
-    /// it cannot be. What it reads is started again first, where it had
+    /// it is — and for the channel's path to be serving it; or says why it
+    /// cannot be. What it reads is started again first, where it had
     /// stopped for want of players.
     pub(crate) async fn ready(&self, within: Duration) -> Result<(), Unready> {
+        let until = tokio::time::Instant::now() + within;
         self.subscription.wake();
         let mut fed = self.subscription.fed();
-        let made = tokio::time::timeout(within, fed.wait_for(|fed| *fed != Fed::Idle))
+        let made = tokio::time::timeout_at(until, fed.wait_for(|fed| *fed != Fed::Idle))
             .await
             .ok()
             .and_then(Result::ok)
             .map(|fed| fed.clone());
-        match made {
-            Some(fed @ Fed::Live(_)) => self.registration.follow(&fed).map_err(Unready::Listener),
-            Some(Fed::Failed(refusal)) => Err(Unready::Refused(refusal)),
-            _ => Err(Unready::NotYet),
-        }
+        let name = match made {
+            Some(Fed::Live(feed)) => {
+                self.registration
+                    .follow(&Fed::Live(feed.clone()))
+                    .map_err(Unready::Listener)?;
+                feed.broadcast.name()
+            }
+            Some(Fed::Failed(refusal)) => return Err(Unready::Refused(refusal)),
+            _ => return Err(Unready::NotYet),
+        };
+        let mut serving = self.registration.serving.subscribe();
+        tokio::time::timeout_at(
+            until,
+            serving.wait_for(|serving| serving.as_deref() == Some(&*name)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|_| ())
+        .ok_or(Unready::NotYet)
+    }
+
+    /// How many players play the channel over the listener now.
+    pub(crate) fn players(&self) -> usize {
+        self.registration.players()
     }
 
     /// Takes the channel off the listener for good: no player opens it from
-    /// here. Those playing it go on until their broadcast closes.
+    /// here, and those playing it end.
     pub(crate) fn detach(&self) {
         self.task.halt();
         self.registration.detach();
@@ -155,9 +281,9 @@ impl Registration {
         }
     }
 
-    /// Has the channel registered reading what `fed` says, unless it is:
-    /// the broadcast it says, where it is live; nothing, where what it
-    /// needs cannot be made; as it was, where the source is not live.
+    /// Has the channel's path serving what `fed` says, unless it is: the
+    /// broadcast it says, where it is live; nothing, where what it needs
+    /// cannot be made; as it was, where the source is not live.
     fn follow(&self, fed: &Fed) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.detached {
@@ -166,19 +292,39 @@ impl Registration {
         match fed {
             Fed::Live(feed) => {
                 let name = feed.broadcast.name();
-                if state.reads.as_deref() == Some(&*name) {
+                if state
+                    .served
+                    .as_ref()
+                    .is_some_and(|served| served.reads == name)
+                {
                     return Ok(());
                 }
-                if state.reads.take().is_some() {
-                    self.remove();
-                }
-                self.add(&feed.broadcast)?;
+                // The path goes on, its players with it: only what writes
+                // into it changes.
+                let path = match state.served.take() {
+                    Some(served) => Arc::clone(&served.path),
+                    None => Arc::new(self.path()?),
+                };
+                self.serving.send_replace(None);
+                let forwarder = Task::new();
+                forwarder.spawn(&self.runtime, {
+                    let path = Arc::clone(&path);
+                    let broadcast = feed.broadcast.clone();
+                    let serving = self.serving.clone();
+                    let channel = self.channel.clone();
+                    let kind = self.kind();
+                    move |halt| forward(channel, kind, path, broadcast, serving, halt)
+                });
                 tracing::info!(channel = %self.channel, listener = self.kind(), broadcast = %name, "streamed");
-                state.reads = Some(name);
+                state.served = Some(Served {
+                    path,
+                    reads: name,
+                    forwarder,
+                });
             }
             Fed::Failed(_) => {
-                if state.reads.take().is_some() {
-                    self.remove();
+                if state.served.take().is_some() {
+                    self.serving.send_replace(None);
                 }
             }
             Fed::Idle => {}
@@ -189,31 +335,31 @@ impl Registration {
     fn detach(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.detached = true;
-        if state.reads.take().is_some() {
-            self.remove();
-        }
+        state.served = None;
+        self.serving.send_replace(None);
     }
 
-    fn add(&self, broadcast: &Broadcast) -> Result<(), String> {
+    /// The channel's path on the listener.
+    fn path(&self) -> Result<ServedPath, String> {
         match &self.listener {
             Listener::Rtsp(listener) => listener
-                .add_path(&self.channel, broadcast)
+                .path(&self.channel)
+                .map(ServedPath::Rtsp)
                 .map_err(|error| error.to_string()),
             Listener::WebRtc(listener) => listener
-                .add_path(&self.channel, broadcast)
+                .path(&self.channel)
+                .map(ServedPath::WebRtc)
                 .map_err(|error| error.to_string()),
         }
     }
 
-    fn remove(&self) {
-        match &self.listener {
-            Listener::Rtsp(listener) => {
-                listener.remove_path(&self.channel);
-            }
-            Listener::WebRtc(listener) => {
-                listener.remove_path(&self.channel);
-            }
-        }
+    fn players(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .served
+            .as_ref()
+            .map_or(0, |served| served.path.players())
     }
 
     fn kind(&self) -> &'static str {
@@ -221,5 +367,81 @@ impl Registration {
             Listener::Rtsp(_) => "rtsp",
             Listener::WebRtc(_) => "webrtc",
         }
+    }
+}
+
+/// Writes what `broadcast` carries into `path`, until halted: a run of the
+/// path each time the broadcast begins with tracks the last could not go on
+/// with. Says on `serving` which broadcast the path serves a run of.
+async fn forward(
+    channel: String,
+    kind: &'static str,
+    path: Arc<ServedPath>,
+    broadcast: Broadcast,
+    serving: watch::Sender<Option<Arc<str>>>,
+    mut halt: watch::Receiver<bool>,
+) {
+    let name = format!("{channel}-to-{kind}");
+    loop {
+        let (source, streams) = match BroadcastSource::new(name.clone(), &broadcast) {
+            Ok(opened) => opened,
+            Err(BroadcastError::NotPublished(_)) => {
+                if wait_or_halted(RETRY, &mut halt).await {
+                    return;
+                }
+                continue;
+            }
+            Err(_) => return,
+        };
+        let sinks = match path.open(&streams) {
+            Ok(sinks) => sinks,
+            Err(reason) => {
+                tracing::warn!(channel = %channel, listener = kind, "cannot serve the channel: {reason}");
+                if wait_or_halted(Duration::from_secs(1), &mut halt).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let wired = DrivenPipeline::new(name.clone(), source, |source, ctx| {
+            for (index, sink) in sinks {
+                ctx.attach(source, index, ctx.branch().to(sink)?)?;
+            }
+            Ok(())
+        });
+        let mut pipeline = match wired {
+            Ok((pipeline, ())) => pipeline,
+            Err(error) => {
+                tracing::warn!(channel = %channel, listener = kind, "cannot wire what serves the channel: {error}");
+                return;
+            }
+        };
+        serving.send_replace(Some(broadcast.name()));
+        // Polled as what it waits on wakes it, and at the time it asks for.
+        let finished = poll_fn(|cx| match pipeline.poll(cx) {
+            Driven::Finished => Poll::Ready(()),
+            Driven::Pending { at } => {
+                if let Some(at) = at {
+                    let waker = cx.waker().clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(at.into()).await;
+                        waker.wake();
+                    });
+                }
+                Poll::Pending
+            }
+        });
+        tokio::select! {
+            () = finished => {}
+            _ = halt.wait_for(|halted| *halted) => return,
+        }
+    }
+}
+
+/// Waits `wait`, or until halted: whether it was.
+async fn wait_or_halted(wait: Duration, halt: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(wait) => false,
+        _ = halt.wait_for(|halted| *halted) => true,
     }
 }

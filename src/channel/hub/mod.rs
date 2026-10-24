@@ -107,9 +107,15 @@ enum Command {
         profile: Profile,
         demand: Demand,
     },
+    /// What a subscription's broadcast is read by, counted by the sink —
+    /// see [`Subscription::read_by`].
+    ReadBy(u64, Readers),
     Unsubscribe(u64),
     Wake(&'static str),
 }
+
+/// How many read what a sink gives them, as it counts them.
+type Readers = Arc<dyn Fn() -> usize + Send + Sync>;
 
 /// What the hub's task and its handles share.
 struct Shared {
@@ -175,6 +181,7 @@ impl Hub {
             shared: Arc::clone(&shared),
             convert,
             subscriptions: BTreeMap::new(),
+            readers: BTreeMap::new(),
             sleeping: BTreeSet::new(),
             woken: BTreeMap::new(),
             idle_since: BTreeMap::new(),
@@ -285,6 +292,16 @@ impl Subscription {
         self.fed.clone()
     }
 
+    /// Has what it reads counted as read by what `readers` counts, in
+    /// place of the broadcast's own readers: what a sink that always reads
+    /// it for others — a listener's forwarder — counts its players by.
+    pub(crate) fn read_by(&self, readers: impl Fn() -> usize + Send + Sync + 'static) {
+        let _ = self
+            .shared
+            .commands
+            .send(Command::ReadBy(self.id, Arc::new(readers)));
+    }
+
     /// A player is coming: what is made for it is started again where it
     /// had stopped, and tried again where it could not be made.
     pub(crate) fn wake(&self) {
@@ -311,6 +328,8 @@ struct Hubbing {
     shared: Arc<Shared>,
     convert: ConvertConfig,
     subscriptions: BTreeMap<u64, (Profile, Demand)>,
+    /// What each subscription that counts its own readers counts them by.
+    readers: BTreeMap<u64, Readers>,
     /// Profiles whose conversions stopped for want of players.
     sleeping: BTreeSet<&'static str>,
     /// When each profile was last woken, or subscribed.
@@ -393,7 +412,11 @@ impl Hubbing {
                 self.subscriptions.insert(id, (profile, demand));
                 self.woken.insert(profile.name, now);
             }
+            Command::ReadBy(id, readers) => {
+                self.readers.insert(id, readers);
+            }
             Command::Unsubscribe(id) => {
+                self.readers.remove(&id);
                 if let Some((profile, _)) = self.subscriptions.remove(&id)
                     && !self.subscribed(profile.name)
                 {
@@ -602,12 +625,25 @@ impl Hubbing {
                 .values()
                 .filter(|(subscribed, _)| subscribed.name == profile.name)
                 .all(|(_, demand)| *demand == Demand::WhileRead);
+            // Read by what its sinks count, where they count their own —
+            // a listener's players, not the forwarder always reading the
+            // broadcast for them — and else by the broadcast's own readers.
+            let counted: Vec<usize> = self
+                .subscriptions
+                .iter()
+                .filter(|(_, (subscribed, _))| subscribed.name == profile.name)
+                .filter_map(|(id, _)| self.readers.get(id).map(|readers| readers()))
+                .collect();
             let read = match feeds.get(profile.name).map(|fed| fed.borrow().clone()) {
                 // Its own broadcast costs nothing to go on reading.
                 Some(Fed::Live(feed))
                     if on_demand && feed.broadcast.name() != self.shared.original.name() =>
                 {
-                    feed.broadcast.stats().readers
+                    if counted.is_empty() {
+                        feed.broadcast.stats().readers
+                    } else {
+                        counted.iter().sum()
+                    }
                 }
                 _ => {
                     self.idle_since.remove(profile.name);

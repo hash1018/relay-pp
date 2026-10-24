@@ -13,7 +13,7 @@ publish = false
 # so it is taken from the repository at a revision. To build against a
 # checkout beside this one instead:
 #   cargo build --config 'patch."https://github.com/hash1018/media-pp".media-pp.path="../media-pp/lib"'
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "96d85040183788a3c63cc892ec81029312cb7e55", features = ["rtsp-server", "rtmp-server", "webrtc"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "90b38476f1ffedf5796c161aca7bbca784df331c", features = ["rtsp-server", "rtmp-server", "webrtc"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 futures = "0.3"
@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # NVENC or else Vulkan Video on Linux. Neither needs an SDK to build, and a
 # machine without the GPU converts in software.
 [target.'cfg(windows)'.dependencies]
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "96d85040183788a3c63cc892ec81029312cb7e55", features = ["d3d11"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "90b38476f1ffedf5796c161aca7bbca784df331c", features = ["d3d11"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-media-pp = { git = "https://github.com/hash1018/media-pp", rev = "96d85040183788a3c63cc892ec81029312cb7e55", features = ["cuda", "vulkan"] }
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "90b38476f1ffedf5796c161aca7bbca784df331c", features = ["cuda", "vulkan"] }

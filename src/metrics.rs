@@ -147,6 +147,12 @@ pub(crate) fn text(readings: &Readings) -> String {
         &webrtc,
     );
     family(
+        "relay_pp_channel_rtsp_players",
+        "gauge",
+        "RTSP players of the channel.",
+        &per_channel(&|status| status.rtsp_players as f64),
+    );
+    family(
         "relay_pp_rtsp_players",
         "gauge",
         "RTSP players, every channel together.",
@@ -178,6 +184,8 @@ mod tests {
             connections: 3,
             client: Some("rtsp"),
             readers: 2,
+            rtsp_players: 1,
+            webrtc_players: 0,
             bytes: 1_000_000,
             sinks: vec!["webrtc", "record", "hls"],
             recording: Some("/recordings/x/index.m3u8".to_owned()),

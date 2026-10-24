@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use media_pp::driver::DriverRunner;
 use media_pp::elements::{
-    AudioCodec, Broadcast, BroadcastOptions, CounterHandle, PacketCounter, RtspOptions, RtspServer,
-    RtspServerOptions, RtspSource, RtspTransport, StreamInfo, SwAudioEncoder,
-    SwAudioEncoderOptions, SwEncoder, SwEncoderOptions, TestAudioOptions, TestAudioSource,
-    TestVideoOptions, TestVideoSource, VideoCodec, WebRtcOptions, WebRtcSource,
+    AudioCodec, CounterHandle, PacketCounter, RtspOptions, RtspServer, RtspServerOptions,
+    RtspServerPath, RtspSource, RtspTransport, StreamInfo, SwAudioEncoder, SwAudioEncoderOptions,
+    SwEncoder, SwEncoderOptions, TestAudioOptions, TestAudioSource, TestVideoOptions,
+    TestVideoSource, VideoCodec, WebRtcOptions, WebRtcSource,
 };
 use media_pp::ffmpeg;
 use media_pp::pipeline::{Pipeline, PipelineBuilder};
@@ -25,6 +25,8 @@ pub const WITHIN: Duration = Duration::from_secs(20);
 /// served at `rtsp://{addr}/cam`.
 pub struct Camera {
     server: Arc<DriverRunner>,
+    /// What its players play, served for as long as it runs.
+    _path: RtspServerPath,
     pub input: Arc<Pipeline>,
     pub addr: SocketAddr,
 }
@@ -66,8 +68,7 @@ impl Camera {
     ) -> Option<Self> {
         let (server, handle) = RtspServer::bind("camera", addr, RtspServerOptions::default())
             .expect("bind the camera");
-        let broadcast = Broadcast::new("cam", BroadcastOptions::default());
-        handle.add_path("cam", &broadcast).unwrap();
+        let path = handle.path("cam").unwrap();
         let server = DriverRunner::new(server);
         server.run().unwrap();
         let encoder = SwEncoder::new(
@@ -103,7 +104,17 @@ impl Camera {
         if let Some(sound_encoder) = &sound_encoder {
             tracks.push(StreamInfo::from(sound_encoder));
         }
-        let mut sinks = broadcast.publish(&tracks).unwrap();
+        let mut muxer = path.muxer();
+        let added: Vec<_> = tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| muxer.add_stream(format!("track-{index}"), track).unwrap())
+            .collect();
+        let mut opened = muxer.open().unwrap();
+        let mut sinks: Vec<_> = added
+            .into_iter()
+            .map(|track| opened.take(track).unwrap())
+            .collect();
         let sound_sink = sound.map(|_| sinks.remove(1));
         let sink = sinks.remove(0);
         let pictures = TestVideoSource::new(
@@ -151,13 +162,17 @@ impl Camera {
         Some(Self {
             addr: handle.local_addr(),
             server,
+            _path: path,
             input,
         })
     }
 
+    /// Stops it, and waits for its server's thread to end — its port free
+    /// again, for a camera started at the same address.
     pub fn stop(self) {
         self.input.stop();
         self.server.stop();
+        for _ in self.server.bus().iter() {}
     }
 }
 

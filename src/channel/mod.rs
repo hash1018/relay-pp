@@ -193,8 +193,13 @@ pub struct ChannelStatus {
     /// How its stream comes in: `"rtsp"` for a camera pulled, or the
     /// protocol its publisher pushes over — once one has come in.
     pub client: Option<&'static str>,
-    /// Readers of its broadcast: players and recorders.
+    /// Readers of its broadcast: what serves it to each listener's players,
+    /// its recorder, its HLS.
     pub readers: usize,
+    /// Its RTSP players.
+    pub rtsp_players: usize,
+    /// Its WebRTC players.
+    pub webrtc_players: usize,
     /// What its broadcast has been written, over every connection.
     pub bytes: u64,
     /// What reads it: `"rtsp"` and `"webrtc"` once a player has asked for
@@ -291,13 +296,20 @@ impl Channel {
     pub fn status(&self) -> ChannelStatus {
         let source = self.source.status();
         let stats = self.hub.stats();
-        let (sinks, record) = {
+        let (sinks, record, rtsp_players, webrtc_players) = {
             let attached = self.attached();
             let mut sinks: Vec<&'static str> = attached
                 .listened
                 .keys()
                 .map(|output| output.name())
                 .collect();
+            let players = |output| {
+                attached
+                    .listened
+                    .get(&output)
+                    .map_or(0, |sink| sink.players())
+            };
+            let (rtsp_players, webrtc_players) = (players(Output::Rtsp), players(Output::WebRtc));
             let record = match &attached.recorder {
                 Some(recorder) => {
                     sinks.push("record");
@@ -308,7 +320,7 @@ impl Channel {
             if attached.hls.as_ref().is_some_and(|hls| !hls.is_over()) {
                 sinks.push("hls");
             }
-            (sinks, record)
+            (sinks, record, rtsp_players, webrtc_players)
         };
         ChannelStatus {
             name: self.name.clone(),
@@ -322,6 +334,8 @@ impl Channel {
             connections: source.connections,
             client: source.client,
             readers: stats.readers,
+            rtsp_players,
+            webrtc_players,
             bytes: stats.bytes,
             sinks,
             recording: record.recording,

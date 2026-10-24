@@ -8,10 +8,15 @@
 //! path by a forwarder of its own — a pipeline with no thread of its own,
 //! polled on the runtime, of a reader of the broadcast into the path's
 //! muxer — a run of the path each time the broadcast begins anew with
-//! other tracks. Where what it reads changes — a conversion begins, or is
-//! no longer needed — the forwarder is moved to the new broadcast, and its
-//! players go on where the tracks allow; where it cannot be made, the
-//! channel is taken off the listener until it can.
+//! other tracks, and each time players come to a path that had none. With
+//! no player it reads nothing: the path describes the last run it wrote,
+//! which is what a player is told it plays, and the forwarder begins
+//! another as the player is counted. So what it reads counts as read only
+//! while the path is played, which is what the hub stops a conversion by.
+//! Where what it reads changes — a conversion begins, or is no longer
+//! needed — the forwarder is moved to the new broadcast, and its players go
+//! on where the tracks allow; where it cannot be made, the channel is taken
+//! off the listener until it can.
 
 use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
@@ -118,6 +123,14 @@ impl ServedPath {
         }
     }
 
+    /// Waits until other than `from` players play it: how many do.
+    async fn players_change(&self, from: usize) -> usize {
+        match self {
+            ServedPath::Rtsp(path) => path.players_change(from).await,
+            ServedPath::WebRtc(path) => path.players_change(from).await,
+        }
+    }
+
     /// Opens a run of the path with what of `streams` its listener carries,
     /// and answers each one's output and sink.
     fn open(&self, streams: &[StreamInfo]) -> Result<Vec<(usize, BoxSink)>, String> {
@@ -191,14 +204,6 @@ impl ListenerSink {
             serving: watch::Sender::new(None),
         });
         let subscription = hub.subscribe(output.profile(), output.demand());
-        // What it reads is read by the path's players, not by the forwarder
-        // that is always reading it.
-        let players = Arc::downgrade(&registration);
-        subscription.read_by(move || {
-            players
-                .upgrade()
-                .map_or(0, |registration| registration.players())
-        });
         let task = Task::new();
         let following = Arc::clone(&registration);
         let fed = subscription.fed();
@@ -370,9 +375,12 @@ impl Registration {
     }
 }
 
-/// Writes what `broadcast` carries into `path`, until halted: a run of the
-/// path each time the broadcast begins with tracks the last could not go on
-/// with. Says on `serving` which broadcast the path serves a run of.
+/// Writes what `broadcast` carries into `path` while it is played, until
+/// halted: a run of the path each time the broadcast begins with tracks the
+/// last could not go on with, and each time players come to it again. The
+/// first run is begun at once, unplayed, for the path to describe — nobody
+/// plays a path that describes nothing. Says on `serving` which broadcast
+/// the path describes a run of.
 async fn forward(
     channel: String,
     kind: &'static str,
@@ -382,7 +390,14 @@ async fn forward(
     mut halt: watch::Receiver<bool>,
 ) {
     let name = format!("{channel}-to-{kind}");
+    let mut described = false;
     loop {
+        if described {
+            tokio::select! {
+                _ = path.players_change(0) => {}
+                _ = halt.wait_for(|halted| *halted) => return,
+            }
+        }
         let (source, streams) = match BroadcastSource::new(name.clone(), &broadcast) {
             Ok(opened) => opened,
             Err(BroadcastError::NotPublished(_)) => {
@@ -417,6 +432,7 @@ async fn forward(
             }
         };
         serving.send_replace(Some(broadcast.name()));
+        described = true;
         // Polled as what it waits on wakes it, and at the time it asks for.
         let finished = poll_fn(|cx| match pipeline.poll(cx) {
             Driven::Finished => Poll::Ready(()),
@@ -431,8 +447,17 @@ async fn forward(
                 Poll::Pending
             }
         });
+        // The run ends with its last player: the pipeline goes as the loop
+        // goes round.
+        let unplayed = async {
+            let mut players = path.players();
+            while players > 0 {
+                players = path.players_change(players).await;
+            }
+        };
         tokio::select! {
             () = finished => {}
+            () = unplayed => {}
             _ = halt.wait_for(|halted| *halted) => return,
         }
     }

@@ -193,8 +193,8 @@ pub struct ChannelStatus {
     /// How its stream comes in: `"rtsp"` for a camera pulled, or the
     /// protocol its publisher pushes over — once one has come in.
     pub client: Option<&'static str>,
-    /// Readers of its broadcast: what serves it to each listener's players,
-    /// its recorder, its HLS.
+    /// Readers of its broadcast: what serves it to each listener's players
+    /// while it has any, its recorder, its HLS.
     pub readers: usize,
     /// Its RTSP players.
     pub rtsp_players: usize,

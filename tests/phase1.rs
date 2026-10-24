@@ -90,6 +90,47 @@ fn a_camera_is_pulled_played_and_followed_across_a_drop() {
     camera.stop();
 }
 
+/// A channel on a listener reads its broadcast only while it is played:
+/// nothing before its first player and after its last, and a player that
+/// comes to it then plays all the same.
+#[test]
+fn a_listener_reads_the_channel_only_while_it_is_played() {
+    let camera = Camera::start("127.0.0.1:0".parse().unwrap());
+    let server = server();
+    let (status, _, body) = http(
+        server.http_addr(),
+        "POST",
+        "/api/v1/channels",
+        Some(&channel(
+            "cam1",
+            &format!("rtsp://user:secret@{}/cam", camera.addr),
+        )),
+    );
+    assert_eq!(status, 201, "{body}");
+    wait_for("the camera live", || state_of(&server) == SourceState::Live);
+
+    let url = play_rtsp(server.http_addr(), "cam1");
+    assert_eq!(server.status()[0].sinks, ["rtsp"]);
+    wait_for("nothing read before a player", || {
+        server.status()[0].readers == 0
+    });
+
+    for round in ["first", "again"] {
+        let (rtsp, over_rtsp) = rtsp_player(&url);
+        wait_for(&format!("RTSP packets, {round}"), || over_rtsp.get() > 20);
+        let status = &server.status()[0];
+        assert_eq!((status.readers, status.rtsp_players), (1, 1), "{round}");
+        rtsp.stop();
+        wait_for(&format!("nothing read after the player, {round}"), || {
+            let status = &server.status()[0];
+            (status.readers, status.rtsp_players) == (0, 0)
+        });
+    }
+
+    server.stop();
+    camera.stop();
+}
+
 #[test]
 fn channels_are_made_and_removed_over_the_api() {
     let camera = Camera::start("127.0.0.1:0".parse().unwrap());

@@ -44,7 +44,10 @@ impl Chunk {
         let mut bytes = 0;
         let mut written = SystemTime::UNIX_EPOCH;
         for entry in fs::read_dir(&self.path).into_iter().flatten().flatten() {
-            if let Ok(metadata) = entry.metadata() {
+            // The file's own, not its directory entry's: on Windows that
+            // says what a file held when it was last closed, and the media
+            // file being written is not closed until its recording ends.
+            if let Ok(metadata) = fs::metadata(entry.path()) {
                 bytes += metadata.len();
                 if let Ok(modified) = metadata.modified() {
                     written = written.max(modified);
@@ -423,6 +426,22 @@ mod tests {
             playlist_between(&chunks, at(20), at(50)).is_none(),
             "between the chunks"
         );
+    }
+
+    /// A chunk's media file is held open as it is written: what it holds
+    /// so far is counted, though nothing has closed it.
+    #[test]
+    fn a_chunk_being_written_is_as_large_as_what_it_holds() {
+        use std::io::Write;
+        let root = scratch("growing");
+        let chunk = new_chunk(&root, "cam1", at(0)).unwrap();
+        let mut media = fs::File::create(chunk.path.join(MEDIA)).unwrap();
+        media.write_all(&[0; 4096]).unwrap();
+        media.flush().unwrap();
+        let (bytes, _) = chunk.size_and_written();
+        assert_eq!(bytes, 4096, "while it is open");
+        drop(media);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

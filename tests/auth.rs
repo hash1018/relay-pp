@@ -11,7 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::*;
 use hmac::{Hmac, Mac};
-use media_pp::elements::{WhepOptions, WhepSource};
+use media_pp::elements::{WebRtcOptions, WebRtcSource};
 use relay_pp::SourceState;
 use sha2::Sha256;
 
@@ -147,12 +147,12 @@ fn webrtc_players_present_a_token() {
     made(&server, camera.addr);
     let url = format!("http://{}/cam1/whep", server.http_addr());
     let open = |bearer_token: Option<String>| {
-        WhepSource::open(
+        WebRtcSource::open(
             "player",
             &url,
-            WhepOptions {
+            WebRtcOptions {
                 bearer_token,
-                ..WhepOptions::default()
+                ..WebRtcOptions::default()
             },
         )
         .map(|_| ())

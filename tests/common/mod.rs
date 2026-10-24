@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use media_pp::driver::DriverRunner;
 use media_pp::elements::{
-    AudioCodec, Broadcast, BroadcastOptions, CounterHandle, PacketCounter, RtspOptions,
-    RtspPathMode, RtspServer, RtspServerOptions, RtspSource, RtspTransport, StreamInfo,
-    SwAudioEncoder, SwAudioEncoderOptions, SwEncoder, SwEncoderOptions, TestAudioOptions,
-    TestAudioSource, TestVideoOptions, TestVideoSource, VideoCodec, WhepOptions, WhepSource,
+    AudioCodec, Broadcast, BroadcastOptions, CounterHandle, PacketCounter, RtspOptions, RtspServer,
+    RtspServerOptions, RtspSource, RtspTransport, StreamInfo, SwAudioEncoder,
+    SwAudioEncoderOptions, SwEncoder, SwEncoderOptions, TestAudioOptions, TestAudioSource,
+    TestVideoOptions, TestVideoSource, VideoCodec, WebRtcOptions, WebRtcSource,
 };
 use media_pp::ffmpeg;
 use media_pp::pipeline::{Pipeline, PipelineBuilder};
@@ -67,9 +67,7 @@ impl Camera {
         let (server, handle) = RtspServer::bind("camera", addr, RtspServerOptions::default())
             .expect("bind the camera");
         let broadcast = Broadcast::new("cam", BroadcastOptions::default());
-        handle
-            .add_path("cam", &broadcast, RtspPathMode::Play)
-            .unwrap();
+        handle.add_path("cam", &broadcast).unwrap();
         let server = DriverRunner::new(server);
         server.run().unwrap();
         let encoder = SwEncoder::new(
@@ -186,7 +184,7 @@ pub fn rtsp_player(url: &str) -> (Arc<Pipeline>, CounterHandle) {
 }
 
 pub fn whep_player(url: &str) -> (Arc<Pipeline>, CounterHandle) {
-    let (source, streams) = WhepSource::open("player", url, WhepOptions::default())
+    let (source, streams) = WebRtcSource::open("player", url, WebRtcOptions::default())
         .unwrap_or_else(|error| panic!("{url} opens: {error}"));
     let (counter, counted) = PacketCounter::new("packets");
     let (pipeline, ()) = Pipeline::new("whep-player", source, |source, ctx| {
@@ -395,11 +393,11 @@ pub fn rtsp_opens(url: &str) -> bool {
 /// player's default for the first: pictures converted in software, where
 /// no GPU is, come out of x264 seconds after they went in.
 pub fn whep_tracks(url: &str) -> (Arc<Pipeline>, Vec<(ffmpeg::codec::Id, CounterHandle)>) {
-    let options = WhepOptions {
+    let options = WebRtcOptions {
         describe_within: Duration::from_secs(15),
-        ..WhepOptions::default()
+        ..WebRtcOptions::default()
     };
-    let (source, streams) = WhepSource::open("player", url, options)
+    let (source, streams) = WebRtcSource::open("player", url, options)
         .unwrap_or_else(|error| panic!("{url} opens: {error}"));
     let mut tracks = Vec::new();
     let mut counters = Vec::new();
@@ -454,7 +452,7 @@ pub fn push(
     over: Push,
     token: Option<String>,
 ) -> Option<media_pp::Result<Arc<Pipeline>>> {
-    use media_pp::elements::{RtmpMuxer, RtspMuxer, WhipOptions, WhipPublisher};
+    use media_pp::elements::{RtmpMuxer, RtspMuxer, WebRtcMuxer, WebRtcOptions};
     let pictures_encoder = SwEncoder::new(
         "push-encoder",
         SwEncoderOptions {
@@ -522,17 +520,19 @@ pub fn push(
                 )
             }
             Push::Whip => {
-                let mut publisher = WhipPublisher::create(
+                let mut muxer = WebRtcMuxer::create(
                     "publisher",
                     url,
-                    WhipOptions {
+                    WebRtcOptions {
                         bearer_token: token,
-                        ..WhipOptions::default()
+                        ..WebRtcOptions::default()
                     },
                 )?;
-                let a = publisher.add_track(pictures.parameters())?;
-                let b = publisher.add_track(sound.parameters())?;
-                let mut sinks = publisher.open()?;
+                let (a, b) = (
+                    muxer.add_stream("pictures", pictures.clone())?,
+                    muxer.add_stream("sound", sound.clone())?,
+                );
+                let mut sinks = muxer.open()?;
                 pushing(
                     pictures_encoder,
                     sinks.take(a)?,

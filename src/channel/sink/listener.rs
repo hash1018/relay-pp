@@ -12,9 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use media_pp::elements::{
-    Broadcast, RtmpServerHandle, RtspPathMode, RtspServerHandle, WebRtcPathMode, WebRtcServerHandle,
-};
+use media_pp::elements::{Broadcast, RtmpServerHandle, RtspServerHandle, WebRtcServerHandle};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
@@ -199,10 +197,10 @@ impl Registration {
     fn add(&self, broadcast: &Broadcast) -> Result<(), String> {
         match &self.listener {
             Listener::Rtsp(listener) => listener
-                .add_path(&self.channel, broadcast, RtspPathMode::Play)
+                .add_path(&self.channel, broadcast)
                 .map_err(|error| error.to_string()),
             Listener::WebRtc(listener) => listener
-                .add_path(&self.channel, broadcast, WebRtcPathMode::Play)
+                .add_path(&self.channel, broadcast)
                 .map_err(|error| error.to_string()),
         }
     }

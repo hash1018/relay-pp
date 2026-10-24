@@ -2,22 +2,21 @@
 //! RTMP or RTSP, or a browser over WHIP.
 //!
 //! A server every channel shares takes the publisher — media-pp's RTMP,
-//! RTSP or WebRTC server, which does the protocol — and writes what it
-//! sends into a broadcast of this source's own, its *intake*, registered on
-//! the server as where a publisher of the channel goes. The source reads
-//! the intake and writes what it reads into the channel's hub, as a camera
-//! pulled is: a publisher arriving begins a run, and leaving ends it. What
-//! reads the hub never knows a camera from a publisher. One publisher at a
-//! time: a second is refused by the server while the first publishes.
+//! RTSP or WebRTC server, which does the protocol — and hands it out as a
+//! source of what it sends, through the `Publishers` the channel took on it.
+//! The source is wired into the channel's hub as a camera pulled is, a
+//! pipeline of its own: a publisher arriving begins a run, and leaving ends
+//! it. What reads the hub never knows a camera from a publisher. One
+//! publisher at a time: a second is refused by the server while the first
+//! publishes.
 
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use media_pp::buffer::MediaBuffer;
-use media_pp::element::RawSink;
-use media_pp::elements::{
-    Broadcast, BroadcastItem, BroadcastOptions, BroadcastSink, WebRtcPathMode,
-};
+use media_pp::bus::BusEvent;
+use media_pp::element::IntoSource;
+use media_pp::elements::{Publishers, RtmpSource, RtspSource, StreamInfo, WebRtcSource};
+use media_pp::pipeline::Pipeline;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -68,13 +67,20 @@ pub(in crate::channel) struct PublishSource {
     task: Task,
 }
 
+/// What the server hands a channel's publishers out through, by protocol.
+enum Taken {
+    Rtsp(Publishers<RtspSource>),
+    Rtmp(Publishers<RtmpSource>),
+    Whip(Publishers<WebRtcSource>),
+}
+
 struct Inner {
     name: String,
     protocol: Publish,
-    /// What the server writes a publisher's stream into.
-    intake: Broadcast,
     publisher: Publisher,
-    listeners: Listeners,
+    /// Where its publishers come from, until its task takes it: let go of
+    /// as the source halts, which takes the channel off its server.
+    taken: Mutex<Option<Taken>>,
     state: Mutex<State>,
 }
 
@@ -86,38 +92,37 @@ struct State {
 
 impl PublishSource {
     /// A source for the channel called `name` taking a publisher over
-    /// `protocol`, its intake registered on that server from now on.
+    /// `protocol`, on that server from now on.
     pub(in crate::channel) fn new(
         name: &str,
         protocol: Publish,
         publisher: Publisher,
         listeners: &Listeners,
     ) -> Result<Self, String> {
-        let intake = Broadcast::new(format!("{name}@intake"), BroadcastOptions::default());
-        let registered = match protocol {
+        let taken = match protocol {
             Publish::Rtsp => listeners
                 .rtsp
-                .add_publish_path(name, &intake)
+                .take_publishers(name)
+                .map(Taken::Rtsp)
                 .map_err(|error| error.to_string()),
             Publish::Rtmp => listeners
                 .rtmp
-                .add_path(&format!("{RTMP_APP}{name}"), &intake)
+                .take_publishers(&format!("{RTMP_APP}{name}"))
+                .map(Taken::Rtmp)
                 .map_err(|error| error.to_string()),
             Publish::Whip => listeners
                 .webrtc
-                .add_path(&whip_path(name), &intake, WebRtcPathMode::Publish)
+                .take_publishers(&whip_path(name))
+                .map(Taken::Whip)
                 .map_err(|error| error.to_string()),
-        };
-        registered.map_err(|error| {
-            format!("cannot take a publisher over {}: {error}", protocol.name())
-        })?;
+        }
+        .map_err(|error| format!("cannot take a publisher over {}: {error}", protocol.name()))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 name: name.to_owned(),
                 protocol,
-                intake,
                 publisher,
-                listeners: listeners.clone(),
+                taken: Mutex::new(Some(taken)),
                 state: Mutex::new(State {
                     state: SourceState::AwaitingPublisher,
                     since: SystemTime::now(),
@@ -128,10 +133,19 @@ impl PublishSource {
         })
     }
 
-    /// Starts reading the intake on `runtime`.
+    /// Starts taking publishers on `runtime`.
     pub(in crate::channel) fn run(&self, runtime: &Handle) {
+        let Some(taken) = self
+            .inner
+            .taken
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        else {
+            return;
+        };
         let inner = Arc::clone(&self.inner);
-        self.task.spawn(runtime, |halt| inner.run(halt));
+        self.task.spawn(runtime, |halt| inner.run(taken, halt));
     }
 
     pub(in crate::channel) fn status(&self) -> SourceStatus {
@@ -151,25 +165,15 @@ impl PublishSource {
     }
 
     /// Takes the channel off its server — no publisher begins on it from
-    /// here, and one publishing goes on until it ends — closes the intake,
-    /// and tells the task to stop.
+    /// here — and tells the task to stop, which ends one publishing.
     pub(in crate::channel) fn halt(&self) {
-        let inner = &self.inner;
-        match inner.protocol {
-            Publish::Rtsp => {
-                inner.listeners.rtsp.remove_publish_path(&inner.name);
-            }
-            Publish::Rtmp => {
-                inner
-                    .listeners
-                    .rtmp
-                    .remove_path(&format!("{RTMP_APP}{}", inner.name));
-            }
-            Publish::Whip => {
-                inner.listeners.webrtc.remove_path(&whip_path(&inner.name));
-            }
-        }
-        inner.intake.close();
+        drop(
+            self.inner
+                .taken
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
         self.task.halt();
     }
 
@@ -179,46 +183,75 @@ impl PublishSource {
 }
 
 impl Inner {
-    /// The source's task: what the intake is written, written into the hub,
-    /// each publisher a run, until halted.
-    async fn run(self: Arc<Self>, mut halt: watch::Receiver<bool>) {
-        let mut reader = self.intake.subscribe();
-        let mut sinks: Vec<BroadcastSink> = Vec::new();
-        loop {
-            let item = tokio::select! {
-                item = reader.recv() => item,
-                () = halted(&mut halt) => break,
-            };
-            match item {
-                Some(BroadcastItem::Started(tracks)) => match self.publisher.publish(&tracks) {
-                    Ok(published) => {
-                        sinks = published;
-                        self.set(SourceState::Live, true);
-                        tracing::info!(channel = %self.name, protocol = self.protocol.name(), "a publisher began");
-                    }
-                    Err(reason) => {
-                        sinks.clear();
-                        tracing::warn!(channel = %self.name, "a publisher's stream cannot be taken: {reason}");
-                    }
-                },
-                Some(BroadcastItem::Packet { track, packet, .. }) => {
-                    if let Some(sink) = sinks.get_mut(track) {
-                        // A packet the hub refuses — its run superseded — is
-                        // one the next run does without.
-                        let _ = sink.consume(MediaBuffer::Packet(packet));
-                    }
-                }
-                Some(BroadcastItem::Skipped) => {}
-                Some(BroadcastItem::Ended) => {
-                    sinks.clear();
-                    self.publisher.ended();
-                    self.set(SourceState::AwaitingPublisher, false);
-                    tracing::info!(channel = %self.name, "the publisher left");
-                }
-                Some(BroadcastItem::Closed) | None => break,
-            }
+    /// The source's task: each publisher, as it begins, written into the
+    /// hub — a run each — until halted, when what it takes them through is
+    /// let go of.
+    async fn run(self: Arc<Self>, taken: Taken, mut halt: watch::Receiver<bool>) {
+        match taken {
+            Taken::Rtsp(publishers) => self.take(publishers, &mut halt).await,
+            Taken::Rtmp(publishers) => self.take(publishers, &mut halt).await,
+            Taken::Whip(publishers) => self.take(publishers, &mut halt).await,
         }
         self.publisher.ended();
+    }
+
+    async fn take<S, M>(&self, publishers: Publishers<S>, halt: &mut watch::Receiver<bool>)
+    where
+        S: IntoSource<M>,
+    {
+        loop {
+            let next = tokio::select! {
+                next = publishers.next_async() => next,
+                () = halted(halt) => return,
+            };
+            // The server has stopped.
+            let Some((source, streams)) = next else {
+                return;
+            };
+            let pipeline = match self.start(source, &streams) {
+                Ok(pipeline) => pipeline,
+                Err(reason) => {
+                    tracing::warn!(channel = %self.name, "a publisher's stream cannot be taken: {reason}");
+                    continue;
+                }
+            };
+            self.set(SourceState::Live, true);
+            tracing::info!(channel = %self.name, protocol = self.protocol.name(), "a publisher began");
+            let left = tokio::select! {
+                reason = watch_bus(&pipeline) => Some(reason),
+                () = halted(halt) => None,
+            };
+            // Stopping joins the pipeline's threads: not on the runtime's
+            // own.
+            let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
+            self.publisher.ended();
+            self.set(SourceState::AwaitingPublisher, false);
+            let Some(reason) = left else {
+                return;
+            };
+            tracing::info!(channel = %self.name, "the publisher left: {reason}");
+        }
+    }
+
+    /// Publishes `streams` to the hub and starts a pipeline writing
+    /// `source` into them: one run.
+    fn start<S, M>(&self, source: S, streams: &[StreamInfo]) -> Result<Arc<Pipeline>, String>
+    where
+        S: IntoSource<M>,
+    {
+        let sinks = self.publisher.publish(streams)?;
+        let (pipeline, ()) =
+            Pipeline::new(format!("{}-publisher", self.name), source, |source, ctx| {
+                for (stream, sink) in streams.iter().zip(sinks) {
+                    ctx.attach(source, stream.index(), ctx.branch().to(sink)?)?;
+                }
+                Ok(())
+            })
+            .map_err(|error| format!("cannot wire the publisher: {error}"))?;
+        pipeline
+            .run()
+            .map_err(|error| format!("cannot start the publisher: {error}"))?;
+        Ok(pipeline)
     }
 
     fn set(&self, now: SourceState, began: bool) {
@@ -229,6 +262,19 @@ impl Inner {
         state.state = now;
         if began {
             state.publications += 1;
+        }
+    }
+}
+
+/// Why a publisher's pipeline ended, as its bus says — which it does only
+/// for a failure or the publisher leaving, which ends its source.
+async fn watch_bus(pipeline: &Pipeline) -> String {
+    loop {
+        match pipeline.bus().recv_async().await {
+            Some(BusEvent::Error { error, .. }) => return format!("it failed: {error}"),
+            Some(BusEvent::Finished) => return "it ended its stream".to_owned(),
+            Some(_) => {}
+            None => return "its pipeline ended".to_owned(),
         }
     }
 }

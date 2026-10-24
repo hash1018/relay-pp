@@ -28,6 +28,7 @@ on Linux are what measure a process. Results are in
 | `record N` | the same, each recorded — relay-pp as HLS (fMP4 by byte range), MediaMTX as fMP4 segments, an hour a file for both |
 | `rtsp M` | one channel, M RTSP players |
 | `webrtc M` | one channel, M WebRTC players |
+| `spread N` | N channels, one RTSP player each: what serving many channels to a few players costs |
 | `watch N` | N channels, one WebRTC player each: what converting each for WebRTC costs, given a stream WebRTC does not carry |
 
 Each run waits for every channel to be live, then 15 seconds more, starts

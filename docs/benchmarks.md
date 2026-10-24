@@ -369,6 +369,32 @@ it, two hundred times at once, is let go of after but stays with the
 process, as glibc keeps a heap it has grown. Opening a few cameras at a time
 would keep it near the first figure.
 
+## Players served through a path's muxer
+
+Measured 2026-10-24 on the same machine, with [`bench/`](../bench/README.md)
+and the stream above: relay-pp at 5fd0205, whose listeners read the hub's
+broadcast themselves (media-pp 96d85040's `add_path`), against b1b6c1b,
+where each listener's path is written by a forwarder of the channel's own —
+a reader of the hub's broadcast into the path's muxer, polled on the runtime
+(media-pp 90b38476). Each scenario twice, the two builds alternated; the
+mean of the two.
+
+| Scenario | before CPU | after CPU | before memory | after memory | players |
+|---|---|---|---|---|---|
+| `pull 100` | 74 | 72 | 72 MB | 72 MB | — |
+| `rtsp 200` | 64 | 67 | 46 MB | 45 MB | 200, nothing lost |
+| `spread 100` | 215 | 252 | 157 MB | 162 MB | 100 |
+| `webrtc 50` | 52 | 57 | 129 MB | 130 MB | 50, no gap |
+| `watch 50` | 116 | 140 | 198 MB | 202 MB | 50, no gap |
+
+What a forwarder costs is per channel with players, and per listener it is
+played over: about half a percent of a core for this stream, a packet going
+through one more broadcast on its way. A channel's players cost what they
+did — a channel of 200 RTSP players three points more — and no thread is
+added. A hundred channels with an RTSP player each take some 0.4 of a core
+more; were that to matter, a run's pipeline could write the listeners' paths
+itself, in place of the forwarder's second broadcast.
+
 ## Not measured here
 
 Runs repeated to show their spread; players on another machine; UDP; more

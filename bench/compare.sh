@@ -8,6 +8,8 @@
 #             record   — <count> channels pulling the camera, each recorded
 #             rtsp     — one channel, <count> RTSP players
 #             webrtc   — one channel, <count> WebRTC (WHEP) players
+#             spread   — <count> channels, one RTSP player each: what
+#                        serving many channels to a few players costs
 #             watch    — <count> channels, one WebRTC player each: what
 #                        converting each for WebRTC costs, where the camera
 #                        sends what WebRTC does not carry
@@ -73,7 +75,7 @@ case $scenario in
     pull) ;;
     record) record=true ;;
     rtsp | webrtc) channels=1 ;;
-    watch) ;;
+    spread | watch) ;;
     *) echo "no scenario $scenario" >&2; exit 2 ;;
 esac
 
@@ -102,7 +104,7 @@ EOF
         if $record; then curl -sf -X POST "http://$api/api/v1/channels/cam$i/record" >/dev/null; fi
     done
     live() { [ "$(curl -sf "http://$api/api/v1/channels" | grep -o '"state":"live"' | wc -l)" -eq "$channels" ]; }
-    rtsp_play() { curl -sf -X POST "http://$api/api/v1/channels/cam1/play" -H 'Content-Type: application/json' \
+    rtsp_play() { curl -sf -X POST "http://$api/api/v1/channels/${1:-cam1}/play" -H 'Content-Type: application/json' \
         -d '{"protocol":"rtsp"}' | sed 's/.*"url":"\([^"]*\)".*/\1/'; }
     whep_of() { echo "http://$api/$1/whep"; }
     whep=$(whep_of cam1)
@@ -148,7 +150,7 @@ EOF
     (cd "$run" && "$MEDIAMTX" mediamtx.yml >mediamtx.log 2>&1 &)
     wait_until "MediaMTX" 20 curl -sf "http://$api/v3/paths/list"
     live() { [ "$(curl -sf "http://$api/v3/paths/list?itemsPerPage=10000" | grep -o '"ready":true' | wc -l)" -eq "$channels" ]; }
-    rtsp_play() { echo rtsp://127.0.0.1:38554/cam1; }
+    rtsp_play() { echo "rtsp://127.0.0.1:38554/${1:-cam1}"; }
     whep_of() { echo "http://127.0.0.1:38889/$1/whep"; }
     whep=$(whep_of cam1)
     ;;
@@ -169,6 +171,15 @@ case $scenario in
         "$tools/webrtc_load$exe" "$whep" "$count" --seconds $((SECONDS_MEASURED + 15)) >"$run/players.log" 2>&1 &
         load=$!
         sleep 10
+        ;;
+    spread)
+        loads=()
+        for i in $(seq "$channels"); do
+            "$tools/rtsp_load$exe" "$(rtsp_play "cam$i")" 1 --seconds $((SECONDS_MEASURED + 25)) \
+                >"$run/players-$i.log" 2>&1 &
+            loads+=($!)
+        done
+        sleep 20
         ;;
     watch)
         loads=()
@@ -206,5 +217,11 @@ if [ "$scenario" = watch ]; then
         /^players:/ { played += $2; failed += $4 }
         /^pictures:/ { pictures += $2; gaps += $6; sub(/.*sounds: /, ""); sounds += $1 }
         END { printf "played=%d failed=%d pictures=%d after_gap=%d sounds=%d", played, failed, pictures, gaps, sounds }')
+fi
+if [ "$scenario" = spread ]; then
+    for load in "${loads[@]}"; do wait "$load" || true; done
+    players=$(cat "$run"/players-*.log | awk '
+        /^players:/ { played += $2; failed += $4 }
+        END { printf "played=%d failed=%d", played, failed }')
 fi
 echo "$scenario $server $count | $server_cost $gpu | camera: $camera_cost | $players"

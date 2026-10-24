@@ -1444,7 +1444,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "media-pp"
 version = "0.4.1"
-source = "git+https://github.com/hash1018/media-pp?rev=4c6d2eae94e5c3e874544bb0635e5b5b3d5bef4e#4c6d2eae94e5c3e874544bb0635e5b5b3d5bef4e"
+source = "git+https://github.com/hash1018/media-pp?rev=4d3e307e45bb89026121b9f42b9e322eafd30afa#4d3e307e45bb89026121b9f42b9e322eafd30afa"
 dependencies = [
  "ab_glyph",
  "arc-swap",
@@ -1998,7 +1998,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -31,6 +31,48 @@ fn chunks(root: &Path, channel: &str) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// Each chunk of `channel` under `root`, as a line: its name, whether its
+/// playlist is ended, its segments and their length, and the pictures its
+/// media file holds — how many, and from when to when. Where a playback is
+/// short, whether a chunk was short or the playback lost some of one.
+fn described(root: &Path, channel: &str) -> String {
+    chunks(root, channel)
+        .iter()
+        .map(|chunk| {
+            let listed = playlist(chunk);
+            let segments: Vec<f64> = listed
+                .lines()
+                .filter_map(|line| line.strip_prefix("#EXTINF:"))
+                .filter_map(|rest| rest.trim_end_matches(',').parse().ok())
+                .collect();
+            let pictures = media_pp::ffmpeg::format::input(&chunk.join("media.m4s"))
+                .ok()
+                .and_then(|mut input| {
+                    let stream = input.streams().best(media_pp::ffmpeg::media::Type::Video)?;
+                    let (index, unit) = (stream.index(), f64::from(stream.time_base()));
+                    let times: Vec<f64> = input
+                        .packets()
+                        .filter(|(stream, _)| stream.index() == index)
+                        .filter_map(|(_, packet)| packet.pts())
+                        .map(|pts| pts as f64 * unit)
+                        .collect();
+                    let first = times.iter().copied().reduce(f64::min)?;
+                    let last = times.iter().copied().reduce(f64::max)?;
+                    Some(format!("{} pictures, {first:.3}..{last:.3} s", times.len()))
+                })
+                .unwrap_or_else(|| "no pictures read".into());
+            format!(
+                "{} ended={} segments={} ({:.2} s) {pictures}",
+                chunk.file_name().unwrap_or_default().to_string_lossy(),
+                listed.contains("#EXT-X-ENDLIST"),
+                segments.len(),
+                segments.iter().sum::<f64>(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn playlist(chunk: &Path) -> String {
     std::fs::read_to_string(chunk.join("index.m3u8")).unwrap_or_default()
 }
@@ -127,7 +169,7 @@ fn a_camera_is_recorded_chunk_by_chunk_and_played_back() {
         .best(media_pp::ffmpeg::media::Type::Video)
         .expect("the playback has pictures");
     let (index, unit) = (pictures.index(), f64::from(pictures.time_base()));
-    let (mut played, mut run, mut last, mut packets) = (0.0, None::<(f64, f64)>, None, 0);
+    let (mut stretch, mut run, mut last, mut packets) = (0.0, None::<(f64, f64)>, None, 0);
     let mut packet = media_pp::ffmpeg::Packet::empty();
     while packet.read(&mut input).is_ok() {
         packets += 1;
@@ -137,18 +179,22 @@ fn a_camera_is_recorded_chunk_by_chunk_and_played_back() {
         let at = at as f64 * unit;
         if last.is_some_and(|last| at < last) {
             let (from, to) = run.take().expect("a run under way");
-            played += to - from + 1.0 / 15.0;
+            stretch += to - from + 1.0 / 15.0;
         }
         run = Some(run.map_or((at, at), |(from, to): (f64, f64)| (from, to.max(at))));
         last = Some(at);
     }
     drop(input);
     if let Some((from, to)) = run {
-        played += to - from + 1.0 / 15.0;
+        stretch += to - from + 1.0 / 15.0;
     }
     assert!(
-        played >= 3.9,
-        "four seconds or more of pictures: {played:.2} s in {packets} packets"
+        stretch >= 3.9,
+        "four seconds or more of pictures: {stretch:.2} s in {packets} packets\n\
+         the playback:\n{played_list}\n\
+         the chunks:\n{}",
+        described(&root, "floor2-cam1"),
+        played_list = played,
     );
 
     // The camera drops: the recording under way ends with it. It comes

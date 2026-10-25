@@ -108,3 +108,42 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  macos:
+    runs-on: macos-15
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      # The encoders the tests' cameras use, as above, but no Vulkan: the
+      # Mac converts on VideoToolbox, which is part of macOS, and FFmpeg's
+      # Vulkan context would need MoltenVK.
+      - name: Set up FFmpeg
+        uses: hash1018/media-pp/.github/actions/setup-ffmpeg@fbba81290627dd23773de6d6a63406175d9a2fca
+        with:
+          vcpkg-features: openh264,opus,gpl,x264,x265,vpx
+
+      - name: Cache downloaded crates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # macOS's own code — the VideoToolbox device pictures are converted
+      # on — is compiled nowhere else.
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

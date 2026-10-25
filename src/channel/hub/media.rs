@@ -17,7 +17,9 @@ use super::plan::Target;
 use crate::config::VideoConversion;
 
 /// What a converted track's pictures may be held by after its decoder: the
-/// encoder's own, as many as a GPU encoder keeps while it works.
+/// encoder's own, as many as a GPU encoder keeps while it works. Core
+/// Video's pool grows, so VideoToolbox is given no such budget.
+#[cfg(any(windows, target_os = "linux"))]
 const DOWNSTREAM_FRAMES: i32 = 4;
 
 /// A sound track's decoder, and its encoder to `target`: on the processor,
@@ -170,6 +172,10 @@ fn gpus() -> Vec<DecodeTarget> {
                         downstream_hw_frames: DOWNSTREAM_FRAMES,
                     });
                 }
+            }
+            #[cfg(target_os = "macos")]
+            if let Ok(device) = media_pp::elements::VideoToolboxDevice::new() {
+                targets.push(DecodeTarget::VideoToolbox { device });
             }
             targets
         })

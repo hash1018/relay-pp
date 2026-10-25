@@ -373,9 +373,10 @@ yet.
   is track 1 converted to Opus.
 - Pictures are converted on the GPU where one takes them, decoded and
   encoded there without being copied out: D3D11 on Windows — NVENC, or the
-  Intel or AMD encoder Media Foundation offers — and NVIDIA's NVDEC and
-  NVENC, or else Vulkan Video, on Linux. A codec the GPU cannot decode — VP8
-  on many — is decoded on the processor and still encoded on the GPU. With
+  Intel or AMD encoder Media Foundation offers — NVIDIA's NVDEC and
+  NVENC, or else Vulkan Video, on Linux, and VideoToolbox on macOS. A codec
+  the GPU cannot decode — VP8 on many — is decoded on the processor and
+  still encoded on the GPU. With
   no GPU encoder, or every session of one taken (how many a driver opens
   varies: ten 1080p ones opened at once on a GeForce RTX 3050), it is
   refused, or encoded on the processor where `"any"` says so (below).

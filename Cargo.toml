@@ -31,10 +31,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Pictures are converted on the GPU where one takes them: D3D11 on Windows
 # (NVENC, or Media Foundation's Intel and AMD encoders), NVIDIA's NVDEC and
-# NVENC or else Vulkan Video on Linux. Neither needs an SDK to build, and a
-# machine without the GPU converts in software.
+# NVENC or else Vulkan Video on Linux, VideoToolbox on macOS. None needs an
+# SDK to build, and a machine without the GPU converts in software.
 [target.'cfg(windows)'.dependencies]
 media-pp = { git = "https://github.com/hash1018/media-pp", rev = "63db58a5522badf6dce6612f59afbeda74004bba", features = ["d3d11"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 media-pp = { git = "https://github.com/hash1018/media-pp", rev = "63db58a5522badf6dce6612f59afbeda74004bba", features = ["cuda", "vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+media-pp = { git = "https://github.com/hash1018/media-pp", rev = "63db58a5522badf6dce6612f59afbeda74004bba", features = ["videotoolbox"] }

@@ -97,10 +97,11 @@ fn opus_is_recorded_as_it_came_in_time_with_the_pictures() {
 
     let (codecs, starts) = recorded(&root);
     assert_eq!(codecs, [Id::H264, Id::OPUS]);
-    let apart = (starts[0] - starts[1]).abs();
-    assert!(
-        apart < 0.5,
-        "sound {apart:.2}s from the pictures: {starts:?}"
+    assert_in_time(
+        "opus_is_recorded_as_it_came_in_time_with_the_pictures",
+        &server,
+        &root,
+        &starts,
     );
 
     server.stop();
@@ -200,6 +201,83 @@ fn first_of_each(path: &Path) -> Option<(Vec<Id>, Vec<f64>)> {
     Some((codecs, starts.into_iter().collect::<Option<Vec<_>>>()?))
 }
 
+/// That a recording's pictures and sound begin within half a second of each
+/// other. Where they do not, it says what the recording holds — the first
+/// packets of each, the playlist, the channel's status — and keeps the
+/// recording under `CARGO_TARGET_TMPDIR/failed/{test}`, which CI uploads:
+/// the failure seen only on a hosted Mac, whose cause the numbers alone
+/// did not say.
+fn assert_in_time(test: &str, server: &relay_pp::Server, root: &Path, starts: &[f64]) {
+    let apart = (starts[0] - starts[1]).abs();
+    if apart < 0.5 {
+        return;
+    }
+    let media = find(root, "media.m4s").expect("the recording was found above");
+    let packets = first_packets(&media, 24).join("\n");
+    let playlist = media
+        .parent()
+        .and_then(|chunk| std::fs::read_dir(chunk).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "m3u8"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("failed")
+        .join(test);
+    let _ = std::fs::remove_dir_all(&kept);
+    let copied = copy_dir(root, &kept);
+    panic!(
+        "pictures and sound {apart:.2}s apart: {starts:?}\n\
+         first packets (stream, pts s, dts s, key, bytes):\n{packets}\n\
+         playlist:\n{playlist}\n\
+         status: {:?}\n\
+         recording kept at {} ({copied:?})",
+        server.status(),
+        kept.display(),
+    );
+}
+
+/// The first `count` packets of the file at `path`, as lines.
+fn first_packets(path: &Path, count: usize) -> Vec<String> {
+    let Ok(mut input) = media_pp::ffmpeg::format::input(path) else {
+        return vec!["(cannot open)".into()];
+    };
+    input
+        .packets()
+        .take(count)
+        .map(|(stream, packet)| {
+            let unit = f64::from(stream.time_base());
+            let seconds = |at: Option<i64>| at.map(|at| format!("{:.3}", at as f64 * unit));
+            format!(
+                "{} {:?} {:?} {} {}",
+                stream.index(),
+                seconds(packet.pts()),
+                seconds(packet.dts()),
+                packet.is_key(),
+                packet.size()
+            )
+        })
+        .collect()
+}
+
+/// Copies the directory `from` into `to`, whole.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// A camera of H.265 pictures, by whichever encoder this FFmpeg has.
 fn h265_camera(sound: bool) -> Option<Camera> {
     [VideoCodec::Kvazaar, VideoCodec::H265]
@@ -259,10 +337,11 @@ fn vp8_is_recorded_as_h264_in_time_with_the_sound() {
 
     let (codecs, starts) = recorded(&root);
     assert_eq!(codecs, [Id::H264, Id::AAC]);
-    let apart = (starts[0] - starts[1]).abs();
-    assert!(
-        apart < 0.5,
-        "pictures {apart:.2}s from the sound: {starts:?}"
+    assert_in_time(
+        "vp8_is_recorded_as_h264_in_time_with_the_sound",
+        &server,
+        &root,
+        &starts,
     );
 
     server.stop();

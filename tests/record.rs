@@ -114,18 +114,41 @@ fn a_camera_is_recorded_chunk_by_chunk_and_played_back() {
     let (status, length) = http_range(api, &media, "0-99");
     assert_eq!((status, length), (206, 100));
 
-    // FFmpeg plays the stretch back through the server, ranges and all.
+    // FFmpeg plays the stretch back through the server, ranges and all:
+    // four seconds or more of pictures. Measured by their timestamps, not
+    // counted: a hosted runner's camera, encoding live, may drop pictures,
+    // and a count of 60 failed there at 56 without saying which. Each chunk
+    // begins its own timeline, so the stretch is the runs between the
+    // places the timestamps go back, added up.
     let url = format!("http://{api}/playback/floor2-cam1/index.m3u8");
     let mut input = media_pp::ffmpeg::format::input(&url).expect("the playback opens");
-    let mut packets = 0;
+    let pictures = input
+        .streams()
+        .best(media_pp::ffmpeg::media::Type::Video)
+        .expect("the playback has pictures");
+    let (index, unit) = (pictures.index(), f64::from(pictures.time_base()));
+    let (mut played, mut run, mut last, mut packets) = (0.0, None::<(f64, f64)>, None, 0);
     let mut packet = media_pp::ffmpeg::Packet::empty();
     while packet.read(&mut input).is_ok() {
         packets += 1;
+        let Some(at) = packet.pts().filter(|_| packet.stream() == index) else {
+            continue;
+        };
+        let at = at as f64 * unit;
+        if last.is_some_and(|last| at < last) {
+            let (from, to) = run.take().expect("a run under way");
+            played += to - from + 1.0 / 15.0;
+        }
+        run = Some(run.map_or((at, at), |(from, to): (f64, f64)| (from, to.max(at))));
+        last = Some(at);
     }
     drop(input);
+    if let Some((from, to)) = run {
+        played += to - from + 1.0 / 15.0;
+    }
     assert!(
-        packets >= 60,
-        "four seconds or more at 15 a second: {packets}"
+        played >= 3.9,
+        "four seconds or more of pictures: {played:.2} s in {packets} packets"
     );
 
     // The camera drops: the recording under way ends with it. It comes

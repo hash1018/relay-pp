@@ -187,10 +187,15 @@ fn hls_players_carry_a_token_in_their_urls() {
     assert_eq!(status, 200, "{playlist}");
     let segment = playlist
         .lines()
-        .find(|line| line.contains(".m4s"))
+        .find(|line| line.starts_with("seg-"))
         .expect("a segment")
         .to_owned();
     assert!(segment.ends_with(&format!("?token={play}")), "{segment}");
+    let part = playlist
+        .lines()
+        .find(|line| line.starts_with("#EXT-X-PART:"))
+        .expect("a part");
+    assert!(part.contains(&format!(".mp4?token={play}\"")), "{part}");
     let bare = segment.split('?').next().unwrap();
     assert_eq!(http_bytes(api, &format!("/cam1/{bare}")).0, 401);
     assert_eq!(http_bytes(api, &format!("/cam1/{segment}")).0, 200);

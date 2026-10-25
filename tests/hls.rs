@@ -1,7 +1,9 @@
 //! Phase 3 end to end, on the loopback alone: a camera of media-pp's own
-//! played over HLS live — FFmpeg reading the playlist and its segments
-//! through the server — written only while asked for, and begun again when
-//! asked for after; and the page that plays a channel, with what it runs.
+//! played over Low-Latency HLS live — its parts handed out as they are
+//! made, a player held until the part it asks for is in, and FFmpeg reading
+//! the playlist and its segments through the server — written only while
+//! asked for, and begun again when asked for after; and the page that plays
+//! a channel, with what it runs.
 
 mod common;
 
@@ -62,20 +64,74 @@ fn a_channel_is_played_over_hls_while_it_is_asked_for() {
         head.contains("content-type: application/vnd.apple.mpegurl"),
         "{head}"
     );
-    assert!(playlist.contains("#EXTINF"), "{playlist}");
+    assert!(
+        playlist.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES"),
+        "{playlist}"
+    );
+    assert!(playlist.contains("#EXT-X-PART:"), "{playlist}");
     assert!(sinks(&server).contains(&"hls"));
 
-    let segment = playlist
+    // A part, and the part a player is told is coming, which is handed out
+    // once it is in.
+    let uri = |line: &str| {
+        line.split("URI=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .map(str::to_owned)
+    };
+    let part = playlist
         .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("a segment")
-        .to_owned();
-    let (status, head, _) = http_bytes(api, &format!("/cam1/{segment}"));
-    assert_eq!(status, 200);
-    assert!(head.contains("content-type: video/iso.segment"), "{head}");
+        .filter(|line| line.starts_with("#EXT-X-PART:"))
+        .find_map(uri)
+        .expect("a part");
+    let (status, head, _) = http_bytes(api, &format!("/cam1/{part}"));
+    assert_eq!(status, 200, "{part}");
+    assert!(head.contains("content-type: video/mp4"), "{head}");
+    // A segment's first part is told coming only once it has begun: asked
+    // between two segments, the playlist tells of none for a moment.
+    let mut playlist = String::new();
+    let mut coming = None;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while coming.is_none() && Instant::now() < deadline {
+        playlist = http(api, "GET", "/cam1/index.m3u8", None).2;
+        coming = playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXT-X-PRELOAD-HINT:"))
+            .find_map(uri);
+    }
+    let coming = coming.expect("a part coming");
+    let (status, _, bytes) = http_bytes(api, &format!("/cam1/{coming}"));
+    assert_eq!(status, 200, "{coming}");
+    assert!(!bytes.is_empty());
+
+    // A player saying where it is is held until the segment after is in.
+    let next: u64 = playlist
+        .lines()
+        .find_map(|line| line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .and_then(|first| first.parse::<u64>().ok())
+        .expect("a media sequence")
+        + playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXTINF"))
+            .count() as u64
+        + 1;
+    let asked = Instant::now();
+    let (status, _, held) = http(
+        api,
+        "GET",
+        &format!("/cam1/index.m3u8?_HLS_msn={next}&_HLS_part=0"),
+        None,
+    );
+    assert_eq!(status, 200, "{held}");
+    assert!(held.contains(&format!("part-{next}-0.mp4")), "{held}");
+    assert!(asked.elapsed() < Duration::from_secs(6), "answered once in");
+    let (status, _, _) = http(api, "GET", "/cam1/index.m3u8?_HLS_msn=100000", None);
+    assert_eq!(status, 400, "too far ahead");
+
     for path in [
-        "/cam1/..%2F..%2Fsecret.m4s",
-        "/cam1/nothing.m4s",
+        "/cam1/..%2F..%2Fsecret.mp4",
+        "/cam1/nothing.mp4",
+        "/cam1/part-99999-0.mp4",
         "/cam1/a.txt",
     ] {
         assert_eq!(http_bytes(api, path).0, 404, "{path}");
@@ -93,7 +149,7 @@ fn a_channel_is_played_over_hls_while_it_is_asked_for() {
     // Unasked for, it ends, its files with it.
     wait_for("HLS let go of", || !sinks(&server).contains(&"hls"));
     assert_eq!(
-        http_bytes(api, &format!("/cam1/{segment}")).0,
+        http_bytes(api, &format!("/cam1/{part}")).0,
         404,
         "nothing served once it ended"
     );

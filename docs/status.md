@@ -240,16 +240,24 @@ costs nothing while nobody plays; the camera is pulled either way.
   that to leave; `OPTIONS` says what it takes. The offer is the asking:
   there is nothing to call first. Sound in a codec WebRTC does not carry is
   converted to Opus for it — see "Conversions" below.
-- **HLS** at `http://<host>:8888/<name>/index.m3u8`: fragmented MP4, a
-  sliding window of six segments of a second each, cut at the next
-  keyframe — a player starts two or three of them behind the camera. A
-  channel's HLS is written from the first request for its playlist, which
-  waits for its first segment, and goes on while players ask for the
-  playlist or a segment; `hls.idle` after the last request it stops, and
-  its files, under the system's temporary directory, are removed. What the
-  camera sends goes as it came wherever fMP4 holds it, as a recording does,
-  and is converted where it does not. A player that comes with a
-  `?token=` finds it in the URL of each segment the playlist names.
+- **HLS** at `http://<host>:8888/<name>/index.m3u8`: Low-Latency HLS of
+  fragmented MP4, kept in memory — parts of a fifth of a second, segments
+  cut at the first keyframe past a second, a window of six of them. A
+  player that says where it is (`_HLS_msn`, `_HLS_part`) is held until the
+  part after is in, for up to six seconds, and the part the playlist says
+  is coming is handed out once it is: hls.js plays it under a second behind
+  the camera, and any HLS player plays it as plain HLS, segment by
+  segment. A channel's HLS is written from the first request for its
+  playlist, which waits for its camera and a first whole segment, and goes
+  on while players ask for the playlist or a part; `hls.idle` after the
+  last request it stops. The same camera connected again goes on as the
+  same stream — its numbers, its timeline and its init section — so a
+  player plays on across the drop, behind by as long as the camera was
+  gone unless it catches up, as the page does; one sending other tracks
+  follows behind a discontinuity. What the camera sends goes as it came
+  wherever fMP4 holds it, as a recording does, and is converted where it
+  does not. A player that comes with a `?token=` finds it in the URL of
+  each part and segment the playlist names.
 - **The page** at `http://<host>:8888/<name>`: plays the channel in a
   browser over WebRTC, and over HLS where WebRTC does not get through or is
   chosen; and its recordings, listed or between two times. It carries the
@@ -468,8 +476,10 @@ read back by FFmpeg through the server; a recording ended and begun again as
 the camera dropped and came back, taken off and put back on, and ended by a
 stop. Retention, playlist reading and the playback playlist by unit tests.
 Played over HLS live, FFmpeg reading pictures and sound through the server
-as the playlist slides; the HLS let go of once nobody asked, nothing of it
-served after, and written again when asked for; a token in an HLS player's
+as the playlist slides; a part handed out, the part coming handed out once
+it is in, a player saying where it is held until the next segment's first
+part is in, and one asking too far ahead refused; the HLS let go of once
+nobody asked, nothing of it served after, and written again when asked for; a token in an HLS player's
 URL carried into each segment's, a segment refused without it; the page
 and hls.js served. The metrics read out a camera pulled, recorded and played
 over RTSP and WebRTC; the manager's alone under `[auth]`.
@@ -484,7 +494,11 @@ What it costs against MediaMTX on Windows is in [benchmarks.md](benchmarks.md).
 By hand, in phase 3: the page in a browser (the Claude desktop app's,
 Chromium) against media-pp's `rtsp_server` serving a 1080p H.264 and Opus
 file: played over WebRTC, over HLS — two seconds behind the camera — and a
-recording played back from its list.
+recording played back from its list. Low-Latency HLS, by hand: hls.js 1.7.3
+at its defaults plays it 0.75–0.9 s behind the camera, and the page from a
+cold start about 1.5 s; across a camera dropped for five seconds three
+times over, hls.js at its defaults played on with no error, a drop's time
+behind after each, and the page caught up to a second or so.
 
 Not yet: Ctrl+C on the binary, a real IP camera, Safari's own HLS, and a
 recording of hours.

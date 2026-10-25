@@ -1,21 +1,19 @@
-//! A channel's HLS live: the sink that writes its broadcast as a live HLS
-//! playlist and its segments, into a directory of its own, for the HTTP
-//! port to serve — see `docs/status.md`, "Players".
+//! A channel's HLS live: the sink that writes its broadcast as a
+//! Low-Latency HLS stream — parts of a fifth of a second, kept in memory —
+//! for the HTTP port to serve — see `docs/status.md`, "Players".
 //!
 //! It is written only while asked for: begun by the first request for the
 //! playlist, and ended once no request has come — for the playlist or a
-//! segment — for the server's `[hls] idle`, its directory removed. Like a
-//! recording, each run of the camera is a pipeline of its own,
-//! `BroadcastSource` → `HlsMuxer`, on its own thread; unlike one, nothing
-//! of it is kept: a sliding window of short segments, each deleted as it
-//! leaves the playlist.
+//! part — for the server's `[hls] idle`. Like a recording, each run of the
+//! camera is a pipeline of its own, `BroadcastSource` → `LlHlsMuxer`, on its
+//! own thread; unlike one, nothing of it is kept but a sliding window, and
+//! its players go on across the runs, each a discontinuity of one stream.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use media_pp::elements::{BroadcastSource, HlsMode, HlsMuxer, HlsOptions, HlsSegmentFormat};
+use media_pp::elements::{BroadcastSource, LlHlsOptions, LlHlsStream};
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -26,14 +24,7 @@ use super::follow::{halted, sleep_until, watch_bus};
 use crate::channel::hub::{Fed, Feed, Subscription};
 use crate::channel::task::Task;
 
-/// The playlist's name in its directory, and in its URL.
-pub(crate) const PLAYLIST: &str = "index.m3u8";
-
-/// How long a segment is, cut at the next keyframe after it: what a player
-/// starts behind the camera by, three of them as players go.
-const SEGMENT: Duration = Duration::from_secs(1);
-
-/// How many segments the playlist lists.
+/// How many whole segments the playlist lists.
 const WINDOW: usize = 6;
 
 /// How long after its pipeline failed another is begun.
@@ -41,9 +32,6 @@ const AGAIN_AFTER: Duration = Duration::from_secs(2);
 
 /// How often it looks whether it is still asked for.
 const IDLE_CHECK: Duration = Duration::from_millis(500);
-
-/// Numbers the directories of every HLS live in this process.
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct HlsLive {
     shared: Arc<Shared>,
@@ -53,7 +41,8 @@ pub(crate) struct HlsLive {
 /// What a live and its task share.
 struct Shared {
     name: String,
-    dir: PathBuf,
+    /// What its players are served.
+    stream: LlHlsStream,
     /// When it was last asked for.
     asked: Mutex<Instant>,
     /// How long it goes unasked for before it ends.
@@ -69,23 +58,22 @@ struct Shared {
 
 impl HlsLive {
     /// Starts writing on `runtime` what `subscription` is fed, whenever a
-    /// run of it is live, into a new directory under the system's
-    /// temporary one.
+    /// run of it is live.
     pub(crate) fn start(
         name: &str,
         subscription: Subscription,
         idle: Duration,
         runtime: &Handle,
     ) -> Self {
-        let dir = std::env::temp_dir()
-            .join(format!("relay-pp-{}", std::process::id()))
-            .join(format!(
-                "hls-{}-{name}",
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+        let options = LlHlsOptions {
+            segments: WINDOW,
+            ..LlHlsOptions::default()
+        };
+        let stream = LlHlsStream::new(format!("{name}-hls"), options)
+            .expect("the default parts and segments are ones a stream takes");
         let shared = Arc::new(Shared {
             name: name.to_owned(),
-            dir,
+            stream,
             asked: Mutex::new(Instant::now()),
             idle,
             over: AtomicBool::new(false),
@@ -99,10 +87,10 @@ impl HlsLive {
         Self { shared, task }
     }
 
-    /// Where its files are, its being asked for counted.
-    pub(crate) fn asked(&self) -> &Path {
+    /// What its players are served, its being asked for counted.
+    pub(crate) fn asked(&self) -> &LlHlsStream {
         *lock(&self.shared.asked) = Instant::now();
-        &self.shared.dir
+        &self.shared.stream
     }
 
     /// Whether it has ended, for want of being asked for or halted.
@@ -110,14 +98,18 @@ impl HlsLive {
         self.shared.over.load(Ordering::Acquire)
     }
 
-    /// Waits, up to `within`, for its playlist to be written — at once
+    /// Waits, up to `within`, for its first part to be written — at once
     /// where it is — or says why it is not.
     pub(crate) async fn ready(&self, within: Duration) -> Result<(), Unready> {
         let deadline = Instant::now() + within;
-        let playlist = self.shared.dir.join(PLAYLIST);
         let mut fed = self.shared.subscription.fed();
         loop {
-            if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
+            let written = tokio::time::timeout(
+                Duration::from_millis(100),
+                self.shared.stream.playlist(None),
+            )
+            .await;
+            if matches!(written, Ok(Ok(_))) {
                 return Ok(());
             }
             if let Fed::Failed(refusal) = &*fed.borrow_and_update() {
@@ -130,7 +122,6 @@ impl HlsLive {
                 });
             }
             *lock(&self.shared.asked) = Instant::now();
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -153,13 +144,10 @@ impl Shared {
         };
         let mut live = live_of(&fed.borrow_and_update());
         let mut writing: Option<Arc<Pipeline>> = None;
-        // How many pipelines it has begun: each names its segments apart
-        // from the last's, which a player may still be reading.
-        let mut begun = 0u64;
         let mut again: Option<Instant> = None;
         let mut idle = tokio::time::interval(IDLE_CHECK);
         if let Some(feed) = &live {
-            writing = self.begin(feed, &mut begun, &mut again).await;
+            writing = self.begin(feed, &mut again).await;
         }
         loop {
             let watched = writing.clone();
@@ -175,7 +163,7 @@ impl Shared {
                         self.end(writing.take()).await;
                         again = None;
                         if let Some(feed) = &live {
-                            writing = self.begin(feed, &mut begun, &mut again).await;
+                            writing = self.begin(feed, &mut again).await;
                         }
                     }
                 }
@@ -195,29 +183,26 @@ impl Shared {
                 () = sleep_until(again.filter(|_| writing.is_none())) => {
                     again = None;
                     if let Some(feed) = &live {
-                        writing = self.begin(feed, &mut begun, &mut again).await;
+                        writing = self.begin(feed, &mut again).await;
                     }
                 }
             }
         }
         self.over.store(true, Ordering::Release);
         self.end(writing.take()).await;
-        let dir = self.dir.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+        // Its players are answered that it is over.
+        self.stream.close();
     }
 
     /// Begins a pipeline writing `feed`, or says when to try again.
     async fn begin(
         self: &Arc<Self>,
         feed: &Feed,
-        begun: &mut u64,
         again: &mut Option<Instant>,
     ) -> Option<Arc<Pipeline>> {
         let shared = Arc::clone(self);
         let feed = feed.clone();
-        let index = *begun;
-        *begun += 1;
-        let made = tokio::task::spawn_blocking(move || shared.begin_now(&feed, index)).await;
+        let made = tokio::task::spawn_blocking(move || shared.begin_now(&feed)).await;
         match made {
             Ok(Ok(pipeline)) => {
                 tracing::info!(channel = %self.name, "HLS written");
@@ -238,23 +223,10 @@ impl Shared {
         }
     }
 
-    fn begin_now(&self, feed: &Feed, index: u64) -> Result<Arc<Pipeline>, String> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|error| format!("cannot make {}: {error}", self.dir.display()))?;
+    fn begin_now(&self, feed: &Feed) -> Result<Arc<Pipeline>, String> {
         let (source, tracks) = BroadcastSource::new(format!("{}-hls", self.name), &feed.broadcast)
             .map_err(|error| error.to_string())?;
-        let mut options = HlsOptions::new(
-            self.dir.join(PLAYLIST),
-            self.dir.join(format!("{index}-%05d.m4s")),
-        );
-        options.segment_duration = SEGMENT;
-        options.mode = HlsMode::Live {
-            window_size: WINDOW,
-            delete_old_segments: true,
-        };
-        options.segment_format = HlsSegmentFormat::Fmp4;
-        options.init_filename = format!("{index}-init.mp4");
-        let mut muxer = HlsMuxer::create(options).map_err(|error| error.to_string())?;
+        let mut muxer = self.stream.muxer();
         let mut tracked = Vec::new();
         for (track_index, track) in tracks.iter().enumerate() {
             tracked.push(
@@ -275,8 +247,8 @@ impl Shared {
         Ok(pipeline)
     }
 
-    /// Stops a pipeline: nothing it holds is kept, nor its playlist ended —
-    /// the next run's goes on in its place.
+    /// Stops a pipeline: its run ends where it got to, and the next run's
+    /// goes on after it, behind a discontinuity.
     async fn end(&self, pipeline: Option<Arc<Pipeline>>) {
         if let Some(pipeline) = pipeline {
             let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
@@ -288,10 +260,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Whether `file` is one an HLS live writes: a segment or an
-/// initialization section, by a name of its own making — no path.
+/// Whether `file` is one an HLS live serves: an init section, a part or a
+/// segment, by a name of its own making — no path.
 pub(crate) fn is_media_file(file: &str) -> bool {
-    (file.ends_with(".m4s") || file.ends_with(".mp4"))
+    file.ends_with(".mp4")
         && !file.starts_with('.')
         && file
             .chars()
@@ -304,7 +276,7 @@ mod tests {
 
     #[test]
     fn only_a_file_of_its_own_making_is_served() {
-        for file in ["0-00001.m4s", "3-init.mp4"] {
+        for file in ["init-3.mp4", "part-12-4.mp4", "seg-12.mp4"] {
             assert!(is_media_file(file), "{file}");
         }
         for file in [

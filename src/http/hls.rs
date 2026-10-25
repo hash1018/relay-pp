@@ -2,14 +2,16 @@
 //! recorded between two times.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::{AppState, LIVE_WITHIN, found, unplayable};
-use crate::channel::{HLS_PLAYLIST, PlayError, is_media_file};
+use media_pp::elements::{LlHlsPlaylistError, LlHlsPosition};
+
+use crate::channel::{PlayError, is_media_file};
 use crate::{clock, recordings};
 
 /// `GET /playback/{name}/index.m3u8?from=…&to=…`: a playlist of what a
@@ -98,9 +100,16 @@ fn with_token(playlist: &str, token: &str) -> String {
         + "\n"
 }
 
+/// How long a player asking for what is not written yet is held: three
+/// segments of a camera that sends a keyframe every two seconds. Past it,
+/// it is answered with the playlist as it is.
+const BLOCKING_WITHIN: Duration = Duration::from_secs(6);
+
 /// `GET /{name}/index.m3u8`: the channel's live HLS playlist — its HLS
-/// written from the first such request, its camera and first segment
-/// waited for, and written on while a player goes on asking.
+/// written from the first such request, its camera and first part waited
+/// for, and written on while a player goes on asking. A player that says
+/// where it is — Low-Latency HLS's `_HLS_msn` and `_HLS_part` — is held
+/// until what comes after it is written.
 pub(super) async fn hls_playlist(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -110,16 +119,46 @@ pub(super) async fn hls_playlist(
         Ok(channel) => channel,
         Err(refused) => return refused.into_response(),
     };
-    if let Err(error) = channel.live(LIVE_WITHIN).await {
-        return unplayable(&error);
-    }
-    let dir = match channel.hls(LIVE_WITHIN).await {
-        Ok(dir) => dir,
-        Err(error) => return unplayable(&error),
+    // Its players are answered while its HLS is written, the camera live or
+    // not, as its RTSP and WebRTC players stay across a drop; only the
+    // first waits for the camera and the first segment.
+    let stream = match channel.hls_files() {
+        Some(stream) => stream,
+        None => {
+            if let Err(error) = channel.live(LIVE_WITHIN).await {
+                return unplayable(&error);
+            }
+            match channel.hls(LIVE_WITHIN).await {
+                Ok(stream) => stream,
+                Err(error) => return unplayable(&error),
+            }
+        }
     };
-    let Ok(playlist) = tokio::fs::read_to_string(dir.join(HLS_PLAYLIST)).await else {
-        // Gone between the look and the read: the camera dropped.
-        return unplayable(&PlayError::NotReady { channel: name });
+    let at = match position(&query) {
+        Ok(at) => at,
+        Err(refused) => return refused.into_response(),
+    };
+    let held = match at {
+        Some(at) => tokio::time::timeout(BLOCKING_WITHIN, stream.playlist(Some(at)))
+            .await
+            .ok(),
+        None => None,
+    };
+    let playlist = match held {
+        Some(answered) => answered,
+        // Before a first segment is whole, a player is not held for ever.
+        None => tokio::time::timeout(LIVE_WITHIN, stream.playlist(None))
+            .await
+            .unwrap_or(Err(LlHlsPlaylistError::Closed)),
+    };
+    let playlist = match playlist {
+        Ok(playlist) => playlist,
+        Err(LlHlsPlaylistError::TooFarAhead) => {
+            return (StatusCode::BAD_REQUEST, "that segment is too far ahead\n").into_response();
+        }
+        // Ended between the look and the answer: the camera dropped, or
+        // nobody asked for a while.
+        Err(_) => return unplayable(&PlayError::NotReady { channel: name }),
     };
     (
         [
@@ -134,28 +173,52 @@ pub(super) async fn hls_playlist(
         .into_response()
 }
 
-/// `GET /{name}/{file}`: a segment, or an initialization section, of the
-/// channel's live HLS, while it is written.
+/// Where a player says it is — `_HLS_msn`, and `_HLS_part` with it — or
+/// the answer refusing what it says.
+fn position(
+    query: &HashMap<String, String>,
+) -> Result<Option<LlHlsPosition>, (StatusCode, &'static str)> {
+    let bad = (
+        StatusCode::BAD_REQUEST,
+        "_HLS_msn and _HLS_part are numbers\n",
+    );
+    let Some(msn) = query.get("_HLS_msn") else {
+        return if query.contains_key("_HLS_part") {
+            Err((StatusCode::BAD_REQUEST, "_HLS_part goes with _HLS_msn\n"))
+        } else {
+            Ok(None)
+        };
+    };
+    let msn = msn.parse().map_err(|_| bad)?;
+    let part = match query.get("_HLS_part") {
+        Some(part) => Some(part.parse().map_err(|_| bad)?),
+        None => None,
+    };
+    Ok(Some(LlHlsPosition { msn, part }))
+}
+
+/// `GET /{name}/{file}`: an init section, a part or a segment of the
+/// channel's live HLS, while it is written — the part its playlist says is
+/// coming once it is in.
 pub(super) async fn hls_file(
     State(state): State<AppState>,
     Path((name, file)): Path<(String, String)>,
 ) -> Response {
-    let dir = state
+    let stream = state
         .channels
         .get(&name)
         .and_then(|channel| channel.hls_files());
-    let (Some(dir), true) = (dir, is_media_file(&file)) else {
+    let (Some(stream), true) = (stream, is_media_file(&file)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let content_type = if file.ends_with(".m4s") {
-        "video/iso.segment"
-    } else {
-        "video/mp4"
-    };
-    match tokio::fs::read(dir.join(&file)).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, content_type)], bytes).into_response(),
-        // Left the playlist, and deleted.
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    match tokio::time::timeout(BLOCKING_WITHIN, stream.file(&file)).await {
+        Ok(Some(bytes)) => (
+            [(header::CONTENT_TYPE, "video/mp4")],
+            axum::body::Bytes::from(bytes.to_vec()),
+        )
+            .into_response(),
+        // Left the playlist, never coming, or not in time.
+        _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

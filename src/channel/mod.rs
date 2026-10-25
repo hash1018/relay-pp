@@ -19,8 +19,8 @@ mod sink;
 mod source;
 mod task;
 
+use media_pp::elements::LlHlsStream;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -31,8 +31,8 @@ use tokio::runtime::Handle;
 use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
 use hub::Hub;
 pub(crate) use hub::Refusal;
-pub(crate) use sink::{HLS_PLAYLIST, Listeners, Output, Recorder, is_media_file};
 use sink::{HlsLive, ListenerSink, RecordStatus, Unready};
+pub(crate) use sink::{Listeners, Output, Recorder, is_media_file};
 use source::Source;
 pub use source::{Publish, SourceState};
 pub(crate) use source::{RTMP_APP, whip_path};
@@ -409,9 +409,9 @@ impl Channel {
     }
 
     /// Has its HLS written, where it was not, and waits up to `within` for
-    /// its playlist — at once where it is written already — or says why it
-    /// cannot be. Where its files are. After [`Self::live`].
-    pub(crate) async fn hls(&self, within: Duration) -> Result<PathBuf, PlayError> {
+    /// its first part — at once where it is written already — or says why
+    /// it cannot be. What its players are served. After [`Self::live`].
+    pub(crate) async fn hls(&self, within: Duration) -> Result<LlHlsStream, PlayError> {
         let channel = || self.name.clone();
         let hls = {
             let mut attached = self
@@ -432,22 +432,22 @@ impl Channel {
                 }
             }
         };
-        let dir = hls.asked().to_owned();
+        let stream = hls.asked().clone();
         hls.ready(within).await.map_err(|unready| {
             unready.into_play_error(channel(), |channel, error| PlayError::Hls {
                 channel,
                 error,
             })
         })?;
-        Ok(dir)
+        Ok(stream)
     }
 
-    /// Where its HLS files are, while it is written — being asked for one
-    /// of them counted as its being asked for.
-    pub(crate) fn hls_files(&self) -> Option<PathBuf> {
+    /// What its HLS players are served, while it is written — being asked
+    /// for a file of it counted as its being asked for.
+    pub(crate) fn hls_files(&self) -> Option<LlHlsStream> {
         let attached = self.attached();
         let hls = attached.hls.as_ref().filter(|hls| !hls.is_over())?;
-        Some(hls.asked().to_owned())
+        Some(hls.asked().clone())
     }
 
     /// Waits, up to `within`, for its source to be live — at once where it

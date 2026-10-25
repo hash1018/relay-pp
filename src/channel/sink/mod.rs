@@ -19,7 +19,7 @@ use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 
 use super::hub::{Demand, Profile, Refusal, Target};
-pub(crate) use hls::{HlsLive, PLAYLIST as HLS_PLAYLIST, is_media_file};
+pub(crate) use hls::{HlsLive, is_media_file};
 pub(crate) use listener::{ListenerSink, Listeners};
 pub(crate) use record::{RecordStatus, Recorder};
 

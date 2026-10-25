@@ -117,7 +117,8 @@ async function playWebRtc() {
   await connected(pc, 10000);
 }
 
-function playHls(url) {
+// Plays `url` — the channel's live HLS where `live`, a recording's else.
+function playHls(url, live = false) {
   if (window.Hls && Hls.isSupported()) {
     const retry = { maxNumRetry: 5, retryDelayMs: 1000, maxRetryDelayMs: 5000 };
     const hls = new Hls({
@@ -131,15 +132,40 @@ function playHls(url) {
           errorRetry: retry,
         },
       },
-      liveSyncDurationCount: 2,
+      // The channel's HLS is Low-Latency HLS: played from its parts, a
+      // second or so behind the camera — and caught up to that, a little
+      // faster than the camera goes, after a start or a stall left it
+      // further behind.
+      lowLatencyMode: true,
+      maxLiveSyncPlaybackRate: 1.5,
     });
+    // Live, a camera that dropped and came back leaves the player where it
+    // stopped: seconds behind, it goes to where the channel is.
+    const keepUp = setInterval(() => {
+      const edge = hls.liveSyncPosition;
+      if (live && edge !== null && hls.latency > 5 && video.currentTime < edge) {
+        video.currentTime = edge;
+      }
+    }, 1000);
+    const stopThis = async () => { clearInterval(keepUp); hls.destroy(); };
     hls.on(Hls.Events.ERROR, (_, data) => {
-      if (data.fatal) say("HLS: " + data.details);
+      if (!data.fatal) return;
+      say("HLS: " + data.details + (live ? " — playing again" : ""));
+      // The camera's next connection follows its last behind a
+      // discontinuity, which hls.js can refuse when it comes as the player
+      // waits at the live edge. Played anew, it begins where the channel is.
+      if (live) {
+        setTimeout(() => {
+          if (stopCurrent !== stopThis) return;
+          stopThis();
+          playHls(url, true);
+        }, 1000);
+      }
     });
     hls.on(Hls.Events.MANIFEST_PARSED, () => say(""));
     hls.loadSource(url);
     hls.attachMedia(video);
-    stopCurrent = async () => hls.destroy();
+    stopCurrent = stopThis;
   } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
     video.src = url;
   } else {
@@ -158,12 +184,12 @@ const modes = {
       if (started !== generation) return;
       say("WebRTC: " + error.message + " — playing HLS instead");
       await stop();
-      playHls(withToken(channelPath + "/index.m3u8"));
+      playHls(withToken(channelPath + "/index.m3u8"), true);
     }
   },
   async hls() {
     say("loading HLS…");
-    playHls(withToken(channelPath + "/index.m3u8"));
+    playHls(withToken(channelPath + "/index.m3u8"), true);
   },
   async recordings(started) {
     recordings.hidden = false;

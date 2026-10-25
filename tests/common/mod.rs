@@ -41,31 +41,6 @@ pub struct Camera {
     _path: RtspServerPath,
     pub input: Arc<Pipeline>,
     pub addr: SocketAddr,
-    /// Held while a camera encodes with a heavy software encoder — see
-    /// [`HEAVY`].
-    _heavy: Option<std::sync::MutexGuard<'static, ()>>,
-}
-
-/// One camera at a time encoding with x265, Kvazaar, libvpx or an AV1
-/// encoder. On a hosted runner of three cores, x265 encoding a camera beside
-/// another test held it to four pictures a second where fifteen were asked,
-/// and the other test's camera — VP8, the same time — wrote its pictures
-/// over a second behind its sound: further behind than a broadcast keeps,
-/// so a recording began with no sound for that second. Encoding live in
-/// software, a camera has to keep up for a test of timing to mean anything.
-static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Whether `codec` is one [`HEAVY`] keeps to one camera at a time.
-fn heavy(codec: VideoCodec) -> bool {
-    matches!(
-        codec,
-        VideoCodec::H265
-            | VideoCodec::Kvazaar
-            | VideoCodec::Vp8
-            | VideoCodec::Vp9
-            | VideoCodec::Av1
-            | VideoCodec::Svtav1
-    )
 }
 
 impl Camera {
@@ -122,9 +97,6 @@ impl Camera {
             },
         )
         .ok()?;
-        // Only once it opens: a camera of an encoder this FFmpeg lacks
-        // holds nothing up.
-        let heavy = heavy(pictures).then(|| HEAVY.lock().unwrap_or_else(|p| p.into_inner()));
         let sound_encoder = match sound {
             Some(codec) => Some(
                 SwAudioEncoder::new(
@@ -204,7 +176,6 @@ impl Camera {
             server,
             _path: path,
             input,
-            _heavy: heavy,
         })
     }
 

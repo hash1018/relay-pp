@@ -198,8 +198,10 @@ fn a_camera_is_recorded_chunk_by_chunk_and_played_back() {
     );
 
     // The camera drops: the recording under way ends with it. It comes
-    // back: another begins.
-    let before = chunks(&root, "floor2-cam1").len();
+    // back: another begins. A new chunk, not more of them: the one under
+    // way as the camera dropped may have had no keyframe yet, and is then
+    // removed as it ends.
+    let before = chunks(&root, "floor2-cam1");
     camera.stop();
     wait_for("the drop noticed", || {
         server.status()[0].state != SourceState::Live
@@ -214,7 +216,11 @@ fn a_camera_is_recorded_chunk_by_chunk_and_played_back() {
     );
     let camera = Camera::start(camera_addr);
     wait_for("recording again", || server.status()[0].recording.is_some());
-    assert!(chunks(&root, "floor2-cam1").len() > before);
+    let after = chunks(&root, "floor2-cam1");
+    assert!(
+        after.iter().any(|chunk| !before.contains(chunk)),
+        "a chunk begun as the camera came back: {before:?} then {after:?}"
+    );
 
     // Taken off while the camera streams: answered once the recording is
     // finished. Put back on: another begins at once.

@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use media_pp::elements::{BroadcastSource, HlsMode, HlsMuxer, HlsOptions, HlsSegmentFormat};
+
+use crate::channel::first::FirstPacket;
 use media_pp::pipeline::Pipeline;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -243,7 +245,12 @@ impl Recording {
         let (pipeline, ()) =
             Pipeline::new(format!("{}-record", self.name), source, |source, ctx| {
                 for (index, track) in tracked.into_iter().enumerate() {
-                    ctx.attach(source, index, ctx.branch().to(sinks.take(track)?)?)?;
+                    let first = FirstPacket::new(&self.channel, "recording, read", index);
+                    ctx.attach(
+                        source,
+                        index,
+                        ctx.branch().pipe(first).to(sinks.take(track)?)?,
+                    )?;
                 }
                 Ok(())
             })

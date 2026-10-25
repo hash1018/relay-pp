@@ -13,6 +13,7 @@
 //!
 //! None of source, hub nor sink is media-pp's trait of the same name.
 
+mod first;
 mod hub;
 mod sink;
 mod source;

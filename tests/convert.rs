@@ -14,11 +14,16 @@ use media_pp::ffmpeg::codec::Id;
 use media_pp::ffmpeg::media;
 use relay_pp::SourceState;
 
-fn made(server: &relay_pp::Server, camera: std::net::SocketAddr) {
+/// The server's log, in the output of the test that wrote it.
+fn logged() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
+}
+
+fn made(server: &relay_pp::Server, camera: std::net::SocketAddr) {
+    logged();
     let body = channel("cam1", &format!("rtsp://{camera}/cam"));
     let (status, _, answer) = http(server.http_addr(), "POST", "/api/v1/channels", Some(&body));
     assert_eq!(status, 201, "{answer}");
@@ -350,6 +355,7 @@ fn vp8_is_recorded_as_h264_in_time_with_the_sound() {
 
 /// Makes `cam1` pulling `camera` with `convert` — the body's `"convert"`.
 fn made_with(server: &relay_pp::Server, camera: std::net::SocketAddr, convert: &str) {
+    logged();
     let body = format!(r#"{{"name":"cam1","source":"rtsp://{camera}/cam","convert":{convert}}}"#);
     let (status, _, answer) = http(server.http_addr(), "POST", "/api/v1/channels", Some(&body));
     assert_eq!(status, 201, "{answer}");

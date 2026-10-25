@@ -15,6 +15,7 @@ use media_pp::pipeline::Pipeline;
 use super::Refusal;
 use super::media::{self, FromKeyframe};
 use super::plan::{Plan, Target, TrackFrom};
+use crate::channel::first::FirstPacket;
 use crate::config::VideoConversion;
 
 /// What a converted track's branch may hold before its decoder, as packets.
@@ -23,6 +24,8 @@ const CONVERT_QUEUE: usize = 64;
 /// The pipeline, and what it has wired.
 pub(super) struct Running {
     pub(super) pipeline: Arc<Pipeline>,
+    /// The channel's name, for the log.
+    channel: String,
     /// What builds a branch's own `Tee` while it runs.
     context: Arc<Context>,
     /// Each source track's `Tee`.
@@ -53,7 +56,11 @@ impl Running {
                     let (branch, tee) = ctx
                         .tee(format!("track-{}", track.index()))
                         .build_dynamic()?;
-                    ctx.attach(source, track.index(), branch)?;
+                    let read = ctx
+                        .branch()
+                        .pipe(FirstPacket::new(name, "converting, read", track.index()))
+                        .to_branch(branch)?;
+                    ctx.attach(source, track.index(), read)?;
                     inputs.push(tee);
                 }
                 Ok((Arc::clone(ctx), inputs))
@@ -64,6 +71,7 @@ impl Running {
             .map_err(|error| Refusal::Failed(format!("cannot start the conversions: {error}")))?;
         Ok(Self {
             pipeline,
+            channel: name.to_owned(),
             context,
             inputs,
             conversions: BTreeMap::new(),
@@ -138,14 +146,15 @@ impl Running {
         sinks: Vec<media_pp::elements::BroadcastSink>,
     ) -> Result<(), Refusal> {
         let mut branches = Vec::new();
-        for (track, sink) in read.iter().zip(sinks) {
+        for (position, (track, sink)) in read.iter().zip(sinks).enumerate() {
             let tee = match *track {
                 TrackFrom::Original(index) => &self.inputs[index],
                 TrackFrom::Converted(index, target) => &self.conversions[&(index, target)].out,
             };
+            let first = FirstPacket::new(&self.channel, "made broadcast, written", position);
             let branch = tee
                 .branch()
-                .and_then(|chain| chain.to(sink))
+                .and_then(|chain| chain.pipe(first).to(sink))
                 .and_then(|branch| tee.attach(branch))
                 .map_err(|error| Refusal::Failed(format!("cannot wire the broadcast: {error}")))?;
             branches.push((tee.clone(), branch));

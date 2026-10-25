@@ -1,6 +1,6 @@
 //! `GET /metrics`: what the server is doing, in Prometheus's text format —
-//! each channel's camera, players, recording and conversions, and the
-//! recordings' size on disk.
+//! each channel's camera, players, recording and conversions, how its
+//! WebRTC sessions are doing, and the recordings' size on disk.
 //!
 //! Read at the moment it is asked for, from what the channels and the
 //! listeners already count; nothing is counted for it. A channel's name is
@@ -20,11 +20,43 @@ pub(crate) struct Readings {
     /// RTSP players playing now, every channel together: the listener
     /// counts no more finely.
     pub(crate) rtsp_players: usize,
-    pub(crate) webrtc_sessions: Vec<SessionStats>,
+    pub(crate) webrtc_sessions: Vec<WebRtcSession>,
     /// What every recording takes on disk, as the last sweep measured it —
     /// none before the first.
     pub(crate) recorded_bytes: Option<u64>,
 }
+
+/// What the metrics read of one of the WebRTC server's sessions open now.
+pub(crate) struct WebRtcSession {
+    pub(crate) path: String,
+    pub(crate) role: SessionRole,
+    /// The share of its packets lost over the last second or so, where its
+    /// connection has measured it.
+    pub(crate) loss: Option<f32>,
+    /// Packets asked to be sent again since it opened: by a player of the
+    /// server, or by the server of a publisher.
+    pub(crate) resend_requests: u64,
+    /// Times a player fell so far behind that it went on from a keyframe.
+    pub(crate) fell_behind: u64,
+}
+
+impl From<&SessionStats> for WebRtcSession {
+    fn from(stats: &SessionStats) -> Self {
+        Self {
+            path: stats.path.clone(),
+            role: stats.role,
+            loss: stats.loss,
+            resend_requests: stats.resend_requests,
+            fell_behind: stats.fell_behind,
+        }
+    }
+}
+
+/// Each role a WebRTC session has, by the name its label gives it.
+const ROLES: [(SessionRole, &str); 2] = [
+    (SessionRole::Play, "play"),
+    (SessionRole::Publish, "publish"),
+];
 
 /// Every state a channel's source is in, by the name the API gives it.
 const STATES: [(SourceState, &str); 4] = [
@@ -146,6 +178,66 @@ pub(crate) fn text(readings: &Readings) -> String {
         "WebRTC players of the channel.",
         &webrtc,
     );
+    // How the channel's WebRTC sessions open now are doing: what each has
+    // counted since it opened, together, and the worst loss among them.
+    let sessions = |channel: &str, role: SessionRole| -> Vec<&WebRtcSession> {
+        readings
+            .webrtc_sessions
+            .iter()
+            .filter(|session| session.path == channel && session.role == role)
+            .collect()
+    };
+    let per_role = |value: &dyn Fn(&str, SessionRole) -> Option<f64>| -> Vec<(String, f64)> {
+        channels
+            .iter()
+            .flat_map(|status| {
+                ROLES.iter().filter_map(|(role, name)| {
+                    value(&status.name, *role).map(|value| {
+                        (
+                            format!("{{channel=\"{}\",role=\"{name}\"}}", status.name),
+                            value,
+                        )
+                    })
+                })
+            })
+            .collect()
+    };
+    family(
+        "relay_pp_channel_webrtc_resend_requests",
+        "gauge",
+        "Packets the channel's WebRTC sessions open now asked to be sent again, by players of the server or by the server of the publisher: lost on the way.",
+        &per_role(&|channel, role| {
+            Some(
+                sessions(channel, role)
+                    .into_iter()
+                    .map(|session| session.resend_requests)
+                    .sum::<u64>() as f64,
+            )
+        }),
+    );
+    family(
+        "relay_pp_channel_webrtc_loss",
+        "gauge",
+        "The largest share of packets lost, from 0 to 1, over the last second among the channel's WebRTC sessions open now; absent where none has measured it.",
+        &per_role(&|channel, role| {
+            sessions(channel, role)
+                .into_iter()
+                .filter_map(|session| session.loss)
+                .map(f64::from)
+                .reduce(f64::max)
+        }),
+    );
+    family(
+        "relay_pp_channel_webrtc_fell_behind",
+        "gauge",
+        "Times the channel's WebRTC players open now fell so far behind that they went on from a keyframe, skipping pictures.",
+        &per_channel(&|status| {
+            sessions(&status.name, SessionRole::Play)
+                .into_iter()
+                .map(|session| session.fell_behind)
+                .sum::<u64>() as f64
+        }),
+    );
     family(
         "relay_pp_channel_rtsp_players",
         "gauge",
@@ -227,6 +319,56 @@ mod tests {
         ] {
             assert!(text.lines().any(|got| got == line), "{line}\n---\n{text}");
         }
+    }
+
+    fn session(path: &str, role: SessionRole, loss: Option<f32>, resends: u64) -> WebRtcSession {
+        WebRtcSession {
+            path: path.to_owned(),
+            role,
+            loss,
+            resend_requests: resends,
+            fell_behind: resends / 2,
+        }
+    }
+
+    /// The sessions open now, read out by their channel and role: resends
+    /// and skips together, the worst loss, and no loss where none was
+    /// measured.
+    #[test]
+    fn a_channel_s_webrtc_sessions_say_what_they_lost() {
+        let text = text(&Readings {
+            channels: vec![
+                status("cam1", SourceState::Live),
+                status("cam2", SourceState::Live),
+            ],
+            rtsp_players: 0,
+            webrtc_sessions: vec![
+                session("cam1", SessionRole::Play, Some(0.02), 4),
+                session("cam1", SessionRole::Play, Some(0.25), 6),
+                session("cam1", SessionRole::Play, None, 0),
+                session("cam1", SessionRole::Publish, Some(0.0), 3),
+                session("elsewhere", SessionRole::Play, Some(0.9), 100),
+            ],
+            recorded_bytes: None,
+        });
+        for line in [
+            "# TYPE relay_pp_channel_webrtc_resend_requests gauge",
+            r#"relay_pp_channel_webrtc_resend_requests{channel="cam1",role="play"} 10"#,
+            r#"relay_pp_channel_webrtc_resend_requests{channel="cam1",role="publish"} 3"#,
+            r#"relay_pp_channel_webrtc_resend_requests{channel="cam2",role="play"} 0"#,
+            r#"relay_pp_channel_webrtc_loss{channel="cam1",role="play"} 0.25"#,
+            r#"relay_pp_channel_webrtc_loss{channel="cam1",role="publish"} 0"#,
+            r#"relay_pp_channel_webrtc_fell_behind{channel="cam1"} 5"#,
+            r#"relay_pp_channel_webrtc_fell_behind{channel="cam2"} 0"#,
+            r#"relay_pp_channel_webrtc_players{channel="cam1"} 3"#,
+        ] {
+            assert!(text.lines().any(|got| got == line), "{line}\n---\n{text}");
+        }
+        assert!(
+            !text.contains(r#"relay_pp_channel_webrtc_loss{channel="cam2""#),
+            "no loss where none was measured\n{text}"
+        );
+        assert!(!text.contains("elsewhere"), "only channels\n{text}");
     }
 
     #[test]

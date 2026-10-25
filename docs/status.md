@@ -418,6 +418,9 @@ it is asked for, from what the channels and listeners count already.
 | `relay_pp_channel_received_bytes_total{channel}` | counter | what its source has written, over every connection |
 | `relay_pp_channel_readers{channel}` | gauge | readers of its stream: its played listeners' forwarders, its recording, its HLS, its conversions |
 | `relay_pp_channel_webrtc_players{channel}` | gauge | its WebRTC players |
+| `relay_pp_channel_webrtc_resend_requests{channel,role}` | gauge | packets its WebRTC sessions open now asked to be sent again since they opened — `play`: its players of the server, `publish`: the server of its publisher; lost on the way |
+| `relay_pp_channel_webrtc_loss{channel,role}` | gauge | the largest share of packets lost, 0 to 1, over the last second among those sessions; absent where none has measured it |
+| `relay_pp_channel_webrtc_fell_behind{channel}` | gauge | times its WebRTC players open now fell so far behind that they went on from a keyframe, skipping pictures |
 | `relay_pp_channel_rtsp_players{channel}` | gauge | its RTSP players |
 | `relay_pp_channel_recording{channel}` | gauge | 1 while a recording of it is written |
 | `relay_pp_channel_record_failed{channel}` | gauge | 1 from its recording failing until one is written again |

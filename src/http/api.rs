@@ -32,7 +32,12 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
             .map(|channel| channel.status())
             .collect(),
         rtsp_players: state.rtsp.players(),
-        webrtc_sessions: state.webrtc.session_stats(),
+        webrtc_sessions: state
+            .webrtc
+            .session_stats()
+            .iter()
+            .map(metrics::WebRtcSession::from)
+            .collect(),
         recorded_bytes: *state
             .recorded_bytes
             .lock()

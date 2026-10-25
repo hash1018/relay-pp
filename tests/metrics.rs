@@ -96,3 +96,39 @@ fn what_runs_is_read_out() {
     camera.stop();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A WHIP publisher's session is read out under its channel, though it
+/// publishes to the path beside the channel's: what the server measured of
+/// what it sent.
+#[test]
+fn a_whip_publisher_is_read_out_under_its_channel() {
+    let server = server();
+    let api = server.http_addr();
+    let body = r#"{"name":"studio","publish":"whip"}"#;
+    assert_eq!(http(api, "POST", "/api/v1/channels", Some(body)).0, 201);
+    let Some(pushed) = push(&format!("http://{api}/studio/whip"), Push::Whip, None) else {
+        eprintln!("skipped: this FFmpeg has no Opus encoder for WHIP");
+        server.stop();
+        return;
+    };
+    let pushed = pushed.expect("the publisher taken");
+    let loss = r#"relay_pp_channel_webrtc_loss{channel="studio",role="publish"}"#;
+    wait_for("the publisher's loss measured", || {
+        value(&http(api, "GET", "/metrics", None).2, loss).is_some()
+    });
+    let metrics = http(api, "GET", "/metrics", None).2;
+    assert!(
+        value(&metrics, loss).is_some_and(|loss| (0.0..=1.0).contains(&loss)),
+        "{metrics}"
+    );
+    assert!(
+        value(
+            &metrics,
+            r#"relay_pp_channel_webrtc_resend_requests{channel="studio",role="publish"}"#
+        )
+        .is_some(),
+        "{metrics}"
+    );
+    pushed.stop();
+    server.stop();
+}

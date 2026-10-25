@@ -12,7 +12,7 @@ use std::fmt::Write;
 
 use media_pp::elements::{SessionRole, SessionStats};
 
-use crate::channel::{ChannelStatus, SourceState};
+use crate::channel::{ChannelStatus, SourceState, whip_path};
 
 /// What one answer is made of.
 pub(crate) struct Readings {
@@ -179,12 +179,19 @@ pub(crate) fn text(readings: &Readings) -> String {
         &webrtc,
     );
     // How the channel's WebRTC sessions open now are doing: what each has
-    // counted since it opened, together, and the worst loss among them.
+    // counted since it opened, together, and the worst loss among them. A
+    // player plays the channel's own path; its WHIP publisher publishes to
+    // the path beside it.
     let sessions = |channel: &str, role: SessionRole| -> Vec<&WebRtcSession> {
+        let path = if role == SessionRole::Publish {
+            whip_path(channel)
+        } else {
+            channel.to_owned()
+        };
         readings
             .webrtc_sessions
             .iter()
-            .filter(|session| session.path == channel && session.role == role)
+            .filter(|session| session.path == path && session.role == role)
             .collect()
     };
     let per_role = |value: &dyn Fn(&str, SessionRole) -> Option<f64>| -> Vec<(String, f64)> {
@@ -346,7 +353,8 @@ mod tests {
                 session("cam1", SessionRole::Play, Some(0.02), 4),
                 session("cam1", SessionRole::Play, Some(0.25), 6),
                 session("cam1", SessionRole::Play, None, 0),
-                session("cam1", SessionRole::Publish, Some(0.0), 3),
+                session("cam1/whip", SessionRole::Publish, Some(0.0), 3),
+                session("cam2", SessionRole::Publish, Some(0.5), 7),
                 session("elsewhere", SessionRole::Play, Some(0.9), 100),
             ],
             recorded_bytes: None,
@@ -356,6 +364,7 @@ mod tests {
             r#"relay_pp_channel_webrtc_resend_requests{channel="cam1",role="play"} 10"#,
             r#"relay_pp_channel_webrtc_resend_requests{channel="cam1",role="publish"} 3"#,
             r#"relay_pp_channel_webrtc_resend_requests{channel="cam2",role="play"} 0"#,
+            r#"relay_pp_channel_webrtc_resend_requests{channel="cam2",role="publish"} 0"#,
             r#"relay_pp_channel_webrtc_loss{channel="cam1",role="play"} 0.25"#,
             r#"relay_pp_channel_webrtc_loss{channel="cam1",role="publish"} 0"#,
             r#"relay_pp_channel_webrtc_fell_behind{channel="cam1"} 5"#,

@@ -271,12 +271,26 @@ impl Recording {
             return;
         };
         let pipeline = writing.pipeline;
-        let _ = tokio::task::spawn_blocking(move || pipeline.finish()).await;
+        let chunk = writing.chunk.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            pipeline.finish();
+            chunk.remove_if_empty()
+        })
+        .await
+        .unwrap_or(false);
         self.status
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .recording = None;
-        tracing::info!(channel = %self.name, chunk = %writing.chunk.url, "recorded");
+        if removed {
+            tracing::info!(
+                channel = %self.name,
+                chunk = %writing.chunk.url,
+                "recorded nothing before it ended; the chunk is removed"
+            );
+        } else {
+            tracing::info!(channel = %self.name, chunk = %writing.chunk.url, "recorded");
+        }
     }
 }
 

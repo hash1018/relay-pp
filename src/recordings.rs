@@ -34,6 +34,17 @@ pub(crate) struct Chunk {
 }
 
 impl Chunk {
+    /// Takes the chunk away where its recording ended with nothing in it —
+    /// begun, then cut at the end of its UTC chunk or by the camera
+    /// dropping, before a keyframe came — answering whether it did. A
+    /// chunk still written, or one with a segment, is left alone.
+    pub(crate) fn remove_if_empty(&self) -> bool {
+        let empty = self
+            .playlist()
+            .is_some_and(|playlist| playlist.ended && playlist.segments.is_empty());
+        empty && fs::remove_dir_all(&self.path).is_ok()
+    }
+
     pub(crate) fn playlist(&self) -> Option<Playlist> {
         fs::read_to_string(self.path.join(PLAYLIST))
             .ok()
@@ -159,6 +170,14 @@ impl Playlist {
             {
                 if let Some((length, offset)) = range {
                     next_offset = offset + length;
+                }
+                // A segment of nothing — what a recording ended before its
+                // first keyframe lists — is no segment: a playback naming
+                // its empty range is answered 416, and a player gives up
+                // on the chunk.
+                if range.is_some_and(|(length, _)| length == 0) {
+                    range = None;
+                    continue;
                 }
                 playlist.segments.push(Segment {
                     duration,
@@ -345,6 +364,14 @@ mod tests {
         #EXTINF:4.000000,\n#EXT-X-BYTERANGE:900\nmedia.m4s\n\
         #EXTINF:2.000000,\n#EXT-X-BYTERANGE:500@2664\nmedia.m4s\n";
 
+    /// What a hosted Mac's recording wrote for a chunk it began a moment
+    /// before its end, no keyframe come by then: ended, with one segment of
+    /// nothing.
+    const RECORDED_NOTHING: &str = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n\
+        #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+        #EXT-X-MAP:URI=\"media.m4s\",BYTERANGE=\"744@0\"\n\
+        #EXTINF:0.000000,\n#EXT-X-BYTERANGE:0@744\nmedia.m4s\n#EXT-X-ENDLIST\n";
+
     fn at(seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_792_764_000 + seconds) // 2026-10-23T14:00:00Z
     }
@@ -360,6 +387,59 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The chunk a recording ended with nothing in has no segment to list
+    /// or to play, and is taken away once ended; one with a segment, or
+    /// one still written, stays. Played back beside a chunk that holds
+    /// something, it adds nothing — no empty range, which a server answers
+    /// 416, and no discontinuity before the first segment there is.
+    #[test]
+    fn a_chunk_that_recorded_nothing_is_neither_played_nor_kept() {
+        let nothing = Playlist::parse(RECORDED_NOTHING);
+        assert!(nothing.ended);
+        assert!(nothing.segments.is_empty(), "{nothing:?}");
+        assert_eq!(nothing.duration(), Duration::ZERO);
+
+        let root = scratch("recorded_nothing");
+        let chunk = |name: &str, playlist: &str| {
+            let path = root.join("cam1").join("2026-10-23").join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(PLAYLIST), playlist).unwrap();
+            fs::write(path.join("media.m4s"), vec![0; 744]).unwrap();
+        };
+        chunk("14-00-00", RECORDED_NOTHING);
+        chunk("14-00-01", &format!("{RECORDED}#EXT-X-ENDLIST\n"));
+        chunk("14-00-11", "#EXTM3U\n#EXT-X-VERSION:7\n");
+        let listed: Vec<_> = chunks(&root, "cam1")
+            .into_iter()
+            .map(|chunk| {
+                let playlist = chunk.playlist().unwrap();
+                (chunk, playlist)
+            })
+            .collect();
+        let played = playlist_between(&listed, at(0), at(60)).unwrap();
+        assert!(!played.contains("@744\n"), "no empty range: {played}");
+        assert_eq!(played.matches("#EXTINF:").count(), 3, "{played}");
+        assert!(!played.contains("#EXT-X-DISCONTINUITY"), "{played}");
+
+        let removed: Vec<bool> = listed
+            .iter()
+            .map(|(chunk, _)| chunk.remove_if_empty())
+            .collect();
+        assert_eq!(removed, [true, false, false], "only the ended, empty one");
+        let left: Vec<_> = chunks(&root, "cam1")
+            .into_iter()
+            .map(|chunk| chunk.url)
+            .collect();
+        assert_eq!(
+            left,
+            [
+                "/recordings/cam1/2026-10-23/14-00-01",
+                "/recordings/cam1/2026-10-23/14-00-11"
+            ]
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

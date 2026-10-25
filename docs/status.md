@@ -313,6 +313,9 @@ What is written:
   included.
 - What is cut off — the process dying, power lost — keeps every segment the
   playlist lists; what is lost is the segment under way.
+- A chunk that ends before its first keyframe came — begun a moment before
+  the end of its UTC chunk, or the camera dropping at once — holds nothing,
+  and is removed as it ends: it is neither listed nor played back.
 - A recording that fails — a full disk — says why in `record_error` and is
   begun again 5 seconds later.
 - Each recording is a media-pp pipeline on a thread of its own, so a disk

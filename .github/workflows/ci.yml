@@ -72,7 +72,7 @@ jobs:
       # Every server, camera and player binds the loopback alone.
       - name: Test
         shell: pwsh
-        run: cargo test
+        run: cargo test --no-fail-fast
 
   linux:
     runs-on: ubuntu-26.04
@@ -107,7 +107,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --no-fail-fast
 
   macos:
     runs-on: macos-15
@@ -146,7 +146,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --no-fail-fast
 
       # A recording a test found out of time is kept for it to be looked at
       # — see `assert_in_time` in tests/convert.rs.

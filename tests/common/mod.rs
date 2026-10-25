@@ -251,20 +251,19 @@ pub fn http_as(
     body: Option<&str>,
     authorization: Option<&str>,
 ) -> (u16, String, String) {
-    let mut stream = TcpStream::connect(addr).unwrap();
     let body = body.unwrap_or_default();
     let authorization = authorization
         .map(|value| format!("Authorization: {value}\r\n"))
         .unwrap_or_default();
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{authorization}\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
+    let response = exchange(
+        addr,
+        &format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{authorization}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    let response = String::from_utf8_lossy(&response).into_owned();
     let status = response
         .split(' ')
         .nth(1)
@@ -274,6 +273,34 @@ pub fn http_as(
         .split_once("\r\n\r\n")
         .map_or((response.as_str(), ""), |(head, body)| (head, body));
     (status, head.to_owned(), body.to_owned())
+}
+
+/// Sends `request` to `addr` in one write and reads the answer to its end.
+///
+/// One write, because a server answering before it has read the body — a
+/// `401` refused on the headers alone — and closing then resets the
+/// connection where the body arrives after it, and the reset can come
+/// before the answer is read. And what arrived before a reset is the answer
+/// all the same: the server closed having sent it.
+pub fn exchange(addr: SocketAddr, request: &str) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset && !response.is_empty() =>
+            {
+                break;
+            }
+            Err(error) => panic!("{addr} answers: {error}"),
+        }
+    }
+    response
 }
 
 /// The body that makes a channel `name` pulling `source`.
@@ -323,14 +350,10 @@ pub fn scratch(label: &str) -> std::path::PathBuf {
 /// `GET path` on `addr` for a body that may be anything but text — a
 /// segment: the status, the headers, and the body.
 pub fn http_bytes(addr: SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
+    let response = exchange(
+        addr,
+        &format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -347,14 +370,12 @@ pub fn http_bytes(addr: SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
 /// `GET path` on `addr` with a `Range` header: the status and the body's
 /// length.
 pub fn http_range(addr: SocketAddr, path: &str, range: &str) -> (u16, usize) {
-    let mut stream = TcpStream::connect(addr).unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nRange: bytes={range}\r\n\r\n"
-    )
-    .unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
+    let response = exchange(
+        addr,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nRange: bytes={range}\r\n\r\n"
+        ),
+    );
     let text = String::from_utf8_lossy(&response);
     let status = text
         .split(' ')

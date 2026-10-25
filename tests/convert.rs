@@ -364,18 +364,16 @@ fn made_with(server: &relay_pp::Server, camera: std::net::SocketAddr, convert: &
 
 /// A WHEP offer `POST`ed as it is, to see the answer's status and body.
 fn offered(server: &relay_pp::Server) -> (u16, String) {
-    use std::io::{Read, Write};
-    let mut stream = std::net::TcpStream::connect(server.http_addr()).unwrap();
     let offer = "v=0\r\n";
-    write!(
-        stream,
-        "POST /cam1/whep HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
-         Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{offer}",
-        offer.len()
-    )
-    .unwrap();
-    let mut answer = String::new();
-    stream.read_to_string(&mut answer).unwrap();
+    let answer = exchange(
+        server.http_addr(),
+        &format!(
+            "POST /cam1/whep HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+             Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{offer}",
+            offer.len()
+        ),
+    );
+    let answer = String::from_utf8_lossy(&answer).into_owned();
     let status = answer
         .split(' ')
         .nth(1)

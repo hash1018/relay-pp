@@ -46,6 +46,9 @@ fn conversions(server: &relay_pp::Server) -> Vec<String> {
 
 #[test]
 fn aac_reaches_webrtc_players_as_opus_and_rtsp_players_as_it_is() {
+    if !opus_encodes() {
+        return;
+    }
     let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
     let server = server();
     made(&server, camera.addr);
@@ -106,6 +109,9 @@ fn opus_is_recorded_as_it_came_in_time_with_the_pictures() {
 
 #[test]
 fn a_conversion_stops_once_no_webrtc_player_has_played_for_a_while() {
+    if !opus_encodes() {
+        return;
+    }
     let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
     let server = server();
     made(&server, camera.addr);
@@ -340,6 +346,9 @@ fn a_channel_pictures_are_not_converted_for_refuses_webrtc_saying_why() {
 
 #[test]
 fn a_channel_says_what_it_converts_over_the_server() {
+    if !opus_encodes() {
+        return;
+    }
     let camera = Camera::with_sound("127.0.0.1:0".parse().unwrap());
     let server = server_with("[convert]\nsound = \"off\"");
     made_with(&server, camera.addr, r#"{"sound":"auto"}"#);

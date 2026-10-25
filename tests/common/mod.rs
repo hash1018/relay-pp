@@ -21,6 +21,18 @@ use relay_pp::{ChannelConfig, Config, ConvertChoice, Server, SourceState, Transp
 
 pub const WITHIN: Duration = Duration::from_secs(20);
 
+/// Whether this FFmpeg encodes Opus, which the server converts a camera's
+/// AAC to for its WebRTC players; says why where it does not, for the test
+/// to skip.
+pub fn opus_encodes() -> bool {
+    let _ = ffmpeg::init();
+    let found = ffmpeg::encoder::find_by_name("libopus").is_some();
+    if !found {
+        eprintln!("skipping: no libopus in this FFmpeg, to convert sound to for WebRTC");
+    }
+    found
+}
+
 /// An RTSP camera: a picture of media-pp's test source, encoded live and
 /// served at `rtsp://{addr}/cam`.
 pub struct Camera {

@@ -184,3 +184,39 @@ fn the_page_that_plays_a_channel_is_served_with_what_it_runs() {
     assert_eq!(script.len(), 385_716, "hls.js as released");
     server.stop();
 }
+
+/// With `player_page = false` the page and what it runs are not served,
+/// where a server's players are of their own; the API is as ever.
+#[test]
+fn the_page_is_not_served_where_it_is_turned_off() {
+    let config = relay_pp::Config::parse(
+        r#"
+        [rtsp]
+        listen = "127.0.0.1:0"
+        [webrtc]
+        listen = "127.0.0.1:0"
+        [http]
+        listen = "127.0.0.1:0"
+        player_page = false
+        [rtmp]
+        listen = "127.0.0.1:0"
+        "#,
+    )
+    .unwrap();
+    let server = relay_pp::Server::start(config).expect("start");
+    let api = server.http_addr();
+    assert_eq!(http(api, "GET", "/cam1", None).0, 404, "no page");
+    assert_eq!(
+        http(api, "GET", "/assets/hls.light.min.js", None).0,
+        404,
+        "nor what it runs"
+    );
+    let body = channel("cam1", "rtsp://127.0.0.1:1/cam");
+    assert_eq!(
+        http(api, "POST", "/api/v1/channels", Some(&body)).0,
+        201,
+        "the API as ever"
+    );
+    assert_eq!(http(api, "GET", "/api/v1/channels/cam1", None).0, 200);
+    server.stop();
+}

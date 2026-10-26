@@ -61,6 +61,9 @@ pub(crate) struct AppState {
     /// What the recordings take on disk, as the retention sweep last
     /// measured it.
     pub(crate) recorded_bytes: Arc<Mutex<Option<u64>>>,
+    /// Whether the page that plays a channel is served (`[http]
+    /// player_page`).
+    pub(crate) player_page: bool,
 }
 
 /// Every route: the manager's, a player's of a channel live, and a
@@ -108,7 +111,7 @@ pub(crate) fn router(state: AppState) -> Router {
             state.clone(),
             who_may_watch_files,
         ));
-    Router::new()
+    let mut router = Router::new()
         .merge(manager)
         .merge(players)
         .merge(publishers)
@@ -116,12 +119,16 @@ pub(crate) fn router(state: AppState) -> Router {
         .nest(recordings::URL_ROOT, files)
         // The session's own URL is the secret that ends it.
         .route("/{name}/whep/{session}", axum::routing::delete(whep_end))
-        .route("/{name}/whip/{session}", axum::routing::delete(whep_end))
-        // The page and what it runs carry nothing of a channel: what it
-        // plays, it asks for with the token it was opened with.
-        .route("/{name}", get(player_page))
-        .route("/assets/hls.light.min.js", get(hls_js))
-        .with_state(state)
+        .route("/{name}/whip/{session}", axum::routing::delete(whep_end));
+    // The page and what it runs carry nothing of a channel: what it plays,
+    // it asks for with the token it was opened with. Where players are of
+    // their own, it is not served at all.
+    if state.player_page {
+        router = router
+            .route("/{name}", get(player_page))
+            .route("/assets/hls.light.min.js", get(hls_js));
+    }
+    router.with_state(state)
 }
 
 /// What a request presented: its `Authorization` header — a `Bearer` token

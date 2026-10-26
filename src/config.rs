@@ -397,6 +397,16 @@ pub struct HttpConfig {
     /// Where the API and WHEP are served.
     #[serde(default = "HttpConfig::default_listen")]
     pub listen: SocketAddr,
+    /// Whether `/admin`, the page that manages the server, and its sign-in
+    /// are served — not the API it calls, which is served either way.
+    /// There is no such page yet: this is the switch it comes with.
+    #[serde(default = "yes")]
+    pub admin_page: bool,
+    /// Whether `/{channel}`, the page that plays a channel in a browser,
+    /// is served — not what it plays from (WHEP, HLS), which a player of
+    /// its own uses either way.
+    #[serde(default = "yes")]
+    pub player_page: bool,
 }
 
 impl HttpConfig {
@@ -409,6 +419,8 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             listen: Self::default_listen(),
+            admin_page: true,
+            player_page: true,
         }
     }
 }
@@ -508,6 +520,17 @@ mod tests {
                 "203.0.113.7:8189".parse().unwrap()
             ]
         );
+    }
+
+    /// Both pages are served unless turned off, whichever the file sets.
+    #[test]
+    fn the_pages_are_on_unless_turned_off() {
+        let defaults = Config::parse("").unwrap().http;
+        assert!(defaults.admin_page && defaults.player_page);
+        let set = Config::parse("[http]\nadmin_page = false\nplayer_page = false").unwrap();
+        assert!(!set.http.admin_page && !set.http.player_page);
+        let one = Config::parse("[http]\nplayer_page = false").unwrap();
+        assert!(one.http.admin_page && !one.http.player_page);
     }
 
     #[test]

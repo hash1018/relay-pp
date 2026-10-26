@@ -179,6 +179,7 @@ impl Server {
             rtsp_public_url: config.rtsp.public_url.clone(),
             auth,
             recorded_bytes,
+            player_page: config.http.player_page,
         });
         let (http_stop, stopped) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn(async move {

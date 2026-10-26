@@ -44,6 +44,8 @@ has them all with comments.
 | `webrtc.candidates` | none | addresses players are told to send to — a router's public address, the machine's own where `listen` is every interface; an IP alone keeps `listen`'s port |
 | `webrtc.threads` | media-pp's default | how many threads WebRTC sessions are spread over, each a UDP port of its own from `listen`'s on |
 | `http.listen` | `0.0.0.0:8888` | the API, WHEP, WHIP, HLS, the player page and recordings |
+| `http.player_page` | `true` | whether `/{name}`, the page that plays a channel, and what it runs are served; off where players are of their own — WHEP and HLS are served either way |
+| `http.admin_page` | `true` | whether `/admin`, the page that manages the server, and its sign-in are served; there is no such page yet, and the API is served either way |
 | `rtmp.listen` | `0.0.0.0:1935` | where RTMP publishers connect |
 | `record.dir` | `recordings` | where recordings go |
 | `record.segment` | `"4s"` | how long a recorded segment is — what a player seeks to — cut at the next keyframe after it |

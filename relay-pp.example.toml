@@ -27,6 +27,12 @@ candidates = ["192.168.0.10"]
 [http]
 # The API, WHEP for browsers (POST /<name>/whep) and recordings.
 # listen = "0.0.0.0:8888"
+# /<name>, the page that plays a channel; off where players are your own
+# (they play from /<name>/whep and /<name>/index.m3u8 all the same).
+# player_page = true
+# /admin, the page that manages the server (to come); the API is served
+# either way.
+# admin_page = true
 
 [rtmp]
 # Where RTMP publishers — OBS, encoders — connect, to a channel made with

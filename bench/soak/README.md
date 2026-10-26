@@ -38,10 +38,17 @@ its encoder and decoder use, and how many channels are live.
 
 2. What media-pp builds with on Linux (`docs/building/linux.md` in
    media-pp): Rust, FFmpeg's development libraries, and the NVIDIA driver —
-   `nvidia-smi` names the GPU.
-3. A test video: an `.mp4` with H.264 pictures and AAC or Opus sound, a few
-   minutes long — a camera's recording does. Nothing of the kind is checked
-   in.
+   `nvidia-smi` names the GPU. `soak.sh` drives relay-pp's API with `curl`,
+   which a desktop install may not have.
+3. A test video: an `.mp4` with H.264 pictures and Opus sound, a few
+   minutes long. Nothing of the kind is checked in. The sound has to be
+   Opus: the WHIP publishers send the file as it is, and WebRTC carries no
+   AAC. A camera's recording, whose sound is AAC more often than not, can
+   have its sound re-encoded and its pictures kept:
+
+   ```sh
+   ffmpeg -i camera.mp4 -c:v copy -c:a libopus -b:a 128k -ar 48000 -movflags +faststart ~/media/stream.mp4
+   ```
 
 ## 1. Build
 
@@ -82,7 +89,8 @@ STREAM=~/media/stream.mp4 HEVC=~/media/stream-hevc.mp4 RUN=smoke bench/soak/soak
 
 It should say `started: 64 of 64 live` (62 without HEVC) and end with a
 summary of zeros — the heap's line comes only with a run past half an
-hour. Then the long one.
+hour. `60 of 64`, with every `pub-whip` line failing, is a file whose sound
+is AAC: `pubs/pub-whip*.log` says so. Then the long one.
 
 ## 5. The soak (3 hours)
 
@@ -116,6 +124,20 @@ see whether that holds on the machine itself, run the soak again with it:
 MALLOC_ARENA_MAX=2 STREAM=~/media/stream.mp4 HEVC=~/media/stream-hevc.mp4 RUN=linux-arena bench/soak/soak.sh 10800
 ```
 
+On the machine itself it held, and cost processor time. Two 3-hour runs on
+an i5-12400F with an RTX 3050, Ubuntu, one after the other:
+
+| Run | Heap after 30 min | After 2 h | Mean | Most | relay-pp's processor |
+|---|---|---|---|---|---|
+| as it is | +169 MB/h | +22 MB/h | 1707 MB | 1913 MB | 80–90%, 120–130% while a round plays |
+| `MALLOC_ARENA_MAX=2` | +2 MB/h | +20 MB/h | 642 MB | 691 MB | 130%, 160–180% while a round plays |
+
+As it is, the heap rose for two hours to about 1.8 GB — three times what
+it came to in Docker — and stayed there; threads and descriptors stayed
+level throughout. Held to two arenas it stayed near 640 MB from the first
+half hour on, and relay-pp's 165 threads, contending for those two, spent
+half a core more doing the same work.
+
 ## Reading what it says
 
 Each run is a folder under `bench/soak/runs/`. `summary.txt` is what to read
@@ -138,6 +160,8 @@ What earlier runs came to, for comparison:
 | Windows, 6 h, no HEVC | none | ~250 MB, flat |
 | Docker on Windows, 3.5 h, HEVC on the GPU | none | 600–800 MB, +34 to +59 MB/h |
 | Docker, 1.5 h, `MALLOC_ARENA_MAX=2` | none | ~350 MB, +5 MB/h after an hour |
+| Linux, 3 h, HEVC on the GPU | none | rising to ~1.8 GB in 2 h, then +22 MB/h |
+| Linux, 3 h, `MALLOC_ARENA_MAX=2` | none | ~640 MB, +2 MB/h; half a core more processor |
 
 Then, where something is off:
 

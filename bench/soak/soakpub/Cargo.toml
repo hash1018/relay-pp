@@ -1,0 +1,11 @@
+[package]
+name = "soakpub"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The soak's publisher. media-pp is the checkout beside relay-pp.
+[dependencies]
+media-pp = { path = "../../../../media-pp/lib", features = ["webrtc"] }
+
+[workspace]

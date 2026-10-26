@@ -28,3 +28,8 @@ rustc-ice-*.txt
 
 # The FFmpeg tree CI builds and caches
 /.vcpkg
+
+# The soak's runs and its helpers' builds
+/bench/soak/runs
+/bench/soak/*/target
+/bench/soak/*/Cargo.lock

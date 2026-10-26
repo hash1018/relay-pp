@@ -1,0 +1,12 @@
+[package]
+name = "hevcify"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Makes the soak's HEVC camera file on NVENC. media-pp is the checkout
+# beside relay-pp.
+[dependencies]
+media-pp = { path = "../../../../media-pp/lib", features = ["cuda"] }
+
+[workspace]

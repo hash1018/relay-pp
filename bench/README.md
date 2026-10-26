@@ -6,6 +6,10 @@ machine, over the loopback, and prints one line of what it cost;
 on Linux are what measure a process. Results are in
 [docs/benchmarks.md](../docs/benchmarks.md).
 
+[`soak/`](soak) is the other kind of run: hours of every input and every
+way out at once, for what is lost and what grows — see
+[soak/README.md](soak/README.md).
+
 ## What runs
 
 - **The camera** — media-pp's `rtsp_server` example, playing `stream.mp4`

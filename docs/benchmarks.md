@@ -185,7 +185,8 @@ camera — media-pp's `rtsp_server` — gives no `rtptime` for a stream of two
 tracks: either sends relay-pp to FFmpeg's client. These runs are of the same
 pictures with no sound (`ffmpeg -i stream.mp4 -map 0:v -c copy`), which
 `retina` takes as it does an IP camera's; MediaMTX was measured again on
-them. Both OSes, the same machine; on Linux memory is resident memory.
+them. Both OSes, the same machine — Linux in Docker, as
+[below](#linux-in-docker), where memory is resident memory.
 
 ### Pulling cameras, nothing reading
 
@@ -289,16 +290,20 @@ of the 65 above — and NVENC's and the decoder's own buffers.
 ## What it says for relay-pp
 
 - **Pulling cameras costs a fraction of MediaMTX's processor time** with
-  `retina`'s client, on Windows as on Linux; FFmpeg's, which takes what
-  `retina` does not, costs twice MediaMTX's on Windows and about the same on
-  Linux.
+  `retina`'s client, on Windows as in Docker; FFmpeg's, which takes what
+  `retina` does not, costs twice MediaMTX's on Windows and about the same in
+  Docker.
 - **Sending to players is where it is strong**: RTSP for a fraction of
   MediaMTX's processor time, WebRTC for less and losing nothing — on Linux
   too, and with a steadier stream at scale.
 - **Memory per camera is the gap left**, smaller: about 1 MB a camera to
   MediaMTX's 0.3–0.5, and about 3 MB a camera recorded, a pipeline each.
+- **On Linux itself** the same build takes less processor than on Windows
+  for everything but WebRTC players, which take 15 to 25% more, and a
+  third of it for converting pictures on the GPU — see
+  [Linux itself](#linux-itself).
 
-## On Linux
+## Linux in Docker
 
 The same runs in Docker on the same machine — a Linux VM of 12 processors
 and 16 GB — relay-pp on media-pp f96bb6ae, MediaMTX v1.20.1 for Linux,
@@ -395,7 +400,84 @@ added. A hundred channels with an RTSP player each take some 0.4 of a core
 more; were that to matter, a run's pipeline could write the listeners' paths
 itself, in place of the forwarder's second broadcast.
 
+## Linux itself
+
+Measured 2026-10-27 on Linux itself, not in a VM: an i5-12400F with 32 GB
+and an RTX 3050, as above, under Ubuntu 26.04 (Linux 7.0, NVIDIA driver
+595.91.07), with [`bench/`](../bench/README.md) and the stream above. Two
+builds: 5fd0205, the one the [table above](#players-served-through-a-paths-muxer)
+measured on Windows, and main at f50e680 (media-pp 36d5c46f). Each scenario
+four runs, the builds alternated twice; the mean of each build's two.
+Memory is resident memory. MediaMTX was not run.
+
+### The same build on both systems
+
+5fd0205 on Linux beside its Windows figures above:
+
+| Scenario | Windows CPU | Linux CPU | Windows memory | Linux memory |
+|---|---|---|---|---|
+| `pull 100` | 74 | 43 | 72 MB | 63 MB |
+| `rtsp 200` | 64 | 53 | 46 MB | 40 MB |
+| `spread 100` | 215 | 90 | 157 MB | 144 MB |
+| `webrtc 50` | 52 | 66 | 129 MB | 121 MB |
+| `watch 50` | 116 | 81 | 198 MB | 175 MB |
+
+Linux takes less processor for everything but WebRTC players, which
+take a quarter more; the difference is widest where every channel has a
+pipeline and threads of its own (`spread`). Every player of every run
+played to the end with nothing lost.
+
+### Every scenario, main
+
+| Scenario | CPU | Memory | Threads | Players |
+|---|---|---|---|---|
+| `pull 50` | 22 | 50 MB | 110 | — |
+| `pull 100` | 44 | 63 MB | 210 | — |
+| `pull 200` | 89 | 88 MB | 410 | — |
+| `record 100` | 103 | 497 MB | 310 | — |
+| `rtsp 50` | 14 | 36 MB | 12 | nothing lost, lag spread p99 5 ms |
+| `rtsp 200` | 54 | 40 MB | 12 | nothing lost, p99 12 ms |
+| `rtsp 500` | 134 | 49 MB | 12 | nothing lost, p99 31 ms |
+| `webrtc 25` | 35 | 79 MB | 12 | no gap, p99 15 ms |
+| `webrtc 50` | 67 | 121 MB | 12 | no gap, p99 21 ms |
+| `webrtc 100` | 108 | 205 MB | 12 | no gap, p99 31 ms |
+| `spread 100` | 115 | 145 MB | 211 | every one played |
+| `watch 50` | 101 | 175 MB | 111 | no gap |
+
+`record 100` wrote 382 Mbit/s over the window, where Windows wrote 411
+of the same cameras; Linux counts writes as the page cache is flushed, as
+in Docker.
+main takes a quarter more than 5fd0205 in `spread 100` and `watch 50`
+(115 to 90, 101 to 81) — the forwarder of a channel's own the
+[table above](#players-served-through-a-paths-muxer) measured on
+Windows — and the same elsewhere.
+
+### Converting H.265 for WebRTC players
+
+`watch N` of the H.265 camera, as in
+[converting for WebRTC players](#converting-for-webrtc-players): decoded on
+NVDEC through CUDA and encoded on NVENC, one CUDA device for the process.
+Windows' figures are of 90ba8fe, D3D11VA and NVENC on one shared D3D11
+device:
+
+| Channels | Windows CPU | Linux CPU | Windows memory | Linux memory | Linux threads | NVENC | NVDEC |
+|---|---|---|---|---|---|---|---|
+| 1 | 19 | 6 | 202 MB | 342 MB | 26 | 6% | 2% |
+| 4 | 59 | 18 | 511 MB | 539 MB | 38 | 24% | 7% |
+| 8 | 128 | 38 | 925 MB | 802 MB | 54 | 42% | 12% |
+| 10 | 131 | 45 | 1,110 MB | 933 MB | 62 | 48% | 18% |
+
+A third of Windows' processor time, every player again playing to the end.
+The first conversion costs more memory than on Windows — the CUDA device
+and its decoder's and encoder's pools — and each after it less: about
+65 MB a conversion to Windows' 100.
+
+Over hours the heap is another matter: in the soak relay-pp's rose to
+1.8 GB on Linux, against about 250 MB on Windows, glibc's arenas keeping
+what was freed — see [`bench/soak/README.md`](../bench/soak/README.md).
+
 ## Not measured here
 
 Runs repeated to show their spread; players on another machine; UDP; more
-than one camera with players; a camera opened with fewer at a time.
+than one camera with players; a camera opened with fewer at a time;
+MediaMTX on Linux itself.

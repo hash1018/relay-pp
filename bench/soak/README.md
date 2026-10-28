@@ -173,8 +173,19 @@ in no direction; threads stayed at about 167 and descriptors at 213, and
 nothing was lost. Three hours more with the build as released, calling
 media-pp's function rather than the trial's own code, came to the same:
 543 MB on average, −0.6 MB/h, each half hour between 514 and 563 MB, 108%
-of processor, nothing lost. In `bench/` scenarios run alternately with and without
-it, relay-pp's processor differed by 0 to 3%.
+of processor, nothing lost. In `bench/` scenarios run alternately with
+and without it, relay-pp's processor differed by 0 to 3%.
+
+Ten hours, to see whether freeing and allocating so much splinters the
+heap until it grows anyway, came to 566 MB on average and nothing lost.
+Each hour after the first came to between 542 and 589 MB, the last three
+at about 585; the heap rose 6 MB an hour in the first five hours and 3 in
+the last five, while what was in use stayed near 460 MB. The arenas' span
+kept growing, from 1000 to 1394 MB, but what grew was free memory handed
+back to the system, not held. What cannot be handed back, free blocks
+smaller than a page, stayed at about 4 MB in every one of `malloc_info`'s
+dumps from the first hour to the tenth. Each trim took 19 ms in the first
+hour and 24 in the last, levelling; processor stayed at 109%.
 
 Holding the mmap threshold low instead — 128 KiB, so that large blocks go
 back to the system as they are freed — kept the heap as small, but
@@ -208,6 +219,7 @@ What earlier runs came to, for comparison:
 | Linux, 3 h, HEVC on the GPU | none | rising to ~1.8 GB in 2 h, then +22 MB/h |
 | Linux, 3 h, `MALLOC_ARENA_MAX=2` | none | ~640 MB, +2 MB/h; half a core more processor |
 | Linux, 3 h, `keep_small` | none | ~550 MB, level; 2% more processor |
+| Linux, 10 h, `keep_small` | none | ~570 MB, +3 to +6 MB/h, slowing |
 
 Then, where something is off:
 

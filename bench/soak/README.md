@@ -170,7 +170,10 @@ Then a 3-hour run with both, beside the two above:
 
 Each half hour after the first came to between 490 and 590 MB on average,
 in no direction; threads stayed at about 167 and descriptors at 213, and
-nothing was lost. In `bench/` scenarios run alternately with and without
+nothing was lost. Three hours more with the build as released, calling
+media-pp's function rather than the trial's own code, came to the same:
+543 MB on average, −0.6 MB/h, each half hour between 514 and 563 MB, 108%
+of processor, nothing lost. In `bench/` scenarios run alternately with and without
 it, relay-pp's processor differed by 0 to 3%.
 
 Holding the mmap threshold low instead — 128 KiB, so that large blocks go

@@ -476,6 +476,26 @@ Over hours the heap is another matter: in the soak relay-pp's rose to
 1.8 GB on Linux, against about 250 MB on Windows, glibc's arenas keeping
 what was freed — see [`bench/soak/README.md`](../bench/soak/README.md).
 
+### Holding glibc's heap
+
+relay-pp now calls media-pp's `heap::keep_small()` first, which holds
+glibc's thresholds and trims its arenas every ten seconds; the soak's heap
+stayed near 550 MB. What it costs, measured 2026-10-28 with a trial build
+doing the same against main at 7f640b9, alternated as above:
+
+| Scenario | CPU as it was | CPU held | Memory as it was | Memory held |
+|---|---|---|---|---|
+| `pull 100` | 43.2 | 43.8 | 64 MB | 62 MB |
+| `pull 200` | 87.4 | 89.4 | 88 MB | 84 MB |
+| `record 100` | 101.6 | 104.4 | 574 MB | 483 MB |
+| `spread 100` | 114.8 | 114.9 | 145 MB | 145 MB |
+| `webrtc 50` | 66.3 | 66.5 | 121 MB | 120 MB |
+| `rtsp 200` | 54.0 | 53.9 | 39 MB | 39 MB |
+
+Each build's two runs agreed within 1.5. It costs 2 to 3% where a hundred
+or more channels each have threads of their own and nothing where they do
+not, and every player played to the end with nothing lost.
+
 ## Not measured here
 
 Runs repeated to show their spread; players on another machine; UDP; more

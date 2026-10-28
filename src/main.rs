@@ -8,6 +8,9 @@ use std::process::ExitCode;
 use relay_pp::{Config, Server};
 
 fn main() -> ExitCode {
+    // glibc's heap, which on Linux otherwise kept 1.8 GB for a soak using
+    // under a tenth of it (bench/soak/README.md); first, before any thread.
+    let trimming = media_pp::heap::keep_small();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -15,6 +18,9 @@ fn main() -> ExitCode {
         )
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
+    if let Err(error) = trimming {
+        tracing::warn!("the heap is not trimmed: {error}");
+    }
     // media-pp's own records, every pipeline and server inside, in a file
     // of their own beside relay-pp's.
     let _media_log = match media_pp::log::init("media-pp", "logs", media_pp::log::Level::Info, 7) {

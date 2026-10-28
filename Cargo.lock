@@ -1444,7 +1444,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "media-pp"
 version = "0.4.1"
-source = "git+https://github.com/hash1018/media-pp?rev=36d5c46fe3f1277b106f7ff40a30705267ca397c#36d5c46fe3f1277b106f7ff40a30705267ca397c"
+source = "git+https://github.com/hash1018/media-pp?rev=570a899273c596e993fb43f7ebcf734fb9a476a9#570a899273c596e993fb43f7ebcf734fb9a476a9"
 dependencies = [
  "ab_glyph",
  "arc-swap",

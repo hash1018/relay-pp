@@ -138,6 +138,48 @@ level throughout. Held to two arenas it stayed near 640 MB from the first
 half hour on, and relay-pp's 165 threads, contending for those two, spent
 half a core more doing the same work.
 
+### What relay-pp does about it
+
+Neither is what relay-pp runs. glibc's `malloc_info` taken every ten
+minutes of a run showed where the memory was: 165 threads had opened all
+96 arenas the machine allows (eight a core), and about four fifths of what
+they kept free was each arena's free end, 10 to 14 MB apiece. glibc gives
+that end back past a threshold it raises as large blocks are freed — to
+twice its mmap threshold, up to 64 MB — and the soak's pictures raised it
+to the top. The other fifth was holes between blocks still in use.
+Deleting every channel left 36 MB in use and over 800 MB kept.
+
+So relay-pp calls media-pp's `heap::keep_small()` first in `main`. It
+holds both thresholds — setting either stops both rising — the end of an
+arena going back past 1 MB and a block mapped on its own only past 32 MB,
+and every ten seconds gives back the free pages in the holes too. Each
+half by itself, and both, for 50 minutes before every channel was deleted:
+
+| Run | Heap at 30–45 min | relay-pp's processor | Heap with every channel deleted |
+|---|---|---|---|
+| as it was | 1442–1513 MB | 96–105% | 834–887 MB |
+| thresholds held | 812 MB | 105% | 372 MB |
+| trimmed every 10 s | 1133 MB | 110% | 480 MB |
+| both | 553 MB | 107% | 86 MB |
+
+Then a 3-hour run with both, beside the two above:
+
+| Run | Heap after 30 min | After 2 h | Mean | Most | relay-pp's processor |
+|---|---|---|---|---|---|
+| `keep_small` | −2 MB/h | between 470 and 640 MB | 546 MB | 639 MB | 108% (91–130%) |
+
+Each half hour after the first came to between 490 and 590 MB on average,
+in no direction; threads stayed at about 167 and descriptors at 213, and
+nothing was lost. In `bench/` scenarios run alternately with and without
+it, relay-pp's processor differed by 0 to 3%.
+
+Holding the mmap threshold low instead — 128 KiB, so that large blocks go
+back to the system as they are freed — kept the heap as small, but
+relay-pp died within minutes converting HEVC: NVIDIA's NVDEC library reads
+a block it has freed, which faults where the block was unmapped (media-pp's
+`docs/issues/nvdec-use-after-free`). Held at 32 MB, that 2.3 MB block
+stays in an arena.
+
 ## Reading what it says
 
 Each run is a folder under `bench/soak/runs/`. `summary.txt` is what to read
@@ -162,6 +204,7 @@ What earlier runs came to, for comparison:
 | Docker, 1.5 h, `MALLOC_ARENA_MAX=2` | none | ~350 MB, +5 MB/h after an hour |
 | Linux, 3 h, HEVC on the GPU | none | rising to ~1.8 GB in 2 h, then +22 MB/h |
 | Linux, 3 h, `MALLOC_ARENA_MAX=2` | none | ~640 MB, +2 MB/h; half a core more processor |
+| Linux, 3 h, `keep_small` | none | ~550 MB, level; 2% more processor |
 
 Then, where something is off:
 

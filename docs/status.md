@@ -508,8 +508,15 @@ cold start about 1.5 s; across a camera dropped for five seconds three
 times over, hls.js at its defaults played on with no error, a drop's time
 behind after each, and the page caught up to a second or so.
 
-Not yet: Ctrl+C on the binary, a real IP camera, Safari's own HLS, and a
-recording of hours.
+Over hours, in soaks: on Windows a hundred cameras for three and a half
+hours, twenty of them recorded throughout in two-minute chunks, none
+failing ([benchmarks.md](benchmarks.md)); on Linux sixty-four channels for
+ten hours, ten recorded throughout and three each time their publisher
+came back, 15 GB in 423 chunks, nothing lost
+([bench/soak/README.md](../bench/soak/README.md)).
+
+Not yet: Ctrl+C on the binary — the soaks end it with a signal it does not
+stop cleanly for — a real IP camera, and Safari's own HLS.
 
 ## Not here yet
 
@@ -517,7 +524,7 @@ recording of hours.
 |---|---|
 | Hooks, a manager asked over HTTP who may play | 4 |
 | On-demand sources, forwarding, event recording | 5 |
-| Packaging, a soak of a hundred cameras | 6 |
+| Packaging | 6 |
 
 Also not here: HTTPS — a token and a Basic password cross the network as
 they are, so put relay-pp behind a proxy that terminates TLS where the

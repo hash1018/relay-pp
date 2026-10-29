@@ -524,7 +524,7 @@ stop cleanly for — a real IP camera, and Safari's own HLS.
 |---|---|
 | Hooks, a manager asked over HTTP who may play | 4 |
 | On-demand sources, forwarding, event recording | 5 |
-| Packaging | 6 |
+| Packaging, a soak of a hundred pulled cameras for a day | 6 |
 
 Also not here: HTTPS — a token and a Basic password cross the network as
 they are, so put relay-pp behind a proxy that terminates TLS where the

@@ -50,8 +50,9 @@ curl http://<host>:8888/metrics                     # the same, for Prometheus
 curl -X DELETE http://<host>:8888/api/v1/channels/cam1
 ```
 
-[docs/status.md](docs/status.md) has every request and answer. Ctrl+C stops
-it. relay-pp logs to the terminal and media-pp to `logs/`.
+[docs/status.md](docs/status.md) has every request and answer. Ctrl+C or
+SIGTERM stops it, every recording finished first. relay-pp logs to the
+terminal and media-pp to `logs/`.
 
 Without an `[auth]` section anyone who reaches the HTTP port can make and
 remove channels, play them and read every recording — see "Who may" in

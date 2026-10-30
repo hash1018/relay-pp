@@ -26,7 +26,9 @@ relay-pp [CONFIG]
 
 `CONFIG` is a TOML file of where to listen and how to record (below). With
 none named, `relay-pp.toml` is read if it is there, and the defaults are
-used if it is not. Ctrl+C stops it. relay-pp logs to the terminal
+used if it is not. Ctrl+C stops it, and so does SIGTERM — what systemd,
+`docker stop` and `kill` send — or on Windows its console closed or the
+machine shutting down; see "Stopping". relay-pp logs to the terminal
 (`RUST_LOG` filters it, `info` by default) and media-pp's own records go to
 `logs/`.
 
@@ -442,6 +444,10 @@ camera together — however many there are, no longer than the slowest live
 connection takes to stop, and what is left of opens under way is given 2
 seconds — then closes the listeners.
 
+It exits 0 once it has. A second signal while it stops ends it there,
+unfinished, exiting 1: a recording under way is left with its segments
+but no end to its playlist.
+
 ## Threads
 
 A camera pulled is a media-pp pipeline of its own: a thread writing the
@@ -515,8 +521,10 @@ ten hours, ten recorded throughout and three each time their publisher
 came back, 15 GB in 423 chunks, nothing lost
 ([bench/soak/README.md](../bench/soak/README.md)).
 
-Not yet: Ctrl+C on the binary — the soaks end it with a signal it does not
-stop cleanly for — a real IP camera, and Safari's own HLS.
+Stopped by Ctrl+C or SIGTERM while it records, the binary ends the
+recording's playlist and exits 0 (`tests/stop.rs`).
+
+Not yet: a real IP camera, and Safari's own HLS.
 
 ## Not here yet
 

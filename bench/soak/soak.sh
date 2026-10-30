@@ -46,6 +46,13 @@ stop_all() {
     for name in relay-pp rtsp_server rtsp_load webrtc_load soakpub; do
         pkill -x "$name" >/dev/null 2>&1
     done
+    # relay-pp finishes its recordings before it exits: wait for it, for
+    # half a minute at most.
+    for _ in $(seq 300); do
+        pgrep -x relay-pp >/dev/null || return 0
+        sleep 0.1
+    done
+    pkill -KILL -x relay-pp >/dev/null 2>&1
 }
 
 stop_all

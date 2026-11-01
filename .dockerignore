@@ -1,0 +1,6 @@
+# Only what the build copies: target/, logs/ and the soak's runs are gigabytes.
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!assets

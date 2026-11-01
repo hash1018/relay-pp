@@ -32,6 +32,39 @@ machine shutting down; see "Stopping". relay-pp logs to the terminal
 (`RUST_LOG` filters it, `info` by default) and media-pp's own records go to
 `logs/`.
 
+## Docker
+
+```sh
+docker build -t relay-pp .
+docker run -d --name relay --network host \
+    --gpus all -e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+    -v "$PWD/relay-pp.toml:/etc/relay-pp.toml:ro" -v relay-data:/data \
+    relay-pp /etc/relay-pp.toml
+```
+
+The image is Linux on x86-64, with FFmpeg built into it as media-pp says.
+Building it from nothing takes about ten minutes.
+
+- **The network.** `--network host` needs no list of ports, and is what
+  WebRTC and RTP over UDP are simplest with. With `-p` instead, publish each
+  port the configuration uses, one UDP port for each of `webrtc.threads`
+  from `webrtc.listen`'s on (8189 and 8190 by default), and leave RTP over UDP
+  out: its ports are chosen as players ask, so `rtsp.udp = false`.
+- **`webrtc.candidates`** must name an address players reach, the machine's
+  or a router's rather than the container's own, as must `rtsp.public_url`
+  where players are told one.
+- **`/data`** is where it runs: recordings, unless `record.dir` says
+  otherwise, and media-pp's `logs/`. It is gone with the container unless
+  it is a volume. It runs as user 1001, which a folder of the machine's
+  mounted there has to let write; a named volume already does.
+- **The GPU** is optional. Without `--gpus` everything else runs, and a
+  player whose pictures need converting is refused as `convert.video`
+  says. The NVIDIA driver and its container runtime are the machine's;
+  the image has neither.
+- **Stopping.** `docker stop` gives it 10 seconds before killing it, which
+  leaves a recording without the end of its playlist; `--stop-timeout` on
+  `docker run` gives it longer. See "Stopping".
+
 ## Configuration
 
 Every key is optional. [`relay-pp.example.toml`](../relay-pp.example.toml)

@@ -64,3 +64,5 @@ License 2.0 (`assets/hls.js/LICENSE`).
 
 Building needs FFmpeg's development libraries, as media-pp does — see its
 [building guide](https://github.com/hash1018/media-pp/tree/main/docs/building).
+The [Dockerfile](Dockerfile) builds all of it, FFmpeg included: see "Docker"
+in [docs/status.md](docs/status.md).

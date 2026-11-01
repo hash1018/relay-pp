@@ -112,6 +112,10 @@ pub(crate) fn router(state: AppState) -> Router {
             who_may_watch_files,
         ));
     let mut router = Router::new()
+        // For whatever watches the process, which presents nothing. It says
+        // only that this port answers: a camera that is down is no reason to
+        // restart what serves the others.
+        .route("/healthz", get(|| async { "ok\n" }))
         .merge(manager)
         .merge(players)
         .merge(publishers)

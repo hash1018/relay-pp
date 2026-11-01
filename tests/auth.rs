@@ -89,6 +89,11 @@ fn the_api_takes_the_managers_token_alone() {
     assert_eq!(status, 200);
     assert!(listed.contains(r#""name":"cam1""#), "{listed}");
 
+    // A probe presents nothing, and is told nothing of the channels.
+    let (status, _, health) = http(api, "GET", "/healthz", None);
+    assert_eq!(status, 200);
+    assert_eq!(health, "ok\n");
+
     // The metrics are the manager's too: they name every channel.
     assert_eq!(http(api, "GET", "/metrics", None).0, 401);
     assert_eq!(http_as(api, "GET", "/metrics", None, Some(&player)).0, 401);

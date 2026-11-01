@@ -135,7 +135,7 @@ No token or password is logged, nor kept beside the configuration.
 
 On the HTTP port. JSON in and out. A channel's name is letters, digits,
 `-`, `_`, `.` and `~` — not `/`, so that it is one part of a URL's path —
-and not `api`, `assets`, `playback` or `recordings`.
+and not `api`, `assets`, `healthz`, `playback` or `recordings`.
 
 | | | |
 |---|---|---|
@@ -148,6 +148,7 @@ and not `api`, `assets`, `playback` or `recordings`.
 | `DELETE /api/v1/channels/{name}/record` | end recording it | `204`; `404` |
 | `GET /api/v1/recordings/{name}` | its recordings | `200` |
 | `GET /metrics` | what runs, for Prometheus — see "Metrics" | `200` |
+| `GET /healthz` | that the port answers, to anyone, for a Kubernetes probe; nothing of the channels | `200` |
 | `GET /playback/{name}/index.m3u8` | a stretch of its recordings, as one playlist | `200`; `400`, `404` |
 
 Besides the API, a channel's players' own URLs — `/{name}/whep`,

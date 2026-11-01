@@ -102,7 +102,7 @@ impl ChannelConfig {
 pub enum ChannelError {
     /// Its name is not one a URL carries as one part of its path.
     #[error(
-        "channel {0:?}: a name is letters, digits, `-`, `_`, `.` and `~`, and not `api`, `assets`, `playback` or `recordings`"
+        "channel {0:?}: a name is letters, digits, `-`, `_`, `.` and `~`, and not `api`, `assets`, `healthz`, `playback` or `recordings`"
     )]
     Name(String),
     /// Its source is not one relay-pp takes yet.
@@ -573,7 +573,7 @@ impl Drop for Channel {
 
 /// The first parts of the HTTP port's own paths, which a channel's
 /// `/<name>/whep` would be taken for.
-const RESERVED: [&str; 4] = ["api", "assets", "playback", "recordings"];
+const RESERVED: [&str; 5] = ["api", "assets", "healthz", "playback", "recordings"];
 
 /// Whether `name` goes into a URL as one part of its path — letters,
 /// digits, `-`, `_`, `.` and `~`, and not `.` or `..` alone — and is no
@@ -634,6 +634,7 @@ mod tests {
             ".",
             "..",
             "api",
+            "healthz",
         ] {
             assert!(
                 matches!(

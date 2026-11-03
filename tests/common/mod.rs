@@ -405,6 +405,7 @@ pub fn pulling(name: &str, camera: SocketAddr) -> ChannelConfig {
         source: Some(format!("rtsp://{camera}/cam")),
         publish: None,
         transport: Transport::Tcp,
+        on_demand: false,
         convert: ConvertChoice::default(),
     }
 }

@@ -2,7 +2,9 @@
 //! [`Hub`](hub::Hub) it writes into, and the sinks reading the hub — see
 //! `docs/design.md`, "The model".
 //!
-//! A channel is made with its source alone, which it pulls from then on.
+//! A channel is made with its source alone, which it pulls from then on —
+//! or, made on demand, only while something wants it: a player, a request
+//! waiting to play, its recording, its HLS.
 //! Its sinks are attached and detached while it runs: RTSP and WebRTC
 //! players, through the listeners every channel shares, as a player first
 //! asks for the channel ([`ListenerSink`](sink::ListenerSink)), a
@@ -21,19 +23,20 @@ mod task;
 
 use media_pp::elements::LlHlsStream;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 
 use crate::config::{ConvertChoice, ConvertConfig, RecordConfig};
 use hub::Hub;
 pub(crate) use hub::Refusal;
 use sink::{HlsLive, ListenerSink, RecordStatus, Unready};
 pub(crate) use sink::{Listeners, Output, Recorder, is_media_file};
-use source::Source;
+use source::{Demand, Source};
 pub use source::{Publish, SourceState};
 pub(crate) use source::{RTMP_APP, whip_path};
 
@@ -56,6 +59,10 @@ pub struct ChannelConfig {
     /// default, which loses nothing) or `"udp"`.
     #[serde(default)]
     pub transport: Transport,
+    /// Whether its camera is connected only while something wants it,
+    /// rather than for as long as the channel is there. A `source` only.
+    #[serde(default)]
+    pub on_demand: bool,
     /// What is converted for a way out that cannot carry a track, over
     /// the server's `[convert]`: `{"sound": "off", "video": "any"}`, each
     /// left out the server's.
@@ -91,6 +98,7 @@ impl ChannelConfig {
                 }
                 Ok(())
             }
+            (None, Some(_)) if self.on_demand => Err(ChannelError::OnDemand(self.name.clone())),
             (None, Some(_)) => Ok(()),
             _ => Err(ChannelError::Input(self.name.clone())),
         }
@@ -117,6 +125,9 @@ pub enum ChannelError {
     /// over, or neither.
     #[error("channel {0}: a `source` to pull, or a protocol to `publish` over — one of them")]
     Input(String),
+    /// It is on demand and takes a publisher, which comes when it will.
+    #[error("channel {0}: only a `source` pulled is on demand, not a publisher")]
+    OnDemand(String),
     /// Its source could not be made: a server would not take its
     /// publisher.
     #[error("channel {channel}: {error}")]
@@ -201,6 +212,8 @@ pub struct ChannelStatus {
     pub source: String,
     /// What the source is doing.
     pub state: SourceState,
+    /// Whether its camera is connected only while something wants it.
+    pub on_demand: bool,
     /// Since when, in milliseconds since the Unix epoch.
     pub since_ms: u64,
     /// Why the source last failed, while it is not live.
@@ -246,8 +259,14 @@ pub struct Channel {
     /// What it may convert.
     convert: ConvertConfig,
     /// What it is attached to, behind one lock — so nothing is attached to
-    /// a channel once it is halted.
-    attached: Mutex<Attached>,
+    /// a channel once it is halted. Shared with its source on demand, which
+    /// is wanted while any of it is.
+    attached: Arc<Mutex<Attached>>,
+    /// Requests waiting for it to be live, and the bell each rings as it
+    /// begins to: what has a camera on demand connect.
+    waiting: Arc<AtomicUsize>,
+    coming: Arc<Notify>,
+    on_demand: bool,
     /// How a recorder of it records, and where its tasks run.
     record: RecordConfig,
     /// How long its HLS is written unasked for.
@@ -271,14 +290,42 @@ struct Attached {
     hls: Option<Arc<HlsLive>>,
 }
 
+impl Attached {
+    /// Whether any of it wants the stream now: a player on a listener, a
+    /// recording, HLS still asked for.
+    fn wants(&self) -> bool {
+        self.recorder.is_some()
+            || self.hls.as_ref().is_some_and(|hls| !hls.is_over())
+            || self.listened.values().any(|sink| sink.players() > 0)
+    }
+}
+
+/// A request waiting for a channel to be live, counted while it does.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Channel {
     /// Makes a channel of its source alone, and starts pulling it on
     /// `runtime` — or taking its publisher, on the one of `listeners` its
-    /// protocol is served by.
+    /// protocol is served by. On demand, its camera is let go of once
+    /// nothing has wanted it for `close_after`.
     pub(crate) fn start(
         config: &ChannelConfig,
         record: &RecordConfig,
         hls_idle: Duration,
+        close_after: Duration,
         convert: ConvertConfig,
         listeners: &Listeners,
         runtime: &Handle,
@@ -286,19 +333,35 @@ impl Channel {
         config.check()?;
         let convert = config.convert.over(convert);
         let hub = Hub::start(&config.name, convert, runtime);
-        let source =
-            Source::new(&config.name, config, hub.publisher(), listeners).map_err(|error| {
-                ChannelError::Intake {
-                    channel: config.name.clone(),
-                    error,
+        let attached = Arc::new(Mutex::new(Attached::default()));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let coming = Arc::new(Notify::new());
+        let demand = config.on_demand.then(|| Demand {
+            wanted: Box::new({
+                let attached = Arc::clone(&attached);
+                let waiting = Arc::clone(&waiting);
+                move || {
+                    waiting.load(Ordering::Acquire) > 0
+                        || attached.lock().unwrap_or_else(|p| p.into_inner()).wants()
                 }
+            }),
+            coming: Arc::clone(&coming),
+            close_after,
+        });
+        let source = Source::new(&config.name, config, hub.publisher(), listeners, demand)
+            .map_err(|error| ChannelError::Intake {
+                channel: config.name.clone(),
+                error,
             })?;
         let channel = Self {
             name: config.name.clone(),
             source,
             hub,
             convert,
-            attached: Mutex::default(),
+            attached,
+            waiting,
+            coming,
+            on_demand: config.on_demand,
             record: record.clone(),
             hls_idle,
             runtime: runtime.clone(),
@@ -343,6 +406,7 @@ impl Channel {
             name: self.name.clone(),
             source: source.url,
             state: source.state,
+            on_demand: self.on_demand,
             since_ms: source
                 .since
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -451,8 +515,11 @@ impl Channel {
     }
 
     /// Waits, up to `within`, for its source to be live — at once where it
-    /// is — or says what it is doing instead.
+    /// is — or says what it is doing instead. On demand, the camera is
+    /// connected for it.
     pub(crate) async fn live(&self, within: Duration) -> Result<(), PlayError> {
+        let _waiting = Waiting::new(&self.waiting);
+        self.coming.notify_one();
         let mut runs = self.hub.runs();
         let live = tokio::time::timeout(within, async {
             runs.wait_for(Option::is_some).await.is_ok()
@@ -469,6 +536,7 @@ impl Channel {
                     format!("waiting to connect again: {error}")
                 }
                 (SourceState::AwaitingPublisher, _) => "no publisher publishes into it".to_owned(),
+                (_, Some(error)) => format!("its camera is not live: {error}"),
                 _ => "its camera is not live yet".to_owned(),
             },
         })
@@ -611,6 +679,7 @@ mod tests {
             source: Some(source.to_owned()),
             publish: None,
             transport: Transport::Tcp,
+            on_demand: false,
             convert: ConvertChoice::default(),
         }
     }

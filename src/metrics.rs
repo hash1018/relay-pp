@@ -59,11 +59,12 @@ const ROLES: [(SessionRole, &str); 2] = [
 ];
 
 /// Every state a channel's source is in, by the name the API gives it.
-const STATES: [(SourceState, &str); 4] = [
+const STATES: [(SourceState, &str); 5] = [
     (SourceState::Connecting, "connecting"),
     (SourceState::Live, "live"),
     (SourceState::Waiting, "waiting"),
     (SourceState::AwaitingPublisher, "awaiting_publisher"),
+    (SourceState::Idle, "idle"),
 ];
 
 /// The answer, in Prometheus's text format.
@@ -278,6 +279,7 @@ mod tests {
             name: name.to_owned(),
             source: "rtsp://10.0.0.1/".to_owned(),
             state,
+            on_demand: false,
             since_ms: 0,
             error: None,
             connections: 3,

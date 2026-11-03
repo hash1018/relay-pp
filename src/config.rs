@@ -55,6 +55,9 @@ pub struct Config {
     /// HLS players.
     #[serde(default)]
     pub hls: HlsConfig,
+    /// Cameras pulled only while something wants them.
+    #[serde(default)]
+    pub on_demand: OnDemandConfig,
     /// What is converted for a way out that cannot carry what a camera
     /// sends, unless a channel says otherwise.
     #[serde(default)]
@@ -234,6 +237,31 @@ impl Default for HlsConfig {
     fn default() -> Self {
         Self {
             idle: Self::default_idle(),
+        }
+    }
+}
+
+/// `[on_demand]`: for the channels made with `"on_demand": true`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnDemandConfig {
+    /// How long such a camera stays connected once nothing wants it — no
+    /// player, recording or HLS: `"10s"`. One coming back sooner plays at
+    /// once.
+    #[serde(default = "OnDemandConfig::default_close_after", with = "duration")]
+    pub close_after: Duration,
+}
+
+impl OnDemandConfig {
+    fn default_close_after() -> Duration {
+        Duration::from_secs(10)
+    }
+}
+
+impl Default for OnDemandConfig {
+    fn default() -> Self {
+        Self {
+            close_after: Self::default_close_after(),
         }
     }
 }
@@ -540,6 +568,15 @@ mod tests {
         let defaults = Config::parse("").unwrap().hls;
         assert_eq!(defaults.idle, Duration::from_secs(30));
         assert!(Config::parse("[hls]\nidle = \"soon\"").is_err());
+    }
+
+    #[test]
+    fn how_long_an_unwanted_camera_stays_connected_is_read_with_its_unit() {
+        let config = Config::parse("[on_demand]\nclose_after = \"1m\"").unwrap();
+        assert_eq!(config.on_demand.close_after, Duration::from_secs(60));
+        let defaults = Config::parse("").unwrap().on_demand;
+        assert_eq!(defaults.close_after, Duration::from_secs(10));
+        assert!(Config::parse("[on_demand]\nafter = \"1m\"").is_err());
     }
 
     #[test]

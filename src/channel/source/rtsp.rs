@@ -4,6 +4,7 @@
 //! AAC, Opus and G.711.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use media_pp::bus::BusEvent;
 use media_pp::elements::{RtspOptions, RtspSource, StreamInfo};
@@ -18,7 +19,14 @@ use super::{CAMERA_TIMEOUT, Ended, Inner, halted};
 /// Each connection is a pipeline of its own ending in the broadcast,
 /// published again: the broadcast is what outlives it, and publishing
 /// again is what tells its readers that one run ended and another began.
-pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -> Ended {
+///
+/// On demand, it is let go of once nothing has wanted it for its
+/// `close_after`, counted from `wanted`.
+pub(super) async fn pull(
+    inner: &Arc<Inner>,
+    halt: &mut watch::Receiver<bool>,
+    wanted: &mut Instant,
+) -> Ended {
     let opening = tokio::task::spawn_blocking({
         let inner = Arc::clone(inner);
         move || open(&inner)
@@ -46,11 +54,22 @@ pub(super) async fn pull(inner: &Arc<Inner>, halt: &mut watch::Receiver<bool>) -
         // A sink cannot go on with this run: a new connection describes
         // the camera anew.
         () = inner.publisher.renewal() => Ended::Reconnect,
+        () = inner.unwanted(wanted) => Ended::Unwanted,
     };
     // Stopping joins the pipeline's threads, and tells the camera the
     // session is over: not on the runtime's own threads.
     let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
     ended
+}
+
+/// Opens the camera and lets go of it at once: whether it answers, and why
+/// not.
+pub(super) async fn probe(inner: &Arc<Inner>) -> Result<(), String> {
+    let inner = Arc::clone(inner);
+    match tokio::task::spawn_blocking(move || open(&inner).map(drop)).await {
+        Ok(answered) => answered,
+        Err(_) => Err("opening the camera panicked".into()),
+    }
 }
 
 /// Opens the camera: a media-pp source, and the streams of it a broadcast

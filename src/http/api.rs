@@ -91,9 +91,10 @@ pub(super) async fn create_channel(
         }
         Err(error) => {
             let status = match error {
-                ChannelError::Name(_) | ChannelError::Source { .. } | ChannelError::Input(_) => {
-                    StatusCode::BAD_REQUEST
-                }
+                ChannelError::Name(_)
+                | ChannelError::Source { .. }
+                | ChannelError::Input(_)
+                | ChannelError::OnDemand(_) => StatusCode::BAD_REQUEST,
                 ChannelError::Intake { .. } => StatusCode::CONFLICT,
                 ChannelError::Exists(_) => StatusCode::CONFLICT,
             };

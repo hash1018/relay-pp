@@ -153,6 +153,7 @@ impl Server {
             listeners.clone(),
             config.record.clone(),
             config.hls.clone(),
+            config.on_demand.clone(),
             config.convert,
             runtime.handle().clone(),
         ));

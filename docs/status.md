@@ -88,6 +88,7 @@ has them all with comments.
 | `record.keep` | none | how long a recording is kept from its last write: `"30d"` |
 | `record.max_size` | none | how much all recordings together may take, the oldest removed first: `"500GB"`, `"2TiB"` |
 | `hls.idle` | `"30s"` | how long a channel's HLS goes on being written after the last request for its playlist or a segment |
+| `on_demand.close_after` | `"10s"` | how long a camera pulled on demand stays connected once nothing wants it — see "A channel's camera" |
 | `convert.sound` | `"auto"` | sound a way out cannot carry: `"auto"`, converted for it; `"off"`, left out of it — see "Conversions" |
 | `convert.video` | `"gpu"` | pictures a way out cannot carry: `"gpu"`, converted on a GPU and refused where none takes them; `"any"`, on the processor where no GPU does; `"off"`, that way out refused |
 | `auth.api_token` | none | what the manager presents for the API, 16 characters or more — see "Who may" |
@@ -168,13 +169,15 @@ it — are under "Players" below.
 | `source` | this or `publish` | a camera to pull: an `rtsp://` or `rtsps://` URL |
 | `publish` | this or `source` | the protocol a publisher pushes the stream over: `"rtmp"`, `"rtsp"` or `"whip"` — see "A channel's publisher" |
 | `transport` | `"tcp"` | how the camera is pulled: `"tcp"`, RTP on the RTSP connection, which loses nothing; or `"udp"` |
+| `on_demand` | `false` | whether the camera is connected only while something wants it — see "A channel's camera"; a `source` only |
 | `convert` | the server's `[convert]` | its own say over it: `{"sound": "off", "video": "any"}`, each left out the server's |
 
 `201` with its status, `Location` its URL; `400` for a name or source that
-cannot be used, both `source` and `publish` or neither, a field missing or
-unknown, or not JSON; `409` for a name taken. It answers at once; the camera
-is opened afterwards, and pulled from then on, played or not — or a
-publisher taken from then on.
+cannot be used, both `source` and `publish` or neither, `on_demand` with
+`publish`, a field missing or unknown, or not JSON; `409` for a name taken.
+It answers at once; the camera is opened afterwards, and pulled from then
+on, played or not — on demand, while something wants it — or a publisher
+taken from then on.
 
 ### `DELETE /api/v1/channels/{name}` — remove one
 
@@ -194,7 +197,8 @@ there. Each is:
 |---|---|
 | `name` | its name |
 | `source` | its URL, with any user name and password cut out |
-| `state` | `connecting`, `live`, or `waiting` — failed, and connecting again after a wait |
+| `state` | `connecting`, `live`, `waiting` — failed, and connecting again after a wait — or, on demand, `idle`: nothing wants it, and it is not connected |
+| `on_demand` | whether its camera is connected only while something wants it |
 | `since_ms` | since when, in milliseconds since the Unix epoch |
 | `error` | why it last failed, while it is not live |
 | `connections` | how many times it has gone live |
@@ -254,6 +258,27 @@ from when it is made until it is removed:
   from 1.
 - Players stay connected across a drop and go on from the next keyframe once
   the camera is back, their timestamps carrying on.
+
+Made with `"on_demand": true`, the camera is connected only while something
+wants it, so that a hundred cameras of which a few are watched pull a few:
+
+- Made, it is opened once and let go of, and the channel is `idle`, with
+  why where the camera did not answer — a mistyped URL shows at once.
+- What wants it: a request waiting for it to be live — a player asking over
+  the API, WHEP or HLS, which connects it and waits up to 10 seconds as for
+  any camera — a player on a listener, its recording, and its HLS while
+  it is written. A player coming straight to the RTSP listener of a channel
+  it serves already connects it too.
+- Once nothing has wanted it for `on_demand.close_after`, 10 seconds by
+  default, it is let go of: `idle` again. A player back sooner plays at
+  once.
+- A failure is tried again as above while something wants it, and not once
+  nothing has for `close_after`: `idle`, saying why. A camera that is off is
+  not opened again and again for nobody.
+- The first picture takes as long as the camera to connect and send a
+  keyframe: a second or so, more with a long keyframe interval. A WebRTC
+  answer and an RTSP description carry the camera's tracks, which only the
+  camera says.
 
 ## Players
 
@@ -451,7 +476,7 @@ it is asked for, from what the channels and listeners count already.
 | Series | Type | What |
 |---|---|---|
 | `relay_pp_channel_up{channel}` | gauge | 1 while the channel's stream comes in |
-| `relay_pp_channel_state{channel,state}` | gauge | 1 for the state its source is in: `connecting`, `live`, `waiting`, `awaiting_publisher` |
+| `relay_pp_channel_state{channel,state}` | gauge | 1 for the state its source is in: `connecting`, `live`, `waiting`, `awaiting_publisher`, `idle` |
 | `relay_pp_channel_connections_total{channel}` | counter | times its source has gone live |
 | `relay_pp_channel_received_bytes_total{channel}` | counter | what its source has written, over every connection |
 | `relay_pp_channel_readers{channel}` | gauge | readers of its stream: its played listeners' forwarders, its recording, its HLS, its conversions |
@@ -565,7 +590,7 @@ Not yet: a real IP camera, and Safari's own HLS.
 | | Phase |
 |---|---|
 | Hooks, a manager asked over HTTP who may play | 4 |
-| On-demand sources, forwarding, event recording | 5 |
+| Forwarding, event recording | 5 |
 | Packaging, a soak of a hundred pulled cameras for a day | 6 |
 
 Also not here: HTTPS — a token and a Basic password cross the network as

@@ -9,6 +9,12 @@
 //!
 //! What watches a connection — waits on it, waits before connecting again,
 //! hears a halt — is the source's task, holding no thread while it waits.
+//!
+//! A camera pulled on demand ([`Demand`]) is opened once as the channel is
+//! made, to say at once whether it answers, and connected only while the
+//! channel says something wants it: let go of once nothing has for its
+//! `close_after`, and not connected again after a failure unless something
+//! still does — a camera that is off is not tried for ever for nobody.
 
 mod publish;
 mod rtsp;
@@ -21,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime};
 use media_pp::elements::RtspTransport;
 use serde::Serialize;
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use super::hub::Publisher;
 use super::sink::Listeners;
@@ -42,6 +48,9 @@ const LONGEST_WAIT: Duration = Duration::from_secs(30);
 /// [`FIRST_WAIT`]: one that drops as soon as it is connected is waited for
 /// longer and longer, not every second.
 const STAYED_UP: Duration = Duration::from_secs(10);
+/// How often an on-demand camera looks at whether it is wanted, besides
+/// being told that something is coming.
+const WANT_CHECK: Duration = Duration::from_secs(1);
 
 /// What a channel's source is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,6 +64,20 @@ pub enum SourceState {
     Waiting,
     /// No publisher is publishing into it.
     AwaitingPublisher,
+    /// Pulled on demand, and nothing wants it: not connected.
+    Idle,
+}
+
+/// What a camera pulled on demand is told by its channel.
+pub(in crate::channel) struct Demand {
+    /// Whether anything wants the camera now: a player, a recording, HLS,
+    /// or a request waiting for it to be live.
+    pub(in crate::channel) wanted: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Rung as a request begins to wait for it, so that it connects without
+    /// waiting for its next look.
+    pub(in crate::channel) coming: Arc<Notify>,
+    /// How long it stays connected once nothing wants it.
+    pub(in crate::channel) close_after: Duration,
 }
 
 /// What a source is doing, at one moment.
@@ -80,16 +103,20 @@ pub(in crate::channel) enum Source {
 
 impl Source {
     /// The source `config` says for the channel called `name`, writing
-    /// through `publisher`: a camera, nothing opened yet, or a publisher,
-    /// its server already taking one.
+    /// through `publisher`: a camera, nothing opened yet — connected only
+    /// as `demand` says, where it is given — or a publisher, its server
+    /// already taking one.
     pub(in crate::channel) fn new(
         name: &str,
         config: &ChannelConfig,
         publisher: Publisher,
         listeners: &Listeners,
+        demand: Option<Demand>,
     ) -> Result<Self, String> {
         match (&config.source, config.publish) {
-            (Some(url), None) => Ok(Source::Pull(PullSource::new(name, url, config, publisher))),
+            (Some(url), None) => Ok(Source::Pull(PullSource::new(
+                name, url, config, publisher, demand,
+            ))),
             (None, Some(protocol)) => {
                 PublishSource::new(name, protocol, publisher, listeners).map(Source::Publish)
             }
@@ -142,6 +169,8 @@ struct Inner {
     /// What each connection's tracks are published through: a run each, and
     /// another where a camera changes its pictures partway.
     publisher: Publisher,
+    /// Where it is pulled on demand: what says whether it is wanted.
+    demand: Option<Demand>,
     state: Mutex<State>,
 }
 
@@ -155,7 +184,13 @@ struct State {
 impl PullSource {
     /// A source for the channel called `name` pulling the camera at `url`,
     /// writing through `publisher`, nothing opened yet.
-    fn new(name: &str, url: &str, config: &ChannelConfig, publisher: Publisher) -> Self {
+    fn new(
+        name: &str,
+        url: &str,
+        config: &ChannelConfig,
+        publisher: Publisher,
+        demand: Option<Demand>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 name: name.to_owned(),
@@ -165,6 +200,7 @@ impl PullSource {
                     Transport::Udp => RtspTransport::Udp,
                 },
                 publisher,
+                demand,
                 state: Mutex::new(State {
                     state: SourceState::Connecting,
                     since: SystemTime::now(),
@@ -177,7 +213,8 @@ impl PullSource {
     }
 
     /// Starts pulling the camera on `runtime`, connecting again whenever it
-    /// fails.
+    /// fails — on demand, opening it once and connecting while it is
+    /// wanted.
     pub(in crate::channel) fn run(&self, runtime: &Handle) {
         let inner = Arc::clone(&self.inner);
         self.task.spawn(runtime, |halt| inner.run(halt));
@@ -218,19 +255,44 @@ enum Ended {
     Failed(String),
     /// Ended to be connected again at once.
     Reconnect,
+    /// Let go of: nothing has wanted it for its `close_after`.
+    Unwanted,
 }
 
 impl Inner {
     /// The source's task: pulls the camera, and connects again after a wait
-    /// whenever it fails, until it is halted.
+    /// whenever it fails, until it is halted. On demand, only while it is
+    /// wanted.
     async fn run(self: Arc<Self>, mut halt: watch::Receiver<bool>) {
         let mut wait = FIRST_WAIT;
         // Why it last failed, kept while it connects again.
         let mut last = None;
+        // When it was last wanted, on demand.
+        let mut wanted = Instant::now();
+        if let Some(demand) = &self.demand {
+            self.set(SourceState::Connecting, None);
+            let answered = tokio::select! {
+                answered = rtsp::probe(&self) => answered,
+                () = halted(&mut halt) => return,
+            };
+            match &answered {
+                Ok(()) => {
+                    tracing::info!(channel = %self.name, "the camera answers; connected when wanted");
+                }
+                Err(reason) => {
+                    tracing::warn!(channel = %self.name, "{reason}; tried again when wanted");
+                }
+            }
+            last = answered.err();
+            if !(demand.wanted)() && self.idle(last.clone(), &mut halt).await {
+                return;
+            }
+            wanted = Instant::now();
+        }
         loop {
             self.set(SourceState::Connecting, last.clone());
             let began = Instant::now();
-            let ended = self.pull(&mut halt).await;
+            let ended = self.pull(&mut halt, &mut wanted).await;
             self.publisher.ended();
             let reason = match ended {
                 Ended::Halted => break,
@@ -239,9 +301,34 @@ impl Inner {
                     tracing::info!(channel = %self.name, "connecting again, as asked");
                     continue;
                 }
+                Ended::Unwanted => {
+                    tracing::info!(channel = %self.name, "nothing wants it; let go of");
+                    wait = FIRST_WAIT;
+                    last = None;
+                    if self.idle(None, &mut halt).await {
+                        break;
+                    }
+                    wanted = Instant::now();
+                    continue;
+                }
             };
             if began.elapsed() >= STAYED_UP {
                 wait = FIRST_WAIT;
+            }
+            last = Some(reason.clone());
+            // On demand, a camera nothing has wanted for its `close_after` is
+            // not tried again until something does.
+            if let Some(demand) = &self.demand
+                && !(demand.wanted)()
+                && wanted.elapsed() >= demand.close_after
+            {
+                tracing::warn!(channel = %self.name, "{reason}; tried again when wanted");
+                wait = FIRST_WAIT;
+                if self.idle(last.clone(), &mut halt).await {
+                    break;
+                }
+                wanted = Instant::now();
+                continue;
             }
             // Spread over ±20%, so cameras a network outage dropped together
             // are not all opened again in the same instant.
@@ -251,19 +338,70 @@ impl Inner {
                 "{reason}; connecting again in {:.1}s",
                 spread.as_secs_f64()
             );
-            self.set(SourceState::Waiting, Some(reason.clone()));
-            last = Some(reason);
+            self.set(SourceState::Waiting, Some(reason));
             tokio::select! {
                 () = tokio::time::sleep(spread) => {}
                 () = halted(&mut halt) => break,
+                () = self.unwanted(&mut wanted) => {
+                    tracing::info!(channel = %self.name, "nothing wants it; not tried again until something does");
+                    wait = FIRST_WAIT;
+                    if self.idle(last.clone(), &mut halt).await {
+                        break;
+                    }
+                    wanted = Instant::now();
+                    continue;
+                }
             }
             wait = (wait * 2).min(LONGEST_WAIT);
         }
     }
 
     /// One connection.
-    async fn pull(self: &Arc<Self>, halt: &mut watch::Receiver<bool>) -> Ended {
-        rtsp::pull(self, halt).await
+    async fn pull(
+        self: &Arc<Self>,
+        halt: &mut watch::Receiver<bool>,
+        wanted: &mut Instant,
+    ) -> Ended {
+        rtsp::pull(self, halt, wanted).await
+    }
+
+    /// Idle, saying why it last failed, until something wants it — false
+    /// then — or it is halted — true.
+    async fn idle(&self, error: Option<String>, halt: &mut watch::Receiver<bool>) -> bool {
+        let Some(demand) = &self.demand else {
+            return false;
+        };
+        self.set(SourceState::Idle, error);
+        loop {
+            // Asked for before it is looked at, so a ring between the two is
+            // not missed.
+            let coming = demand.coming.notified();
+            if (demand.wanted)() {
+                return false;
+            }
+            tokio::select! {
+                () = coming => {}
+                () = tokio::time::sleep(WANT_CHECK) => {}
+                () = halted(halt) => return true,
+            }
+        }
+    }
+
+    /// Waits until nothing has wanted it for its `close_after`, counted from
+    /// `wanted` — moved on each time it is — or for ever where it is not
+    /// pulled on demand.
+    async fn unwanted(&self, wanted: &mut Instant) {
+        let Some(demand) = &self.demand else {
+            return std::future::pending().await;
+        };
+        loop {
+            if (demand.wanted)() {
+                *wanted = Instant::now();
+            } else if wanted.elapsed() >= demand.close_after {
+                return;
+            }
+            tokio::time::sleep(WANT_CHECK).await;
+        }
     }
 
     fn set(&self, state: SourceState, error: Option<String>) {

@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use crate::channel::{
     AttachError, Channel, ChannelConfig, ChannelError, Listeners, Output, PlayError,
 };
-use crate::config::{ConvertConfig, HlsConfig, RecordConfig};
+use crate::config::{ConvertConfig, HlsConfig, OnDemandConfig, RecordConfig};
 
 pub(crate) struct Channels {
     /// Read on every request, written only as a channel is added or
@@ -29,6 +29,8 @@ pub(crate) struct Channels {
     pub(crate) record: RecordConfig,
     /// How a channel's HLS is written.
     hls: HlsConfig,
+    /// How an on-demand channel lets go of its camera.
+    on_demand: OnDemandConfig,
     /// What a channel converts, where it says nothing of it.
     convert: ConvertConfig,
     /// Where every channel's tasks run.
@@ -40,6 +42,7 @@ impl Channels {
         listeners: Listeners,
         record: RecordConfig,
         hls: HlsConfig,
+        on_demand: OnDemandConfig,
         convert: ConvertConfig,
         runtime: Handle,
     ) -> Self {
@@ -49,6 +52,7 @@ impl Channels {
             listeners,
             record,
             hls,
+            on_demand,
             convert,
             runtime,
         }
@@ -82,6 +86,7 @@ impl Channels {
             config,
             &self.record,
             self.hls.idle,
+            self.on_demand.close_after,
             self.convert,
             &self.listeners,
             &self.runtime,

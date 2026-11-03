@@ -200,8 +200,8 @@ GET    /api/v1/recordings/{name}
 ```
 
 A player's request waits up to ten seconds for the camera to be live. A
-source is changed by removing the channel and making it again; `on_demand`
-comes with its phase. [status.md](status.md) has every request and answer
+source is changed by removing the channel and making it again, `on_demand`
+with it. [status.md](status.md) has every request and answer
 as built.
 
 Secrets never reach a log line or an API answer; a URL with credentials is

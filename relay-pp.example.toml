@@ -58,6 +58,11 @@ candidates = ["192.168.0.10"]
 # request for its playlist or a segment.
 # idle = "30s"
 
+[on_demand]
+# How long a camera of a channel made with "on_demand": true stays connected
+# once nothing wants it: no player, recording or HLS.
+# close_after = "10s"
+
 [convert]
 # What is converted for a way out that cannot carry what a camera sends —
 # WebRTC players, a recording — where a channel says nothing of it; a
